@@ -1100,7 +1100,7 @@ qwen3vl_series = {
     ),
     "Qwen3-VL-8B-Instruct-COLT": partial(
         Qwen3VLChat,
-        model_path="CoLT/CoLT-8B",
+        model_path="hulianyuyy/CoLT-8B",
         use_custom_prompt=False,
         use_vllm=False,
         do_sample=False, 
