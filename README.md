@@ -1,6 +1,6 @@
 # CoLT: Teaching Multi-Modal Models to Think with Chain of Latent Thoughts (ECCV2026)
 
-[[📖 Paper](https://arxiv.org/)] [[🤗 CoLT-8B-model](https://huggingface.co/OneThink/OneThinker-8B)] [[🤗 CoLT-train-data](https://huggingface.co/datasets/hulianyuyy/CoLT_Train_Dataset)] 
+[[📖 Paper](https://arxiv.org/)] [[🤗 CoLT-8B-model](https://huggingface.co/OneThink/CoLT-8B)] [[🤗 CoLT-train-data](https://huggingface.co/datasets/hulianyuyy/CoLT_Train_Dataset)] 
 
 
 
