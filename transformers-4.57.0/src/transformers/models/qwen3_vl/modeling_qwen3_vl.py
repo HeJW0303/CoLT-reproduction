@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
@@ -1477,13 +1478,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         # NOTE: When training under some sharding/initialization contexts (e.g. init_empty_weights / ZeRO init),
         # loading a nested decoder inside __init__ can silently produce zero/empty parameters.
         # We still initialize here, but also support lazy re-loading in forward if we detect zeroed weights.
-        self.latent_reasoning_mode = True
+        self.latent_reasoning_mode = os.environ.get("COLT_DISABLE_LATENT_REASONING", "0") != "1"
         if not self.latent_reasoning_mode:
             self.post_init()
             return
         self.decoder = None
         self.backward_decoder = None
-        self._decoder_name_or_path = "Qwen/Qwen3-0.6B"
+        self._decoder_name_or_path = os.environ.get("COLT_DECODER_MODEL_PATH", "Qwen/Qwen3-0.6B")
         if self.training:
             self.decoder = AutoModelForCausalLM.from_pretrained(
                 self._decoder_name_or_path,

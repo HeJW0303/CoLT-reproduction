@@ -202,6 +202,7 @@ run_g.sh
 tmp/
 InternVL*
 Qwen*
+!vlmeval/vlm/qwen3_vl_baseline.py
 CongRong*
 Seed1.5*
 aguvis*

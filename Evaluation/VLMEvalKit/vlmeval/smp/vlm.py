@@ -8,6 +8,7 @@ import os.path as osp
 import base64
 from PIL import Image
 import sys
+import tempfile
 
 Image.MAX_IMAGE_PIXELS = 1e9
 
@@ -49,7 +50,7 @@ def concat_images_vlmeval(images, target_size=-1, mode='h', return_image=False):
     else:
         _str = '\n'.join(images)
         str_md5 = md5(_str)
-        tgt = osp.join('/tmp', str_md5 + '.jpg')
+        tgt = osp.join(tempfile.gettempdir(), str_md5 + '.jpg')
         dst.save(tgt)
         return tgt
 
@@ -159,7 +160,18 @@ def decode_base64_to_image_file(base64_string, image_path, target_size=-1):
     base_dir = osp.dirname(image_path)
     if not osp.exists(base_dir):
         os.makedirs(base_dir, exist_ok=True)
-    image.save(image_path)
+    if os.environ.get('VLMEVAL_ATOMIC_WRITES', '0') != '1':
+        image.save(image_path)
+        return
+
+    stem, suffix = osp.splitext(osp.basename(image_path))
+    temp_path = osp.join(base_dir, f'.{stem}.{os.getpid()}.{uuid4().hex}{suffix}')
+    try:
+        image.save(temp_path)
+        os.replace(temp_path, image_path)
+    finally:
+        if osp.exists(temp_path):
+            os.remove(temp_path)
 
 
 def build_option_str(option_dict):

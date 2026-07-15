@@ -1100,11 +1100,27 @@ qwen3vl_series = {
     ),
     "Qwen3-VL-8B-Instruct-COLT": partial(
         Qwen3VLChat,
-        model_path="hulianyuyy/CoLT-8B",
+        model_path=os.environ.get("COLT_EVAL_MODEL_PATH", "hulianyuyy/CoLT-8B"),
         use_custom_prompt=False,
         use_vllm=False,
         do_sample=False, 
         max_pixels=256*32*32, # for video
+        max_new_tokens=8192,
+        system_prompt= (
+            "Please answer this question based on the visual content."
+            "Provide your thinking process between the <think> and </think> tags, and then give your final answer between the <answer> and </answer> tags."
+            "At the end, you must output the final answer in the format:\n"
+            "<think>\nyour_thinking_process\n</think>\n\n<answer>\nyour_answer_here\n</answer>\n\n"
+        ),
+        post_process=True
+    ),
+    "Qwen3-VL-8B-Instruct-BASE-COT": partial(
+        Qwen3VLBaseChat,
+        model_path=os.environ.get("QWEN3_VL_BASE_MODEL_PATH", "Qwen/Qwen3-VL-8B-Instruct"),
+        use_custom_prompt=False,
+        use_vllm=False,
+        do_sample=False,
+        max_pixels=256*32*32,
         max_new_tokens=8192,
         system_prompt= (
             "Please answer this question based on the visual content."

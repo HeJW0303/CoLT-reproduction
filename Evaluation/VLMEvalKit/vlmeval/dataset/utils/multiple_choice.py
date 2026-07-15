@@ -3,6 +3,7 @@ from ...utils import can_infer, track_progress_rich, can_infer_lego
 from ...smp import *
 import numpy as np
 import re
+import tempfile
 
 MMB_abbrs = {
     'coarse_perception': 'CP',
@@ -563,7 +564,7 @@ def mcq_circular_eval(model, data, meta, nproc, result_file, dataset_name=None):
                     result[k] = v
 
     tmp_ext = get_pred_file_format()
-    tmp_pth = f'/tmp/{timestr()}.{tmp_ext}'
+    tmp_pth = osp.join(tempfile.gettempdir(), f'{timestr()}.{tmp_ext}')
     dump(data_main, tmp_pth)
     data_main = load(tmp_pth)
     indices = data_main['index']

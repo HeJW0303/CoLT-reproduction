@@ -7,6 +7,7 @@ import csv
 import hashlib
 import os.path as osp
 import time
+import uuid
 import numpy as np
 import validators
 import mimetypes
@@ -161,7 +162,20 @@ def dump(data, f, **kwargs):
 
     handlers = dict(pkl=dump_pkl, json=dump_json, jsonl=dump_jsonl, xlsx=dump_xlsx, csv=dump_csv, tsv=dump_tsv)
     suffix = f.split('.')[-1]
-    return handlers[suffix](data, f, **kwargs)
+    if os.environ.get('VLMEVAL_ATOMIC_WRITES', '0') != '1':
+        return handlers[suffix](data, f, **kwargs)
+
+    target = osp.abspath(f)
+    parent = osp.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    base_name = osp.basename(target)
+    temp = osp.join(parent, f'.{base_name}.{os.getpid()}.{uuid.uuid4().hex}.tmp.{suffix}')
+    try:
+        handlers[suffix](data, temp, **kwargs)
+        os.replace(temp, target)
+    finally:
+        if osp.exists(temp):
+            os.remove(temp)
 
 
 def get_pred_file_format():

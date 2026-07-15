@@ -1,17 +1,25 @@
 from .gpt import OpenAIWrapper, GPT4V
 from .hf_chat_model import HFChatModel
-from .gemini import GeminiWrapper, Gemini
-from .qwen_vl_api import QwenVLWrapper, QwenVLAPI, Qwen2VLAPI
-from .qwen_api import QwenAPI
+
+
+class _UnavailableVendoredAPI:
+    def __init__(self, *args, **kwargs):
+        raise ImportError(
+            "This API adapter was omitted from the vendored VLMEvalKit snapshot. "
+            "It is not required by the local CoLT evaluation profile."
+        )
+
+
+GeminiWrapper = Gemini = _UnavailableVendoredAPI
+QwenVLWrapper = QwenVLAPI = Qwen2VLAPI = QwenAPI = _UnavailableVendoredAPI
 from .claude import Claude_Wrapper, Claude3V
-from .reka import Reka
+Reka = _UnavailableVendoredAPI
 from .glm_vision import GLMVisionAPI
 from .cloudwalk import CWWrapper
-from .sensechat_vision import SenseChatVisionAPI
+SenseChatVisionAPI = _UnavailableVendoredAPI
 from .siliconflow import SiliconFlowAPI, TeleMMAPI
 from .hunyuan import HunyuanVision
-from .bailingmm import bailingMMAPI
-from .bluelm_api import BlueLMWrapper, BlueLM_API
+bailingMMAPI = BlueLMWrapper = BlueLM_API = _UnavailableVendoredAPI
 from .jt_vl_chat import JTVLChatAPI
 from .jt_vl_chat_mini import JTVLChatAPI_Mini
 from .taiyi import TaiyiAPI

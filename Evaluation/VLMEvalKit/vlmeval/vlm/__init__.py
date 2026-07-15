@@ -33,9 +33,18 @@ from .mplug_owl2 import mPLUG_Owl2
 from .omnilmm import OmniLMM12B
 from .open_flamingo import OpenFlamingo
 from .pandagpt import PandaGPT
-from .qwen_vl import QwenVL, QwenVLChat
-from .qwen2_vl import Qwen2VLChat, Qwen2VLChatAguvis
-from .qwen3_vl import Qwen3VLChat
+class _UnavailableVendoredModel:
+    def __init__(self, *args, **kwargs):
+        raise ImportError(
+            "This model adapter was omitted from the vendored VLMEvalKit snapshot. "
+            "Only the local CoLT Qwen3-VL adapter is supported by the A100 evaluation profile."
+        )
+
+
+QwenVL = QwenVLChat = _UnavailableVendoredModel
+Qwen2VLChat = Qwen2VLChatAguvis = _UnavailableVendoredModel
+from .colt_qwen3_vl import Qwen3VLChat
+from .qwen3_vl_baseline import Qwen3VLBaseChat
 from .transcore_m import TransCoreM
 from .visualglm import VisualGLM
 from .xcomposer import (
@@ -46,7 +55,7 @@ from .xcomposer import (
     XComposer2d5,
 )
 from .yi_vl import Yi_VL
-from .internvl import InternVLChat
+InternVLChat = _UnavailableVendoredModel
 from .deepseek_vl import DeepSeekVL
 from .deepseek_vl2 import DeepSeekVL2
 from .janus import Janus
@@ -95,15 +104,15 @@ from .ross import Ross
 from .ola import Ola
 from .x_vl import X_VL_HF
 from .ursa import UrsaChat
-from .vlm_r1 import VLMR1Chat
+VLMR1Chat = _UnavailableVendoredModel
 from .aki import AKI
 from .ristretto import Ristretto
-from .vlaa_thinker import VLAAThinkerChat
+VLAAThinkerChat = _UnavailableVendoredModel
 from .kimi_vl import KimiVL
-from .wethink_vl import WeThinkVL
+WeThinkVL = _UnavailableVendoredModel
 from .flash_vl import FlashVL
 from .oryx import Oryx
-from .treevgr import TreeVGR
+TreeVGR = _UnavailableVendoredModel
 from .varco_vision import VarcoVision
 from .qtunevl import (
     QTuneVL,

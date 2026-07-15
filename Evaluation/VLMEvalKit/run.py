@@ -250,7 +250,7 @@ def main():
     for _, model_name in enumerate(args.model):
         model = None
         date, commit_id = timestr('day'), githash(digits=8)
-        eval_id = f"T{date}_G{commit_id}"
+        eval_id = os.environ.get('VLMEVAL_EVAL_ID', f"T{date}_G{commit_id}")
 
         pred_root = osp.join(args.work_dir, model_name, eval_id)
         pred_root_meta = osp.join(args.work_dir, model_name)
@@ -489,6 +489,8 @@ def main():
             except Exception as e:
                 logger.exception(f'Model {model_name} x Dataset {dataset_name} combination failed: {e}, '
                                  'skipping this combination.')
+                if os.environ.get('VLMEVAL_FAIL_ON_ERROR', '0') == '1':
+                    raise
                 continue
 
     if WORLD_SIZE > 1:
