@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 from typing import Any
@@ -14,6 +16,11 @@ class Qwen3VLChat(BaseModel):
 
     INTERLEAVE = True
     VIDEO_LLM = True
+    VISION_PREPROCESS_PROFILES = {
+        "legacy14_processor_resize": (14, True),
+        "model_patch_processor_resize": (None, True),
+        "model_patch_no_processor_resize": (None, False),
+    }
 
     def __init__(
         self,
@@ -48,11 +55,22 @@ class Qwen3VLChat(BaseModel):
         self.post_process = post_process
         self.verbose = verbose
         self.seed = int(os.environ.get("COLT_EVAL_SEED", seed if seed is not None else 1234))
+        self.reseed_per_sample = os.environ.get("COLT_RESEED_PER_SAMPLE", "0") == "1"
+        self.vision_preprocess_profile = os.environ.get(
+            "COLT_VISION_PREPROCESS_PROFILE",
+            "legacy14_processor_resize",
+        )
+        if self.vision_preprocess_profile not in self.VISION_PREPROCESS_PROFILES:
+            supported = ", ".join(sorted(self.VISION_PREPROCESS_PROFILES))
+            raise ValueError(
+                "Unsupported COLT_VISION_PREPROCESS_PROFILE="
+                f"{self.vision_preprocess_profile!r}; expected one of: {supported}"
+            )
 
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
         if not torch.cuda.is_available():
-            raise RuntimeError("CoLT evaluation requires a CUDA GPU.")
+            raise RuntimeError("Qwen3-VL evaluation requires a CUDA GPU.")
         visible_gpus = torch.cuda.device_count()
         if visible_gpus != 1:
             raise RuntimeError(
@@ -83,13 +101,37 @@ class Qwen3VLChat(BaseModel):
         self.model.eval()
         parameter_devices = {parameter.device.type for parameter in self.model.parameters()}
         if parameter_devices != {"cuda"}:
-            raise RuntimeError(f"CoLT model was not loaded entirely on CUDA: {sorted(parameter_devices)}")
+            raise RuntimeError(f"Qwen3-VL model was not loaded entirely on CUDA: {sorted(parameter_devices)}")
 
+        processor_patch_size = int(self.processor.image_processor.patch_size)
+        processor_merge_size = int(self.processor.image_processor.merge_size)
+        if processor_patch_size != 16 or processor_merge_size != 2:
+            raise RuntimeError(
+                "The loaded Qwen3-VL processor must use patch_size=16 and merge_size=2, "
+                f"but reports patch_size={processor_patch_size}, merge_size={processor_merge_size}."
+            )
+        profile_patch_size, self.processor_do_resize = self.VISION_PREPROCESS_PROFILES[
+            self.vision_preprocess_profile
+        ]
+        self.vision_patch_size = processor_patch_size if profile_patch_size is None else profile_patch_size
+        if self.vision_preprocess_profile != "legacy14_processor_resize" and self.vision_patch_size != 16:
+            raise RuntimeError(
+                "The corrected Qwen3-VL profiles require image patch size 16, "
+                f"but the loaded processor reports {processor_patch_size}."
+            )
+
+        adapter_name = "CoLT" if getattr(self.model, "latent_reasoning_mode", False) else "Qwen3-VL baseline"
         print(
-            "[CoLT eval adapter] "
+            f"[{adapter_name} eval adapter] "
             f"model={model_path} seed={self.seed} device={self.device} "
             f"visible_gpus={visible_gpus} caller_do_sample={do_sample} "
-            f"caller_max_new_tokens={max_new_tokens}"
+            f"caller_max_new_tokens={max_new_tokens} "
+            f"vision_profile={self.vision_preprocess_profile} "
+            f"qwen_vl_utils_patch_size={self.vision_patch_size} "
+            f"processor_patch_size={processor_patch_size} "
+            f"processor_merge_size={processor_merge_size} "
+            f"processor_do_resize={self.processor_do_resize} "
+            f"reseed_per_sample={self.reseed_per_sample}"
         )
         if getattr(self.model, "latent_reasoning_mode", False):
             print(
@@ -125,6 +167,44 @@ class Qwen3VLChat(BaseModel):
                 raise ValueError(f"Unsupported message type: {kind}")
         return content
 
+    def _prepare_model_inputs(self, messages):
+        from qwen_vl_utils import process_vision_info
+
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image_inputs, video_inputs = process_vision_info(
+            messages,
+            image_patch_size=self.vision_patch_size,
+        )
+        processor_kwargs: dict[str, Any] = {
+            "text": [text],
+            "images": image_inputs,
+            "videos": video_inputs,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if not self.processor_do_resize:
+            processor_kwargs["images_kwargs"] = {"do_resize": False}
+            if video_inputs is not None:
+                processor_kwargs["videos_kwargs"] = {"do_resize": False}
+        return self.processor(**processor_kwargs).to(self.model.device)
+
+    def _reseed_sample(self, messages, dataset):
+        if not self.reseed_per_sample:
+            return
+        payload = json.dumps(
+            {"dataset": dataset, "messages": messages},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        sample_seed = (self.seed + int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")) % (2**63 - 1)
+        torch.manual_seed(sample_seed)
+        torch.cuda.manual_seed_all(sample_seed)
+
     @staticmethod
     def _extract_final_answer(response: str) -> str:
         matches = re.findall(r"<answer>\s*(.*?)\s*</answer>", response, flags=re.DOTALL | re.IGNORECASE)
@@ -146,27 +226,13 @@ class Qwen3VLChat(BaseModel):
 
     @torch.inference_mode()
     def generate_inner(self, message, dataset=None):
-        from qwen_vl_utils import process_vision_info
-
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.append({"role": "user", "content": self._prepare_content(message)})
+        self._reseed_sample(messages, dataset)
 
-        text = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self.model.device)
+        inputs = self._prepare_model_inputs(messages)
 
         generated_ids = self.model.generate(
             **inputs,

@@ -298,3 +298,42 @@ test -f /workspace/outputs/colt_codefaithful/model.safetensors.index.json
 ```bash
 rm -rf -- /workspace/outputs/colt_codefaithful/checkpoint-1910
 ```
+
+## 8. 图像预处理 A/B 诊断
+
+`15_eval_preprocess_ab_8gpu.sh` 仅评估 `AI2D_TEST` 和 `TextVQA_VAL`，依次运行：
+
+```text
+legacy14_processor_resize
+model_patch_processor_resize
+model_patch_no_processor_resize
+```
+
+第一项复现原适配器的 `image_patch_size=14`；后两项使用 Qwen3-VL processor
+报告的 patch size，并强制校验其为 16。第三项还会向 processor 传入
+`images_kwargs={"do_resize": false}`。脚本固定使用 baseline 的 greedy decoding，
+不需要、也不会执行逐样本重设随机种子。
+每个 profile 使用独立的 work directory，且脚本不启用跨 profile 的预测复用。为避免
+陈旧的 rank 临时文件混入新实验，每次启动还会创建带时间戳的新实验根目录；若该次运行的
+profile 目录意外非空，脚本会直接拒绝运行。
+
+只测试原始 Qwen3-VL textual-CoT baseline：
+
+```bash
+cd /workspace/CoLT
+COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+COLT_ALLOW_FULL_ROOT=1 \
+bash scripts/a100/15_eval_preprocess_ab_8gpu.sh
+```
+
+该诊断固定评估 `Qwen3-VL-8B-Instruct-BASE-COT`，不加载 CoLT checkpoint，也不支持用环境变量切换到 CoLT。
+
+所有输出与正式结果隔离：
+
+```text
+/workspace/eval/results/diagnostic_preprocess/
+/workspace/logs/eval/preprocess_ab_baseline_8gpu_*.log
+```
+
+完成三项 baseline 评估后会生成 `preprocess_ab_summary.csv`，包含论文 baseline 分数、
+相对论文的 gap、相对旧 `image_patch_size=14` profile 的分差、预测变化数、逐题改善/回退数量和长输出计数。

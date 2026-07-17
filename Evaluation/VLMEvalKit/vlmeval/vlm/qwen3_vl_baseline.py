@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import torch
 
@@ -15,11 +16,25 @@ class Qwen3VLBaseChat(Qwen3VLChat):
             raise RuntimeError(
                 "Qwen3VLBaseChat requires COLT_DISABLE_LATENT_REASONING=1 before model construction."
             )
+        expected_model_path = os.environ.get("QWEN3_VL_BASE_MODEL_PATH")
+        requested_model_path = kwargs.get("model_path")
+        if expected_model_path is None:
+            raise RuntimeError("Qwen3VLBaseChat requires QWEN3_VL_BASE_MODEL_PATH to be set.")
+        if requested_model_path is not None and Path(requested_model_path).resolve() != Path(expected_model_path).resolve():
+            raise RuntimeError(
+                "Qwen3VLBaseChat was asked to load a model other than QWEN3_VL_BASE_MODEL_PATH; "
+                f"requested={requested_model_path!r}, expected={expected_model_path!r}."
+            )
         super().__init__(*args, **kwargs)
 
+        if Path(self.model_path).resolve() != Path(expected_model_path).resolve():
+            raise RuntimeError(
+                "Qwen3VLBaseChat must load exactly QWEN3_VL_BASE_MODEL_PATH; "
+                f"model_path={self.model_path!r}, expected={expected_model_path!r}."
+            )
         if getattr(self.model, "latent_reasoning_mode", None) is not False:
             raise RuntimeError("The base Qwen3-VL model did not disable latent reasoning.")
-        forbidden_modules = (
+        forbidden_attributes = (
             "decoder",
             "backward_decoder",
             "prj",
@@ -27,10 +42,14 @@ class Qwen3VLBaseChat(Qwen3VLChat):
             "pj_in",
             "pj_back",
             "pj_out",
+            "alpha",
+            "latent_to_decoder_scale",
+            "num_latent",
+            "cot_boundary_token_ids",
         )
-        present = [name for name in forbidden_modules if hasattr(self.model, name)]
+        present = [name for name in forbidden_attributes if hasattr(self.model, name)]
         if present:
-            raise RuntimeError(f"The base Qwen3-VL model unexpectedly created CoLT modules: {present}")
+            raise RuntimeError(f"The base Qwen3-VL model unexpectedly created CoLT attributes: {present}")
 
         print(
             "[Qwen3-VL baseline] "
@@ -40,27 +59,13 @@ class Qwen3VLBaseChat(Qwen3VLChat):
 
     @torch.inference_mode()
     def generate_inner(self, message, dataset=None):
-        from qwen_vl_utils import process_vision_info
-
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.append({"role": "user", "content": self._prepare_content(message)})
+        self._reseed_sample(messages, dataset)
 
-        text = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self.model.device)
+        inputs = self._prepare_model_inputs(messages)
 
         generation_kwargs = {
             "max_new_tokens": self.max_new_tokens,
