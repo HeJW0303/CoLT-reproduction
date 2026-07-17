@@ -136,10 +136,7 @@ for gpu in "${gpu_ids[@]}"; do
     echo "Unable to query physical GPU $gpu." >&2
     exit 1
   fi
-  if [[ ! "$memory_used" =~ ^[0-9]+$ ]] || (( memory_used >= ${COLT_EVAL_MAX_USED_MIB:-500} )); then
-    echo "Physical GPU $gpu is not available: ${memory_used:-unknown} MiB is in use." >&2
-    exit 1
-  fi
+  echo "Physical GPU $gpu detected: ${memory_used:-unknown} MiB in use; memory usage is not enforced."
 done
 
 bash "$REPO_ROOT/scripts/a100/09_download_eval_data.sh" "${datasets[@]}"
