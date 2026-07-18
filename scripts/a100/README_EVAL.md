@@ -337,3 +337,28 @@ bash scripts/a100/15_eval_preprocess_ab_8gpu.sh
 
 完成三项 baseline 评估后会生成 `preprocess_ab_summary.csv`，包含论文 baseline 分数、
 相对论文的 gap、相对旧 `image_patch_size=14` profile 的分差、预测变化数、逐题改善/回退数量和长输出计数。
+
+## 9. Baseline 256-token 生成上限诊断
+
+官方 CoLT 潜在推理路径会在模型内部强制 `max_new_tokens=256`，但原始 Qwen3-VL
+baseline 不进入该路径，之前的 baseline 评估实际使用 `8192`。以下诊断保持原始
+baseline、greedy decoding 和 `legacy14_processor_resize` 不变，只把生成上限改为 256，
+并仅运行 `AI2D_TEST` 与 `TextVQA_VAL`：
+
+```bash
+cd /workspace/CoLT
+COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+COLT_ALLOW_FULL_ROOT=1 \
+bash scripts/a100/16_eval_base_max256_8gpu.sh
+```
+
+结果和日志分别写入：
+
+```text
+/workspace/eval/results/diagnostic_generation/base_max256/
+/workspace/logs/eval/qwen3vl_base_legacy14_greedy_max256_8gpu_*.log
+```
+
+该脚本使用独立模型名、评估 ID、fingerprint 和结果目录，不会读取或覆盖原有
+8192-token baseline 与预处理 A/B 结果。中断后用同一命令可以在相同 fingerprint
+目录内继续。

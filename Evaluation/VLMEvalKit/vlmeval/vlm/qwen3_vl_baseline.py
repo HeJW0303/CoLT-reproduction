@@ -27,6 +27,26 @@ class Qwen3VLBaseChat(Qwen3VLChat):
             )
         super().__init__(*args, **kwargs)
 
+        expected_max_new_tokens = os.environ.get("COLT_EXPECT_BASE_MAX_NEW_TOKENS")
+        if expected_max_new_tokens is not None:
+            try:
+                expected_max_new_tokens_int = int(expected_max_new_tokens)
+            except ValueError as error:
+                raise RuntimeError(
+                    "COLT_EXPECT_BASE_MAX_NEW_TOKENS must be a positive integer, "
+                    f"got {expected_max_new_tokens!r}."
+                ) from error
+            if expected_max_new_tokens_int <= 0:
+                raise RuntimeError(
+                    "COLT_EXPECT_BASE_MAX_NEW_TOKENS must be a positive integer, "
+                    f"got {expected_max_new_tokens_int}."
+                )
+            if self.max_new_tokens != expected_max_new_tokens_int:
+                raise RuntimeError(
+                    "The Qwen3-VL baseline generation limit does not match the required diagnostic profile: "
+                    f"configured={self.max_new_tokens}, expected={expected_max_new_tokens_int}."
+                )
+
         if Path(self.model_path).resolve() != Path(expected_model_path).resolve():
             raise RuntimeError(
                 "Qwen3VLBaseChat must load exactly QWEN3_VL_BASE_MODEL_PATH; "
