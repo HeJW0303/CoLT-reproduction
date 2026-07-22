@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+COLT_EXPECTED_GPU_NAME="A100-SXM4-80GB"

@@ -79,6 +79,9 @@ Then create soft link to the current dir by running ``ln -s /path_to_downloaded_
 
 For the storage-constrained 8xA100 reproduction profile, see [scripts/a100/README_A100.md](scripts/a100/README_A100.md).
 
+For the native Miniconda workflow shared by the `/data/nvme0/lkl` 8xA100 and 8xA800 servers,
+see [scripts/lkl_8gpu/README.md](scripts/lkl_8gpu/README.md).
+
 For training, we adopt 8 × 80GB GPUs; alternatively, you can also try to train the model on fewer GPUs (e.g., 2 or 4) with 80GB memory.
 
 The code to start training is:
