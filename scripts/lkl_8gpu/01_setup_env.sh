@@ -64,9 +64,9 @@ python -m pip install \
 python -m pip install \
   'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl'
 
-DS_BUILD_OPS=0 python -m pip install -e "$REPO_ROOT/LLaMA-Factory[torch,metrics,deepspeed]" --no-build-isolation
+python -m pip install -e "$REPO_ROOT/LLaMA-Factory[torch,metrics]" --no-build-isolation
+python "$REPO_ROOT/scripts/lkl_8gpu/install_deepspeed.py"
 python -m pip install \
-  deepspeed==0.16.9 \
   qwen-vl-utils==0.0.14 \
   huggingface_hub==0.36.2 \
   wandb

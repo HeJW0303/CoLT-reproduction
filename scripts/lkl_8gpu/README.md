@@ -103,7 +103,8 @@ bash scripts/lkl_8gpu/05_nccl_smoke.sh
 
 `01_setup_env.sh` 会创建 Python 3.11 环境
 `/data/nvme0/lkl/conda/envs/colt`，安装固定版本的 PyTorch 2.6.0+cu124、FlashAttention、
-DeepSpeed、LLaMA-Factory 和仓库内 Transformers。脚本不调用 `apt`，如果预检提示缺少
+DeepSpeed、LLaMA-Factory 和仓库内 Transformers。DeepSpeed 以 `DS_BUILD_OPS=0` 安装，
+当前 ZeRO-3 配置不需要系统 CUDA Toolkit 或 NVCC。脚本不调用 `apt`，如果预检提示缺少
 `git`、`curl`、`unzip` 或 `tmux`，需先让管理员安装系统包。
 
 模型、数据均使用固定 Hugging Face revision 下载并校验。下载中断后可直接重跑步骤 2；
