@@ -116,6 +116,6 @@ PY
 
 hf --help >/dev/null
 hf download --help >/dev/null
-ds_report
+ds_report --hide_operator_status
 
 echo "Environment setup completed: $CONDA_ENV_DIR"
