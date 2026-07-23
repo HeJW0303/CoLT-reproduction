@@ -25,6 +25,11 @@ PATCHED = (
     "        and os.environ.get('DS_BUILD_OPS', '0') == '1'):\n"
     "    cupy = None\n"
 )
+ORIGINAL_OP_CHECK = "for op_name, builder in ALL_OPS.items():\n    op_compatible = builder.is_compatible()\n"
+PATCHED_OP_CHECK = (
+    "for op_name, builder in ALL_OPS.items():\n"
+    "    op_compatible = builder.is_compatible() if op_enabled(op_name) else False\n"
+)
 
 
 def download(url: str, destination: Path) -> None:
@@ -60,9 +65,11 @@ def safe_extract(archive: Path, destination: Path) -> Path:
 def patch_setup(source_root: Path) -> None:
     setup_path = source_root / "setup.py"
     source = setup_path.read_text(encoding="utf-8")
-    if source.count(ORIGINAL) != 1:
+    if source.count(ORIGINAL) != 1 or source.count(ORIGINAL_OP_CHECK) != 1:
         raise RuntimeError("Pinned DeepSpeed setup.py no longer matches the expected source")
-    setup_path.write_text(source.replace(ORIGINAL, PATCHED), encoding="utf-8")
+    source = source.replace(ORIGINAL, PATCHED)
+    source = source.replace(ORIGINAL_OP_CHECK, PATCHED_OP_CHECK)
+    setup_path.write_text(source, encoding="utf-8")
 
 
 def main() -> None:

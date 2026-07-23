@@ -61,8 +61,16 @@ python -m pip install \
   --index-url https://download.pytorch.org/whl/cu124 \
   torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
 
-python -m pip install \
-  'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl'
+if python - <<'PY'
+import flash_attn
+assert flash_attn.__version__ == "2.7.4.post1", flash_attn.__version__
+PY
+then
+  echo "FlashAttention 2.7.4.post1 is already installed"
+else
+  python -m pip install \
+    'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl'
+fi
 
 python -m pip install -e "$REPO_ROOT/LLaMA-Factory[torch,metrics]" --no-build-isolation
 python "$REPO_ROOT/scripts/lkl_8gpu/install_deepspeed.py"
