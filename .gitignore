@@ -28,3 +28,8 @@ cache/
 downloads/
 tmp/
 ray_tmp/
+
+# LKL server-local CoLT runtime state
+/.colt_gpu_profile
+/checkpoints/
+/eval/

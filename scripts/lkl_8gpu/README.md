@@ -14,20 +14,23 @@
 ├── miniconda3/
 ├── conda/{envs,pkgs}/
 ├── CoLT-reproduction/
+│   ├── .colt_gpu_profile
+│   ├── checkpoints/
+│   ├── eval/
+│   ├── logs/
+│   ├── cache/
+│   └── tmp/
 ├── models/
 ├── datasets/
-├── checkpoints/
 ├── hf-cache/
 ├── torch-cache/
-├── cache/
-├── logs/
-├── eval/
-├── tmp/colt/
-└── colt/.colt_gpu_profile
+├── clash
+└── config.yaml
 ```
 
-脚本不会覆盖用户的 `HOME`。`COLT_LKL_ROOT` 等环境变量可覆盖默认路径，但两台机器建议
-保持完全相同的布局。
+模型、数据集、Hugging Face 缓存和 PyTorch 缓存体积大且可跨实验复用，因此保留在
+`/data/nvme0/lkl` 外层。CoLT 专属的 checkpoint、评测结果、日志、预处理缓存、临时文件和
+机器 profile 全部收进仓库目录，并由 `.gitignore` 排除。脚本不会覆盖用户的 `HOME`。
 
 ## 2. 克隆与代理
 
@@ -68,7 +71,7 @@ bash scripts/lkl_8gpu/00_verify_host.sh a800
 ```
 
 该命令严格检查 8 张 GPU 的型号，并写入
-`/data/nvme0/lkl/colt/.colt_gpu_profile`。后续脚本自动读取；若选错 profile，会在安装或
+`/data/nvme0/lkl/CoLT-reproduction/.colt_gpu_profile`。后续脚本自动读取；若选错 profile，会在安装或
 训练前退出。
 
 ## 4. 首次安装与数据准备
@@ -116,8 +119,8 @@ cd /data/nvme0/lkl/CoLT-reproduction
 bash scripts/lkl_8gpu/06_train.sh
 ```
 
-日志位于 `/data/nvme0/lkl/logs`，训练输出位于
-`/data/nvme0/lkl/checkpoints/colt_codefaithful`。脚本会记录 Git SHA、工作区 diff、依赖版本、
+日志位于 `/data/nvme0/lkl/CoLT-reproduction/logs`，训练输出位于
+`/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful`。脚本会记录 Git SHA、工作区 diff、依赖版本、
 训练 YAML 和 DeepSpeed 配置。
 
 只有确认是同一次训练的完整 checkpoint 后才使用恢复模式：

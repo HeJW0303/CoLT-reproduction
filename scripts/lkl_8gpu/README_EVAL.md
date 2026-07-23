@@ -3,7 +3,7 @@
 本评估配置固定使用训练完成后的推理模型：
 
 ```text
-/data/nvme0/lkl/checkpoints/colt_codefaithful
+/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful
 ```
 
 不要将 `global_step1910` 下的 DeepSpeed 分片直接作为推理模型。`checkpoint-1910`
@@ -23,7 +23,7 @@
 | TextVQA_VAL | 1166.1 MiB | 81.3 | 论文主要增益，约 +6.1 |
 
 八个 TSV 合计约 2.72 GiB。VLMEvalKit 会把 TSV 中的 base64 图像解码到
-`/data/nvme0/lkl/eval/LMUData/images`，因此完整评估建议预留 8--10 GiB。
+`/data/nvme0/lkl/CoLT-reproduction/eval/LMUData/images`，因此完整评估建议预留 8--10 GiB。
 
 ## 2. 评估语义
 
@@ -179,8 +179,8 @@ bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh
 完整文件。输出位置：
 
 ```text
-/data/nvme0/lkl/eval/results/baseline_qwen3vl_cot/all8/
-/data/nvme0/lkl/logs/eval/qwen3vl_base_cot_all8_8gpu_*.log
+/data/nvme0/lkl/CoLT-reproduction/eval/results/baseline_qwen3vl_cot/all8/
+/data/nvme0/lkl/CoLT-reproduction/logs/eval/qwen3vl_base_cot_all8_8gpu_*.log
 ```
 
 如被外部停止，使用同一命令重启即可保留已完成预测并续跑。文本推理基线采用 greedy
@@ -188,7 +188,7 @@ decoding，因此相同代码、模型和输入下不会出现 CoLT 随机采样
 
 ## 5. 分阶段评估
 
-该原生 Conda profile 已将评测数据、缓存、日志和结果全部路由到 `/data/nvme0/lkl`。
+该原生 Conda profile 已将评测数据、日志和结果全部路由到仓库目录。
 
 Phase 1 使用 GPU 0、1、2 并行运行：
 
@@ -237,8 +237,8 @@ COLT_EVAL_GPUS=3,4,5 bash scripts/lkl_8gpu/11_eval_phase.sh phase1
 每个任务使用独立结果目录和日志目录：
 
 ```text
-/data/nvme0/lkl/eval/results/codefaithful/<dataset>
-/data/nvme0/lkl/logs/eval
+/data/nvme0/lkl/CoLT-reproduction/eval/results/codefaithful/<dataset>
+/data/nvme0/lkl/CoLT-reproduction/logs/eval
 ```
 
 脚本会错开 60 秒加载模型，避免多个进程同时从 NFS 读取约 20 GiB 权重。可调整：
@@ -277,14 +277,14 @@ bash scripts/lkl_8gpu/09_download_eval_data.sh phase3
 删除前再次确认路径：
 
 ```bash
-du -sh /data/nvme0/lkl/checkpoints/colt_codefaithful/checkpoint-1910
-test -f /data/nvme0/lkl/checkpoints/colt_codefaithful/model.safetensors.index.json
+du -sh /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful/checkpoint-1910
+test -f /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful/model.safetensors.index.json
 ```
 
 满足条件后仅删除恢复 checkpoint，绝不能删除输出根目录的 5 个 safetensors：
 
 ```bash
-rm -rf -- /data/nvme0/lkl/checkpoints/colt_codefaithful/checkpoint-1910
+rm -rf -- /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful/checkpoint-1910
 ```
 
 ## 8. 图像预处理 A/B 诊断
@@ -318,8 +318,8 @@ bash scripts/lkl_8gpu/15_eval_preprocess_ab_8gpu.sh
 所有输出与正式结果隔离：
 
 ```text
-/data/nvme0/lkl/eval/results/diagnostic_preprocess/
-/data/nvme0/lkl/logs/eval/preprocess_ab_baseline_8gpu_*.log
+/data/nvme0/lkl/CoLT-reproduction/eval/results/diagnostic_preprocess/
+/data/nvme0/lkl/CoLT-reproduction/logs/eval/preprocess_ab_baseline_8gpu_*.log
 ```
 
 完成三项 baseline 评估后会生成 `preprocess_ab_summary.csv`，包含论文 baseline 分数、
@@ -341,8 +341,8 @@ bash scripts/lkl_8gpu/16_eval_base_max256_8gpu.sh
 结果和日志分别写入：
 
 ```text
-/data/nvme0/lkl/eval/results/diagnostic_generation/base_max256/
-/data/nvme0/lkl/logs/eval/qwen3vl_base_legacy14_greedy_max256_8gpu_*.log
+/data/nvme0/lkl/CoLT-reproduction/eval/results/diagnostic_generation/base_max256/
+/data/nvme0/lkl/CoLT-reproduction/logs/eval/qwen3vl_base_legacy14_greedy_max256_8gpu_*.log
 ```
 
 该脚本使用独立模型名、评估 ID、fingerprint 和结果目录，不会读取或覆盖原有

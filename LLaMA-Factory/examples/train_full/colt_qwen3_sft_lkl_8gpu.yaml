@@ -26,10 +26,10 @@ overwrite_cache: true
 preprocessing_num_workers: 32
 preprocessing_batch_size: 32
 max_samples: 1000000
-tokenized_path: /data/nvme0/lkl/cache/colt/onethinker_sft_tokenized
+tokenized_path: /data/nvme0/lkl/CoLT-reproduction/cache/colt/onethinker_sft_tokenized
 
 ### output
-output_dir: /data/nvme0/lkl/checkpoints/colt_codefaithful
+output_dir: /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful
 logging_steps: 1
 save_steps: 1000
 save_strategy: steps
