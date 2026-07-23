@@ -7,7 +7,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 
 
@@ -29,6 +29,16 @@ ORIGINAL_OP_CHECK = "for op_name, builder in ALL_OPS.items():\n    op_compatible
 PATCHED_OP_CHECK = (
     "for op_name, builder in ALL_OPS.items():\n"
     "    op_compatible = builder.is_compatible() if op_enabled(op_name) else False\n"
+)
+ORIGINAL_RUNTIME_CHECK = (
+    "for op_name, builder in ALL_OPS.items():\n"
+    "    op_compatible = builder.is_compatible()\n"
+    "    compatible_ops[op_name] = op_compatible\n"
+)
+PATCHED_RUNTIME_CHECK = (
+    "for op_name, builder in ALL_OPS.items():\n"
+    "    op_compatible = builder.is_compatible() if installed_ops.get(op_name, False) else False\n"
+    "    compatible_ops[op_name] = op_compatible\n"
 )
 
 
@@ -71,14 +81,31 @@ def patch_setup(source_root: Path) -> None:
     source = source.replace(ORIGINAL_OP_CHECK, PATCHED_OP_CHECK)
     setup_path.write_text(source, encoding="utf-8")
 
+    runtime_path = source_root / "deepspeed/git_version_info.py"
+    runtime_source = runtime_path.read_text(encoding="utf-8")
+    if runtime_source.count(ORIGINAL_RUNTIME_CHECK) != 1:
+        raise RuntimeError("Pinned DeepSpeed git_version_info.py no longer matches the expected source")
+    runtime_path.write_text(
+        runtime_source.replace(ORIGINAL_RUNTIME_CHECK, PATCHED_RUNTIME_CHECK),
+        encoding="utf-8",
+    )
+
+
+def patched_install_present() -> bool:
+    try:
+        package = distribution("deepspeed")
+    except PackageNotFoundError:
+        return False
+    if package.version != DEEPSPEED_VERSION:
+        return False
+    runtime_path = Path(package.locate_file("deepspeed/git_version_info.py"))
+    return runtime_path.is_file() and PATCHED_RUNTIME_CHECK in runtime_path.read_text(encoding="utf-8")
+
 
 def main() -> None:
-    try:
-        if version("deepspeed") == DEEPSPEED_VERSION:
-            print(f"DeepSpeed {DEEPSPEED_VERSION} is already installed")
-            return
-    except PackageNotFoundError:
-        pass
+    if patched_install_present():
+        print(f"DeepSpeed {DEEPSPEED_VERSION} is already installed with no-toolkit compatibility")
+        return
 
     temp_parent = Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
     temp_parent.mkdir(parents=True, exist_ok=True)
@@ -100,8 +127,8 @@ def main() -> None:
             env=env,
         )
 
-    if version("deepspeed") != DEEPSPEED_VERSION:
-        raise RuntimeError("DeepSpeed version verification failed after installation")
+    if version("deepspeed") != DEEPSPEED_VERSION or not patched_install_present():
+        raise RuntimeError("DeepSpeed no-toolkit installation verification failed")
     print(f"DeepSpeed {DEEPSPEED_VERSION} installed without precompiled CUDA ops")
 
 
