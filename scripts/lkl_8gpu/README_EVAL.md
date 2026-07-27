@@ -233,7 +233,15 @@ decoding，因此相同代码、模型和输入下不会出现 CoLT 随机采样
 ```bash
 COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
 VLMEVAL_WORKERS_PER_GPU=3 \
-bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh
+bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh all8
+```
+
+先单独验证 ChartQA：
+
+```bash
+COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=3 \
+bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh chartqa
 ```
 
 该命令仍固定使用 greedy decoding 和 `max_new_tokens=8192`，同时启用 CPU 图像预取、

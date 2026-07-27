@@ -5,16 +5,28 @@ export COLT_REQUIRE_FINAL_MODEL=0
 source "$(cd "$(dirname "$0")" && pwd)/eval_common.sh"
 require_workspace_layout
 
-datasets=(
-  MMStar
-  ChartQA_TEST
-  ScienceQA_TEST
-  AI2D_TEST
-  MMT-Bench_VAL
-  MMBench_DEV_EN
-  TextVQA_VAL
-  SEEDBench_IMG
-)
+group="${1:-all8}"
+case "$group" in
+  chartqa)
+    datasets=(ChartQA_TEST)
+    ;;
+  all8)
+    datasets=(
+      MMStar
+      ChartQA_TEST
+      ScienceQA_TEST
+      AI2D_TEST
+      MMT-Bench_VAL
+      MMBench_DEV_EN
+      TextVQA_VAL
+      SEEDBench_IMG
+    )
+    ;;
+  *)
+    echo "Usage: $0 chartqa|all8" >&2
+    exit 1
+    ;;
+esac
 eval_model_name="Qwen3-VL-8B-Instruct-BASE-COT"
 paper_profile="qwen3vl_cot"
 gpu_csv="${COLT_EVAL_GPUS:-0,1,2,3,4,5,6,7}"
@@ -41,7 +53,7 @@ if [[ "$dist_backend" != "gloo" && "$dist_backend" != "nccl" ]]; then
 fi
 
 run_id="$(date +%Y%m%d_%H%M%S)"
-log_file="$EVAL_LOG_ROOT/qwen3vl_base_cot_all8_w${workers_per_gpu}_${run_id}.log"
+log_file="$EVAL_LOG_ROOT/qwen3vl_base_cot_${group}_w${workers_per_gpu}_${run_id}.log"
 exec > >(tee -a "$log_file") 2>&1
 
 export COLT_DISABLE_LATENT_REASONING=1
@@ -275,8 +287,8 @@ print(digest.hexdigest()[:12])
 PY
 )"
 
-eval_profile="replicas${nproc_per_node}_w${workers_per_gpu}_p${prefetch}_c${empty_cache_every_n}_all8_greedy_seed${COLT_EVAL_SEED}_${eval_fingerprint}"
-work_dir="$EVAL_OUTPUT_ROOT/baseline_qwen3vl_cot/throughput_replicas/all8/$eval_profile"
+eval_profile="replicas${nproc_per_node}_w${workers_per_gpu}_p${prefetch}_c${empty_cache_every_n}_${group}_greedy_seed${COLT_EVAL_SEED}_${eval_fingerprint}"
+work_dir="$EVAL_OUTPUT_ROOT/baseline_qwen3vl_cot/throughput_replicas/$group/$eval_profile"
 eval_id="BASE_COT_${eval_profile}"
 
 export CUDA_VISIBLE_DEVICES="$gpu_csv"
@@ -339,5 +351,5 @@ python "$REPO_ROOT/scripts/lkl_8gpu/validate_eval_suite.py" \
   "${datasets[@]}" \
   --paper-profile "$paper_profile"
 
-echo "Qwen3-VL base textual-CoT evaluation completed and all eight datasets validated."
+echo "Qwen3-VL base textual-CoT evaluation completed and validated: $group"
 echo "Log: $log_file"
