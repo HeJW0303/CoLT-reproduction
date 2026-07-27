@@ -18,11 +18,34 @@ datasets=(
 eval_model_name="Qwen3-VL-8B-Instruct-BASE-COT"
 paper_profile="qwen3vl_cot"
 gpu_csv="${COLT_EVAL_GPUS:-0,1,2,3,4,5,6,7}"
+workers_per_gpu="${VLMEVAL_WORKERS_PER_GPU:-1}"
+prefetch="${VLMEVAL_PREFETCH:-1}"
+empty_cache_every_n="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"
+dist_backend="${VLMEVAL_DIST_BACKEND:-gloo}"
+
+if [[ ! "$workers_per_gpu" =~ ^[1-9][0-9]*$ ]]; then
+  echo "VLMEVAL_WORKERS_PER_GPU must be a positive integer: $workers_per_gpu" >&2
+  exit 1
+fi
+if [[ "$prefetch" != "0" && "$prefetch" != "1" ]]; then
+  echo "VLMEVAL_PREFETCH must be 0 or 1: $prefetch" >&2
+  exit 1
+fi
+if [[ ! "$empty_cache_every_n" =~ ^[0-9]+$ ]]; then
+  echo "VLMEVAL_EMPTY_CACHE_EVERY_N must be a non-negative integer: $empty_cache_every_n" >&2
+  exit 1
+fi
+if [[ "$dist_backend" != "gloo" && "$dist_backend" != "nccl" ]]; then
+  echo "VLMEVAL_DIST_BACKEND must be gloo or nccl: $dist_backend" >&2
+  exit 1
+fi
+
 run_id="$(date +%Y%m%d_%H%M%S)"
-log_file="$EVAL_LOG_ROOT/qwen3vl_base_cot_all8_8gpu_${run_id}.log"
+log_file="$EVAL_LOG_ROOT/qwen3vl_base_cot_all8_w${workers_per_gpu}_${run_id}.log"
 exec > >(tee -a "$log_file") 2>&1
 
 export COLT_DISABLE_LATENT_REASONING=1
+export COLT_EXPECT_BASE_MAX_NEW_TOKENS=8192
 export QWEN3_VL_BASE_MODEL_PATH="$BASE_MODEL_DIR"
 
 touch "$VLMEVAL_ROOT/.env"
@@ -140,6 +163,7 @@ for gpu in "${gpu_ids[@]}"; do
     exit 1
   fi
 done
+nproc_per_node=$(( ${#gpu_ids[@]} * workers_per_gpu ))
 
 eval_fingerprint="$(
   python - \
@@ -149,6 +173,10 @@ eval_fingerprint="$(
     "$BASE_MODEL_REVISION" \
     "$COLT_EVAL_SEED" \
     "$paper_profile" \
+    "$workers_per_gpu" \
+    "$prefetch" \
+    "$empty_cache_every_n" \
+    "$dist_backend" \
     "${datasets[@]}" <<'PY'
 import hashlib
 import sys
@@ -161,7 +189,11 @@ model_root = Path(sys.argv[3]).resolve()
 model_revision = sys.argv[4]
 seed = sys.argv[5]
 paper_profile = sys.argv[6]
-datasets = sys.argv[7:]
+workers_per_gpu = sys.argv[7]
+prefetch = sys.argv[8]
+empty_cache_every_n = sys.argv[9]
+dist_backend = sys.argv[10]
+datasets = sys.argv[11:]
 digest = hashlib.sha256()
 
 
@@ -203,6 +235,10 @@ add_text("mode", "qwen3vl-native-textual-cot-greedy")
 add_text("model_revision", model_revision)
 add_text("seed", seed)
 add_text("paper_profile", paper_profile)
+add_text("workers_per_gpu", workers_per_gpu)
+add_text("prefetch", prefetch)
+add_text("empty_cache_every_n", empty_cache_every_n)
+add_text("dist_backend", dist_backend)
 add_text("datasets", "\n".join(datasets))
 for distribution in (
     "torch", "transformers", "flash-attn", "qwen-vl-utils", "numpy",
@@ -239,8 +275,8 @@ print(digest.hexdigest()[:12])
 PY
 )"
 
-eval_profile="dp8_all8_greedy_seed${COLT_EVAL_SEED}_${eval_fingerprint}"
-work_dir="$EVAL_OUTPUT_ROOT/baseline_qwen3vl_cot/all8/$eval_profile"
+eval_profile="replicas${nproc_per_node}_w${workers_per_gpu}_p${prefetch}_c${empty_cache_every_n}_all8_greedy_seed${COLT_EVAL_SEED}_${eval_fingerprint}"
+work_dir="$EVAL_OUTPUT_ROOT/baseline_qwen3vl_cot/throughput_replicas/all8/$eval_profile"
 eval_id="BASE_COT_${eval_profile}"
 
 export CUDA_VISIBLE_DEVICES="$gpu_csv"
@@ -249,8 +285,10 @@ export VLMEVAL_EVAL_ID="$eval_id"
 export PRED_FORMAT=xlsx
 export EVAL_FORMAT=csv
 export DIST_TIMEOUT="${DIST_TIMEOUT:-7200}"
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export VLMEVAL_WORKERS_PER_GPU="$workers_per_gpu"
+export VLMEVAL_PREFETCH="$prefetch"
+export VLMEVAL_EMPTY_CACHE_EVERY_N="$empty_cache_every_n"
+export VLMEVAL_DIST_BACKEND="$dist_backend"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE
 mkdir -p "$work_dir"
@@ -259,7 +297,12 @@ echo "Datasets: ${datasets[*]}"
 echo "Baseline: Qwen3-VL-8B-Instruct textual reasoning (paper average 75.7)"
 echo "Generation: native Hugging Face greedy decoding, max_new_tokens=8192"
 echo "CoLT latent reasoning: disabled before model construction"
-echo "Parallelism: 8 model replicas; every dataset is sharded across all 8 ranks"
+echo "Physical GPU count: ${#gpu_ids[@]}"
+echo "Workers per GPU: $VLMEVAL_WORKERS_PER_GPU"
+echo "Total model workers: $nproc_per_node"
+echo "CPU preprocessing prefetch: $VLMEVAL_PREFETCH"
+echo "empty_cache frequency: $VLMEVAL_EMPTY_CACHE_EVERY_N (0=disabled)"
+echo "Distributed backend: $VLMEVAL_DIST_BACKEND"
 echo "Physical GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Evaluation fingerprint: $eval_fingerprint"
 echo "Evaluation id: $eval_id"
@@ -272,7 +315,7 @@ cd "$VLMEVAL_ROOT"
 args=(
   --standalone
   --nnodes=1
-  --nproc_per_node=8
+  --nproc_per_node="$nproc_per_node"
   --max_restarts=0
   run.py
   --data "${datasets[@]}"

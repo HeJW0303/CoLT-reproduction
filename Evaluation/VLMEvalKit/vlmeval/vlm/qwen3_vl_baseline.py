@@ -78,15 +78,10 @@ class Qwen3VLBaseChat(Qwen3VLChat):
         )
 
     @torch.inference_mode()
-    def generate_inner(self, message, dataset=None):
-        messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": self._prepare_content(message)})
-        self._reseed_sample(messages, dataset)
-
-        inputs = self._prepare_model_inputs(messages)
-
+    def generate_prepared(self, prepared):
+        messages = prepared["messages"]
+        self._reseed_sample(messages, prepared["dataset"])
+        inputs = prepared["inputs"].to(self.model.device)
         generation_kwargs = {
             "max_new_tokens": self.max_new_tokens,
             "do_sample": self.do_sample,
@@ -95,12 +90,16 @@ class Qwen3VLBaseChat(Qwen3VLChat):
             generation_kwargs.update(temperature=self.temperature, top_k=self.top_k)
         generated_ids = self.model.generate(**inputs, **generation_kwargs)
         generated_ids = generated_ids[:, inputs.input_ids.shape[1] :]
-        response = self.processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
+        with self._processor_lock:
+            response = self.processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
 
         if self.verbose:
             print(f"[Qwen3-VL baseline raw response] {response}", flush=True)
         return self._extract_final_answer(response) if self.post_process else response
+
+    def generate_inner(self, message, dataset=None):
+        return self.generate_prepared(self._prepare_preprocessed_request(message, dataset))

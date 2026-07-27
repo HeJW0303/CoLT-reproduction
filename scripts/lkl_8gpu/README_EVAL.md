@@ -228,6 +228,19 @@ bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh
 如被外部停止，使用同一命令重启即可保留已完成预测并续跑。文本推理基线采用 greedy
 decoding，因此相同代码、模型和输入下不会出现 CoLT 随机采样的续跑随机序列变化问题。
 
+使用吞吐优化后的 8 卡、每卡 3 worker 运行同一套 baseline：
+
+```bash
+COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=3 \
+bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh
+```
+
+该命令仍固定使用 greedy decoding 和 `max_new_tokens=8192`，同时启用 CPU 图像预取、
+关闭逐样本 `empty_cache()` 并使用 Gloo 同步。结果隔离在
+`eval/results/baseline_qwen3vl_cot/throughput_replicas/`，不会复用旧 8-worker 预测。
+若 3 个模型副本导致显存不足，将 `VLMEVAL_WORKERS_PER_GPU` 降为 `2` 后使用同一命令重跑。
+
 ## 6. 分阶段评估
 
 该原生 Conda profile 已将评测数据、日志和结果全部路由到仓库目录。
