@@ -136,6 +136,48 @@ SEEDBench_IMG
 同目录临时文件，再原子替换正式文件。因此进程在写文件期间被强制停止时，正式路径不会
 留下半个 pickle、xlsx 或图片。
 
+## 4. 多模型副本吞吐评估（实验路线）
+
+`17_eval_colt_replicas.sh` 是独立的吞吐实验入口，不覆盖上面的
+`codefaithful` 结果。它保留 Transformers + CoLT latent generation，新增三项优化：
+
+- 每个 rank 在 CPU 线程中预取下一个样本的图像预处理；
+- 默认不再逐样本调用 `torch.cuda.empty_cache()`；
+- 每张物理 GPU 启动多个完整模型副本，而不是使用 vLLM TP。当前 CoLT latent
+  hidden-state 递归路径仍不兼容 vLLM。
+
+每个 worker 只看到一张 CUDA 设备；例如后四张卡、每卡 3 个副本即启动 12 个 rank：
+
+```bash
+cd /data/nvme0/lkl/CoLT-reproduction
+COLT_EVAL_GPUS=4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=3 \
+bash scripts/lkl_8gpu/17_eval_colt_replicas.sh mmstar
+```
+
+通过 MMStar smoke 后运行剩余 7 个数据集：
+
+```bash
+COLT_EVAL_GPUS=4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=3 \
+bash scripts/lkl_8gpu/17_eval_colt_replicas.sh remaining7
+```
+
+也可以一次跑完整 8 项：
+
+```bash
+COLT_EVAL_GPUS=4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=3 \
+bash scripts/lkl_8gpu/17_eval_colt_replicas.sh all8
+```
+
+该实验默认设置 `VLMEVAL_PREFETCH=1`、`VLMEVAL_EMPTY_CACHE_EVERY_N=0`、
+`VLMEVAL_DIST_BACKEND=gloo` 和 `COLT_RESEED_PER_SAMPLE=1`，结果写入
+`eval/results/throughput_replicas/`。最后一项会让随机 seed 按样本内容确定，便于比较
+不同 worker 数量；因此应与同样设置的单 worker reference 比较准确率，而不是与旧的
+全局 RNG code-faithful 目录做逐 token 比较。若显存不足，先将
+`VLMEVAL_WORKERS_PER_GPU=2` 做 smoke，再决定是否恢复 3。
+
 执行顺序有意将 ChartQA 等较小且高价值的任务放在前面，将样本最多的 SEEDBench_IMG
 放在最后，以便共享服务器再次发生外部中断时尽可能保留更多完整结果。
 
@@ -147,7 +189,7 @@ SEEDBench_IMG
 会重新初始化随机数状态，因此续跑后尚未完成样本的随机序列不保证与一次无中断运行逐
 token 相同；这不影响结果完整性，但若要做严格的逐 token 可复现对照，应保证整轮不中断。
 
-## 4. 初始 Qwen3-VL 文本推理基线
+## 5. 初始 Qwen3-VL 文本推理基线
 
 论文对初始 `Qwen3-VL-8B-Instruct` 报告了两种设置：
 
@@ -186,7 +228,7 @@ bash scripts/lkl_8gpu/14_eval_base_qwen3vl_cot_8gpu.sh
 如被外部停止，使用同一命令重启即可保留已完成预测并续跑。文本推理基线采用 greedy
 decoding，因此相同代码、模型和输入下不会出现 CoLT 随机采样的续跑随机序列变化问题。
 
-## 5. 分阶段评估
+## 6. 分阶段评估
 
 该原生 Conda profile 已将评测数据、日志和结果全部路由到仓库目录。
 
@@ -247,7 +289,7 @@ COLT_EVAL_GPUS=3,4,5 bash scripts/lkl_8gpu/11_eval_phase.sh phase1
 COLT_EVAL_STAGGER_SECONDS=120 bash scripts/lkl_8gpu/11_eval_phase.sh phase1
 ```
 
-## 6. 下载与校验
+## 7. 下载与校验
 
 公开 OpenCompass OSS 站点当前证书已过期。下载脚本先尝试正常 TLS；失败后才使用
 `curl -k`，并强制核对仓库内记录的文件字节数和 MD5。因此证书绕过不会绕过数据
@@ -263,7 +305,7 @@ bash scripts/lkl_8gpu/09_download_eval_data.sh phase3
 
 中断后重新运行会继续 `.part` 文件并在完成后校验。
 
-## 7. Checkpoint 清理
+## 8. Checkpoint 清理
 
 `checkpoint-1000` 已由 Trainer 自动删除。`checkpoint-1910` 是当前唯一包含优化器和
 随机状态的完整恢复点。由于输出根目录已经另存了完整推理模型，可在以下条件全部满足
@@ -287,7 +329,7 @@ test -f /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful/model.sa
 rm -rf -- /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful/checkpoint-1910
 ```
 
-## 8. 图像预处理 A/B 诊断
+## 9. 图像预处理 A/B 诊断
 
 `15_eval_preprocess_ab_8gpu.sh` 仅评估 `AI2D_TEST` 和 `TextVQA_VAL`，依次运行：
 
@@ -325,7 +367,7 @@ bash scripts/lkl_8gpu/15_eval_preprocess_ab_8gpu.sh
 完成三项 baseline 评估后会生成 `preprocess_ab_summary.csv`，包含论文 baseline 分数、
 相对论文的 gap、相对旧 `image_patch_size=14` profile 的分差、预测变化数、逐题改善/回退数量和长输出计数。
 
-## 9. Baseline 256-token 生成上限诊断
+## 10. Baseline 256-token 生成上限诊断
 
 官方 CoLT 潜在推理路径会在模型内部强制 `max_new_tokens=256`，但原始 Qwen3-VL
 baseline 不进入该路径，之前的 baseline 评估实际使用 `8192`。以下诊断保持原始

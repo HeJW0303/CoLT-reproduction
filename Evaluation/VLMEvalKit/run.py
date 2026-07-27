@@ -21,21 +21,39 @@ def get_gpu_list():
 RANK = int(os.environ.get('RANK', 0))
 WORLD_SIZE = int(os.environ.get('WORLD_SIZE', 1))
 LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE",1))
-LOCAL_RANK = int(os.environ.get("LOCAL_RANK",1))
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+WORKERS_PER_GPU = int(os.environ.get("VLMEVAL_WORKERS_PER_GPU", "1"))
+if WORKERS_PER_GPU < 1:
+    raise ValueError("VLMEVAL_WORKERS_PER_GPU must be at least 1")
 
 GPU_LIST = get_gpu_list()
-if LOCAL_WORLD_SIZE > 1 and len(GPU_LIST):
+if len(GPU_LIST) and (LOCAL_WORLD_SIZE > 1 or WORKERS_PER_GPU > 1):
     NGPU = len(GPU_LIST)
-    assert NGPU >= LOCAL_WORLD_SIZE, "The number of processes should be less than or equal to the number of GPUs"
-    GPU_PER_PROC = NGPU // LOCAL_WORLD_SIZE
-    DEVICE_START_IDX = GPU_PER_PROC * LOCAL_RANK
-    CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
-    CUDA_VISIBLE_DEVICES = ','.join(CUDA_VISIBLE_DEVICES)
+    if WORKERS_PER_GPU > 1:
+        expected_world_size = NGPU * WORKERS_PER_GPU
+        if LOCAL_WORLD_SIZE != expected_world_size:
+            raise ValueError(
+                "The worker mapping requires "
+                f"nproc_per_node={expected_world_size} for {NGPU} GPUs and "
+                f"VLMEVAL_WORKERS_PER_GPU={WORKERS_PER_GPU}, got {LOCAL_WORLD_SIZE}."
+            )
+        physical_gpu = GPU_LIST[LOCAL_RANK // WORKERS_PER_GPU]
+        CUDA_VISIBLE_DEVICES = str(physical_gpu)
+    else:
+        if NGPU < LOCAL_WORLD_SIZE:
+            raise ValueError("The number of processes must not exceed the number of GPUs")
+        gpu_per_process = NGPU // LOCAL_WORLD_SIZE
+        device_start_idx = gpu_per_process * LOCAL_RANK
+        visible_devices = GPU_LIST[device_start_idx:device_start_idx + gpu_per_process]
+        CUDA_VISIBLE_DEVICES = ','.join(str(device) for device in visible_devices)
+        physical_gpu = CUDA_VISIBLE_DEVICES
     # Set CUDA_VISIBLE_DEVICES
     os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
     print(
         f'RANK: {RANK}, LOCAL_RANK: {LOCAL_RANK}, WORLD_SIZE: {WORLD_SIZE},'
-        f'LOCAL_WORLD_SIZE: {LOCAL_WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}'
+        f'LOCAL_WORLD_SIZE: {LOCAL_WORLD_SIZE}, '
+        f'WORKERS_PER_GPU: {WORKERS_PER_GPU}, '
+        f'PHYSICAL_GPU: {physical_gpu}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}'
     )
 
 
@@ -242,8 +260,9 @@ def main():
 
     if WORLD_SIZE > 1:
         import torch.distributed as dist
+        dist_backend = os.environ.get('VLMEVAL_DIST_BACKEND', 'nccl')
         dist.init_process_group(
-            backend='nccl',
+            backend=dist_backend,
             timeout=datetime.timedelta(seconds=int(os.environ.get('DIST_TIMEOUT', 3600)))
         )
 

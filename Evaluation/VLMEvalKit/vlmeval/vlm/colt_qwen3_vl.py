@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from typing import Any
 
 import torch
@@ -89,6 +90,7 @@ class Qwen3VLChat(BaseModel):
             local_files_only=True,
             trust_remote_code=True,
         )
+        self._processor_lock = threading.Lock()
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
@@ -170,11 +172,12 @@ class Qwen3VLChat(BaseModel):
     def _prepare_model_inputs(self, messages):
         from qwen_vl_utils import process_vision_info
 
-        text = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        with self._processor_lock:
+            text = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         image_inputs, video_inputs = process_vision_info(
             messages,
             image_patch_size=self.vision_patch_size,
@@ -190,7 +193,28 @@ class Qwen3VLChat(BaseModel):
             processor_kwargs["images_kwargs"] = {"do_resize": False}
             if video_inputs is not None:
                 processor_kwargs["videos_kwargs"] = {"do_resize": False}
-        return self.processor(**processor_kwargs).to(self.model.device)
+        with self._processor_lock:
+            return self.processor(**processor_kwargs)
+
+    def _prepare_preprocessed_request(self, message, dataset=None):
+        assert message is not None and self.check_content(message) == "listdict"
+        for item in message:
+            assert item["type"] in self.allowed_types
+
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": self._prepare_content(message)})
+        return {
+            "dataset": dataset,
+            "messages": messages,
+            "inputs": self._prepare_model_inputs(messages),
+        }
+
+    def prepare_request(self, message, dataset=None):
+        """Build CPU model inputs so the caller can overlap preprocessing with CUDA generation."""
+        assert self.check_content(message) in ["str", "dict", "liststr", "listdict"]
+        return self._prepare_preprocessed_request(self.preproc_content(message), dataset)
 
     def _reseed_sample(self, messages, dataset):
         if not self.reseed_per_sample:
@@ -225,14 +249,10 @@ class Qwen3VLChat(BaseModel):
         return response.strip()
 
     @torch.inference_mode()
-    def generate_inner(self, message, dataset=None):
-        messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": self._prepare_content(message)})
-        self._reseed_sample(messages, dataset)
-
-        inputs = self._prepare_model_inputs(messages)
+    def generate_prepared(self, prepared):
+        messages = prepared["messages"]
+        self._reseed_sample(messages, prepared["dataset"])
+        inputs = prepared["inputs"].to(self.model.device)
 
         generated_ids = self.model.generate(
             **inputs,
@@ -242,12 +262,16 @@ class Qwen3VLChat(BaseModel):
             top_k=self.top_k,
         )
         generated_ids = generated_ids[:, inputs.input_ids.shape[1] :]
-        response = self.processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
+        with self._processor_lock:
+            response = self.processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
 
         if self.verbose:
             print(f"[CoLT raw response] {response}", flush=True)
         return self._extract_final_answer(response) if self.post_process else response
+
+    def generate_inner(self, message, dataset=None):
+        return self.generate_prepared(self._prepare_preprocessed_request(message, dataset))

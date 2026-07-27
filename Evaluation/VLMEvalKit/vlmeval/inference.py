@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 import torch.distributed as dist
 from vlmeval.config import supported_VLM
@@ -144,35 +146,92 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     else:
         model.set_dump_image(dataset.dump_image)
 
-    for i in tqdm(range(lt), desc=f'Infer {model_name}/{dataset_name}, Rank {rank}/{world_size}'):
-        idx = data.iloc[i]['index']
-        if idx in res:
-            continue
-
+    def build_struct(position):
         if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
-            struct = model.build_prompt(data.iloc[i], dataset=dataset_name)
-        else:
-            struct = dataset.build_prompt(data.iloc[i])
+            return model.build_prompt(data.iloc[position], dataset=dataset_name)
+        return dataset.build_prompt(data.iloc[position])
 
-        # If `SKIP_ERR` flag is set, the model will skip the generation if error is encountered
+    prefetch_enabled = (
+        os.environ.get('VLMEVAL_PREFETCH', '0') == '1'
+        and hasattr(model, 'prepare_request')
+        and hasattr(model, 'generate_prepared')
+    )
+    empty_cache_every_n = int(os.environ.get('VLMEVAL_EMPTY_CACHE_EVERY_N', '0'))
+    if empty_cache_every_n < 0:
+        raise ValueError('VLMEVAL_EMPTY_CACHE_EVERY_N must be non-negative')
+
+    def generate_with_error_handling(generate_func):
+        # If `SKIP_ERR` flag is set, skip a failed sample and preserve the old
+        # result-file contract. Preparation failures are handled identically.
         if os.environ.get('SKIP_ERR', False) == '1':
-            FAIL_MSG = 'Failed to obtain answer'
+            fail_msg = 'Failed to obtain answer'
             try:
-                response = model.generate(message=struct, dataset=dataset_name)
+                return generate_func()
             except RuntimeError as err:
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 warnings.warn(f'{type(err)} {str(err)}')
-                response = f'{FAIL_MSG}: {type(err)} {str(err)}'
-        else:
-            response = model.generate(message=struct, dataset=dataset_name)
-        torch.cuda.empty_cache()
+                return f'{fail_msg}: {type(err)} {str(err)}'
+        return generate_func()
 
-        if verbose:
-            print(response, flush=True)
+    progress = tqdm(range(lt), desc=f'Infer {model_name}/{dataset_name}, Rank {rank}/{world_size}')
+    if prefetch_enabled and lt:
+        # Keep one CPU preprocessing job ahead of the CUDA generation. The
+        # adapter owns its processor lock because decoding uses the same tokenizer.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='colt-preprocess')
 
-        res[idx] = response
-        if (i + 1) % 10 == 0:
-            dump(res, out_file)
+        def prepare_sample(position):
+            struct = build_struct(position)
+            return model.prepare_request(struct, dataset_name)
+
+        future = executor.submit(prepare_sample, 0)
+        try:
+            for i in progress:
+                idx = data.iloc[i]['index']
+                preparation_error = None
+                try:
+                    prepared = future.result()
+                except RuntimeError as err:
+                    if os.environ.get('SKIP_ERR', False) != '1':
+                        raise
+                    preparation_error = err
+                if i + 1 < lt:
+                    future = executor.submit(prepare_sample, i + 1)
+                if preparation_error is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    warnings.warn(f'{type(preparation_error)} {str(preparation_error)}')
+                    response = (
+                        'Failed to obtain answer: '
+                        f'{type(preparation_error)} {str(preparation_error)}'
+                    )
+                else:
+                    response = generate_with_error_handling(lambda: model.generate_prepared(prepared))
+                if empty_cache_every_n and (i + 1) % empty_cache_every_n == 0:
+                    torch.cuda.empty_cache()
+
+                if verbose:
+                    print(response, flush=True)
+                res[idx] = response
+                if (i + 1) % 10 == 0:
+                    dump(res, out_file)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+    else:
+        for i in progress:
+            idx = data.iloc[i]['index']
+            struct = build_struct(i)
+            response = generate_with_error_handling(
+                lambda: model.generate(message=struct, dataset=dataset_name)
+            )
+            if empty_cache_every_n and (i + 1) % empty_cache_every_n == 0:
+                torch.cuda.empty_cache()
+
+            if verbose:
+                print(response, flush=True)
+            res[idx] = response
+            if (i + 1) % 10 == 0:
+                dump(res, out_file)
 
     res = {k: res[k] for k in data_indices}
     dump(res, out_file)
