@@ -12,6 +12,9 @@ dist_backend="${VLMEVAL_DIST_BACKEND:-gloo}"
 reseed_per_sample="${COLT_RESEED_PER_SAMPLE:-1}"
 
 case "$group" in
+  chartqa)
+    datasets=(ChartQA_TEST)
+    ;;
   mmstar)
     datasets=(MMStar)
     ;;
@@ -22,7 +25,7 @@ case "$group" in
     datasets=(ChartQA_TEST AI2D_TEST MMBench_DEV_EN ScienceQA_TEST TextVQA_VAL MMT-Bench_VAL SEEDBench_IMG MMStar)
     ;;
   *)
-    echo "Usage: $0 mmstar|remaining7|all8" >&2
+    echo "Usage: $0 chartqa|mmstar|remaining7|all8" >&2
     exit 1
     ;;
 esac

@@ -171,6 +171,22 @@ VLMEVAL_WORKERS_PER_GPU=3 \
 bash scripts/lkl_8gpu/17_eval_colt_replicas.sh all8
 ```
 
+若要对同一个 ChartQA checkpoint 建立未加速 reference，关闭多副本、预取和
+per-sample reseed，并恢复旧实现逐样本 `empty_cache()` 与 NCCL 同步：
+
+```bash
+COLT_EVAL_GPUS=4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=1 \
+VLMEVAL_PREFETCH=0 \
+VLMEVAL_EMPTY_CACHE_EVERY_N=1 \
+VLMEVAL_DIST_BACKEND=nccl \
+COLT_RESEED_PER_SAMPLE=0 \
+bash scripts/lkl_8gpu/17_eval_colt_replicas.sh chartqa
+```
+
+该 reference 使用 4 个 rank，结果 profile 会记录为 `w1_p0_c1_r0_chartqa`，不会复用
+12-worker 的 `w3_p1_c0_r1_all8` 预测。
+
 该实验默认设置 `VLMEVAL_PREFETCH=1`、`VLMEVAL_EMPTY_CACHE_EVERY_N=0`、
 `VLMEVAL_DIST_BACKEND=gloo` 和 `COLT_RESEED_PER_SAMPLE=1`，结果写入
 `eval/results/throughput_replicas/`。最后一项会让随机 seed 按样本内容确定，便于比较
