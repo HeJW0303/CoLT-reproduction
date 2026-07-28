@@ -190,3 +190,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NCCL_DEBUG=INFO \
 ```
 
 不要把代理、Hugging Face token 或其他密钥提交到仓库。
+
+### Paper-faithful 辅助 decoder 吞吐验证
+
+训练基准前先运行确定性的 toy loss/gradient 单元测试：
+
+```bash
+COLT_PAPER_FAITHFUL=1 python scripts/lkl_8gpu/verify_colt_throughput.py
+```
+
+结构合批默认关闭。正式启用前，使用相同 seed 和数据顺序分别对比 3 个 optimizer step：
+
+```bash
+bash scripts/lkl_8gpu/19_benchmark_colt_aux_batching.sh sequential
+bash scripts/lkl_8gpu/19_benchmark_colt_aux_batching.sh batched
+```
+
+`COLT_BATCH_AUX_DECODERS=1` 将三次 forward decoder 调用和两次 backward decoder
+调用分别合并。`COLT_COMPONENT_LOG_EVERY` 控制 rank 0 的 component loss 日志间隔，
+单位为 microbatch，默认值为 8。基准同时设置 `COLT_BENCHMARK_MODE=1` 和
+`COLT_SKIP_FINAL_SAVE=1`，因此不会保存最终模型；正式训练不会同时设置这两个变量，
+仍会正常保存最终模型。

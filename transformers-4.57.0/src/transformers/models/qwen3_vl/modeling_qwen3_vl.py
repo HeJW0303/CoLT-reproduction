@@ -1465,22 +1465,200 @@ def pad_input_ids_by_position(input_ids_list, pad_token_id, max_len=None, device
     return result_list
 
 
-def _compute_colt_forward_cot_loss(loss_function, ref_logits, ref_labels, vocab_size):
+def _compute_colt_forward_cot_loss(loss_function, ref_logits, ref_labels, vocab_size, has_targets=True):
     """Apply the causal LM loss exactly once to the full latent-prefix sequence."""
-    if (ref_labels[..., 1:] != -100).sum() == 0:
+    if not has_targets:
         return ref_logits.sum() * 0.0
     return loss_function(logits=ref_logits, labels=ref_labels, vocab_size=vocab_size)
 
 
-def _compute_colt_backward_alignment_loss(cot_hidden, latent_embd, projector):
+def _compute_colt_backward_alignment_loss(cot_hidden, latent_embd, projector, probe_positions=None):
     """Train the textual branch to match a stop-gradient latent target."""
-    cot_last_hidden = cot_hidden[:, -1, :]
+    if probe_positions is None:
+        cot_last_hidden = cot_hidden[:, -1, :]
+    else:
+        batch_indices = torch.arange(cot_hidden.shape[0], device=cot_hidden.device)
+        cot_last_hidden = cot_hidden[batch_indices, probe_positions]
     cot_to_latent = projector(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
     return 1 - F.cosine_similarity(cot_to_latent.float(), latent_embd.detach().float(), dim=-1).mean()
 
 
+def _ensure_colt_decoder_initialized(
+    decoder,
+    already_checked,
+    name_or_path,
+    torch_dtype,
+    device,
+    enable_gradient_checkpointing=False,
+    loader=None,
+):
+    """Check a nested decoder at most once and reload it if its embedding is all zero."""
+    if decoder is None or already_checked:
+        return decoder, already_checked
+
+    # Set this before any CUDA reduction or reload so failures cannot repeat the scan.
+    already_checked = True
+    try:
+        emb_w = decoder.get_input_embeddings().weight
+        if emb_w is None or emb_w.numel() == 0 or emb_w.detach().abs().sum().item() != 0.0:
+            return decoder, already_checked
+
+        load_model = loader or AutoModelForCausalLM.from_pretrained
+        decoder = load_model(name_or_path, torch_dtype=torch_dtype, resume_download=True).to(device)
+        if enable_gradient_checkpointing:
+            decoder.gradient_checkpointing_enable()
+    except Exception:
+        # Preserve the original non-fatal behavior, but never rescan on a later microbatch.
+        pass
+    return decoder, already_checked
+
+
+def _pad_colt_sequence(tensor, target_length, value=0):
+    pad_length = target_length - tensor.shape[1]
+    if pad_length <= 0:
+        return tensor
+    if tensor.ndim == 2:
+        return F.pad(tensor, (0, pad_length), value=value)
+    if tensor.ndim == 3:
+        return F.pad(tensor, (0, 0, 0, pad_length), value=value)
+    raise ValueError(f"Expected a rank-2 or rank-3 sequence tensor, got shape {tuple(tensor.shape)}")
+
+
+def _run_colt_forward_decoder_steps(decoder, projector, loss_function, records, vocab_size, batched):
+    """Run latent-to-CoT supervision while preserving equal weighting across latent steps."""
+    if not records:
+        return []
+
+    if not batched:
+        losses = []
+        for record in records:
+            outputs = decoder(
+                inputs_embeds=record["inputs_embeds"],
+                attention_mask=record["attention_mask"],
+                position_ids=record["position_ids"],
+                use_cache=False,
+            )
+            logits = projector(outputs.logits)
+            losses.append(
+                _compute_colt_forward_cot_loss(
+                    loss_function,
+                    logits,
+                    record["labels"],
+                    vocab_size,
+                    has_targets=record["has_targets"],
+                )
+            )
+        return losses
+
+    max_length = max(record["inputs_embeds"].shape[1] for record in records)
+    batch_sizes = [record["inputs_embeds"].shape[0] for record in records]
+    inputs_embeds = torch.cat(
+        [_pad_colt_sequence(record["inputs_embeds"], max_length) for record in records], dim=0
+    )
+    attention_mask = torch.cat(
+        [_pad_colt_sequence(record["attention_mask"], max_length) for record in records], dim=0
+    )
+    position_ids = torch.cat(
+        [_pad_colt_sequence(record["position_ids"], max_length) for record in records], dim=0
+    )
+    outputs = decoder(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=False,
+    )
+    step_logits = outputs.logits.split(batch_sizes, dim=0)
+
+    losses = []
+    for logits, record in zip(step_logits, records):
+        original_length = record["inputs_embeds"].shape[1]
+        logits = projector(logits[:, :original_length])
+        losses.append(
+            _compute_colt_forward_cot_loss(
+                loss_function,
+                logits,
+                record["labels"],
+                vocab_size,
+                has_targets=record["has_targets"],
+            )
+        )
+    return losses
+
+
+def _get_colt_decoder_backbone(decoder):
+    return decoder.get_decoder() if hasattr(decoder, "get_decoder") else getattr(decoder, "model", None)
+
+
+def _run_colt_backward_decoder_steps(decoder, projector, records, pad_token_id, batched):
+    """Run CoT-to-latent supervision and select each step's original probe position."""
+    if not records:
+        return []
+
+    decoder_backbone = _get_colt_decoder_backbone(decoder)
+
+    def run_backbone(input_ids, attention_mask):
+        if decoder_backbone is not None:
+            return decoder_backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)[0]
+        outputs = decoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+        return outputs.hidden_states[-1]
+
+    if not batched:
+        losses = []
+        for record in records:
+            hidden = run_backbone(record["input_ids"], record["attention_mask"])
+            losses.append(
+                _compute_colt_backward_alignment_loss(
+                    hidden,
+                    record["latent_embd"],
+                    projector,
+                    probe_positions=record["probe_positions"],
+                )
+            )
+        return losses
+
+    max_length = max(record["input_ids"].shape[1] for record in records)
+    batch_sizes = [record["input_ids"].shape[0] for record in records]
+    input_ids = torch.cat(
+        [_pad_colt_sequence(record["input_ids"], max_length, value=pad_token_id) for record in records], dim=0
+    )
+    attention_mask = torch.cat(
+        [_pad_colt_sequence(record["attention_mask"], max_length) for record in records], dim=0
+    )
+    hidden_steps = run_backbone(input_ids, attention_mask).split(batch_sizes, dim=0)
+
+    losses = []
+    for hidden, record in zip(hidden_steps, records):
+        losses.append(
+            _compute_colt_backward_alignment_loss(
+                hidden,
+                record["latent_embd"],
+                projector,
+                probe_positions=record["probe_positions"],
+            )
+        )
+    return losses
+
+
 def _is_colt_paper_faithful_enabled():
     return os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_colt_rank_zero():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _colt_component_log_interval():
+    try:
+        return max(int(os.environ.get("COLT_COMPONENT_LOG_EVERY", "8")), 0)
+    except ValueError:
+        return 8
 
 
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
@@ -1495,6 +1673,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.paper_faithful = _is_colt_paper_faithful_enabled()
+        self.batch_aux_decoders = self.paper_faithful and os.environ.get(
+            "COLT_BATCH_AUX_DECODERS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._colt_forward_microbatch_count = 0
         # NOTE: When training under some sharding/initialization contexts (e.g. init_empty_weights / ZeRO init),
         # loading a nested decoder inside __init__ can silently produce zero/empty parameters.
         # We still initialize here, but also support lazy re-loading in forward if we detect zeroed weights.
@@ -1695,37 +1877,24 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 )
                 return latent_outputs
 
-            # If decoder weights are zeroed (common symptom: embedding weights all zeros),
-            # reload it once at runtime when we know the actual device.
-            if self.decoder is not None and not self._decoder_reload_attempted:
-                try:
-                    emb_w = self.decoder.get_input_embeddings().weight
-                    if emb_w is not None and emb_w.numel() > 0 and emb_w.detach().abs().sum().item() == 0.0:
-                        self._decoder_reload_attempted = True
-                        device = input_ids.device if input_ids is not None else emb_w.device
-                        self.decoder = AutoModelForCausalLM.from_pretrained(
-                            self._decoder_name_or_path,
-                            torch_dtype=self.config.text_config.dtype,
-                            resume_download=True,
-                        ).to(device)
-                except Exception:
-                    # Do not hard fail here; diagnostics are printed elsewhere.
-                    self._decoder_reload_attempted = True
-            if self.backward_decoder is not None and not self._backward_decoder_reload_attempted:
-                try:
-                    back_emb_w = self.backward_decoder.get_input_embeddings().weight
-                    if back_emb_w is not None and back_emb_w.numel() > 0 and back_emb_w.detach().abs().sum().item() == 0.0:
-                        self._backward_decoder_reload_attempted = True
-                        device = input_ids.device if input_ids is not None else back_emb_w.device
-                        self.backward_decoder = AutoModelForCausalLM.from_pretrained(
-                            self._decoder_name_or_path,
-                            torch_dtype=self.config.text_config.dtype,
-                            resume_download=True,
-                        ).to(device)
-                        if self.paper_faithful:
-                            self.backward_decoder.gradient_checkpointing_enable()
-                except Exception:
-                    self._backward_decoder_reload_attempted = True
+            # Some ZeRO initialization paths have produced zeroed nested decoders. Check once
+            # on the real device, then never scan these large embedding matrices again.
+            decoder_device = input_ids.device
+            self.decoder, self._decoder_reload_attempted = _ensure_colt_decoder_initialized(
+                self.decoder,
+                self._decoder_reload_attempted,
+                self._decoder_name_or_path,
+                self.config.text_config.dtype,
+                decoder_device,
+            )
+            self.backward_decoder, self._backward_decoder_reload_attempted = _ensure_colt_decoder_initialized(
+                self.backward_decoder,
+                self._backward_decoder_reload_attempted,
+                self._decoder_name_or_path,
+                self.config.text_config.dtype,
+                decoder_device,
+                enable_gradient_checkpointing=self.paper_faithful,
+            )
 
             past_key_values = DynamicCache(config=self.config.text_config)
             outputs = self.model(
@@ -1759,6 +1928,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             backward_steps_num = 0
             prediction_steps_num = 0
             batch_size = hidden_states.shape[0]
+            batched_forward_records = []
+            batched_backward_records = []
 
             if self.num_latent != 0:
                 for i in range(self.num_latent):
@@ -1801,8 +1972,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     ref_embds = torch.concat([latent_for_ref, cot_step_embed], dim=1)
                     
                     current_ref_ids = cot_step_id[forward_idx]
+                    current_ref_lens_cpu = [cot_step_len_list[b][forward_idx] for b in range(batch_size)]
+                    has_forward_targets = any(length > 0 for length in current_ref_lens_cpu)
                     current_ref_lens = torch.tensor(
-                        [cot_step_len_list[b][forward_idx] for b in range(batch_size)],
+                        current_ref_lens_cpu,
                         dtype=torch.long,
                         device=current_ref_ids.device,
                     )
@@ -1823,23 +1996,28 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         dim=1,
                     )
 
-                    if (ref_labels != -100).sum() == 0:
-                        forward_loss_total += 0.0
+                    ref_position_ids = (
+                        torch.arange(ref_embds.shape[1], device=ref_embds.device, dtype=torch.long)
+                        .unsqueeze(0)
+                        .expand(batch_size, -1)
+                    )
+                    forward_record = {
+                        "inputs_embeds": ref_embds,
+                        "attention_mask": ref_attention_mask,
+                        "position_ids": ref_position_ids,
+                        "labels": ref_labels,
+                        "has_targets": has_forward_targets,
+                    }
+                    if self.batch_aux_decoders:
+                        batched_forward_records.append(forward_record)
                     else:
-                        ref_position_ids = (
-                            torch.arange(ref_embds.shape[1], device=ref_embds.device, dtype=torch.long)
-                            .unsqueeze(0)
-                            .expand(batch_size, -1)
-                        )
                         ref_outputs = self.decoder(
-                                inputs_embeds=ref_embds,
-                                attention_mask=ref_attention_mask,
-                                position_ids=ref_position_ids,
-                                use_cache=False,
-                            )
-                        ref_logits = ref_outputs.logits
-
-                        ref_logits = self.pj_out(ref_logits)
+                            inputs_embeds=ref_embds,
+                            attention_mask=ref_attention_mask,
+                            position_ids=ref_position_ids,
+                            use_cache=False,
+                        )
+                        ref_logits = self.pj_out(ref_outputs.logits)
 
                         if self.paper_faithful:
                             forward_loss = _compute_colt_forward_cot_loss(
@@ -1847,31 +2025,32 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                 ref_logits,
                                 ref_labels,
                                 self.config.text_config.vocab_size,
+                                has_targets=has_forward_targets,
                             )
-                            if (ref_labels[..., 1:] != -100).sum() > 0:
-                                forward_steps_num += 1
                         else:
                             shift_ref_logits = ref_logits[..., :-1, :].contiguous()
                             shift_ref_labels = ref_labels[..., 1:].contiguous()
-                            if (shift_ref_labels != -100).sum() == 0:
-                                forward_loss = torch.tensor(0.0, device=shift_ref_logits.device)
+                            if not has_forward_targets:
+                                forward_loss = shift_ref_logits.sum() * 0.0
                             else:
                                 forward_loss = self.loss_function(
                                     shift_ref_logits,
                                     shift_ref_labels,
                                     vocab_size=self.config.text_config.vocab_size,
                                 )
-                                forward_steps_num += 1
-                        
+                        if has_forward_targets:
+                            forward_steps_num += 1
                         forward_loss_total += forward_loss
-                        # print(f"forward_loss {i+1}: {forward_loss}")
                     # ----------------------------------------------------
                     # C) backward alignment: CoT step (+probe) -> latent
                     # ----------------------------------------------------
                     if self.backward_decoder is not None and forward_idx >= 1:
                         backward_ref_ids = cot_step_id[forward_idx-1]
+                        backward_ref_lens_cpu = [
+                            cot_step_len_list[b][forward_idx - 1] for b in range(batch_size)
+                        ]
                         backward_ref_lens = torch.tensor(
-                            [cot_step_len_list[b][forward_idx - 1] for b in range(batch_size)],
+                            backward_ref_lens_cpu,
                             dtype=torch.long,
                             device=backward_ref_ids.device,
                         )
@@ -1881,7 +2060,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             .expand(batch_size, -1)
                             < backward_ref_lens.unsqueeze(1)
                         ).long()
-                        if torch.any(cot_step_attention_mask):
+                        if any(length > 0 for length in backward_ref_lens_cpu):
                             # Encode CoT step, then force one extra "probe" step.
                             # Use this extra-step hidden state to align with current latent state.
                             probe_token = torch.full(
@@ -1898,40 +2077,52 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                 ],
                                 dim=1,
                             )
-                            decoder_backbone = (
-                                self.backward_decoder.get_decoder()
-                                if hasattr(self.backward_decoder, "get_decoder")
-                                else getattr(self.backward_decoder, "model", None)
+                            probe_positions = torch.full(
+                                (batch_size,),
+                                cot_plus_probe_ids.shape[1] - 1,
+                                dtype=torch.long,
+                                device=cot_plus_probe_ids.device,
                             )
-                            if decoder_backbone is not None:
-                                cot_outputs = decoder_backbone(
-                                    input_ids=cot_plus_probe_ids,
-                                    attention_mask=cot_plus_probe_mask,
-                                    use_cache=False,
-                                )
-                                cot_hidden = cot_outputs[0]
+                            backward_record = {
+                                "input_ids": cot_plus_probe_ids,
+                                "attention_mask": cot_plus_probe_mask,
+                                "probe_positions": probe_positions,
+                                "latent_embd": latent_embd.detach() if self.paper_faithful else latent_embd,
+                            }
+                            if self.batch_aux_decoders:
+                                batched_backward_records.append(backward_record)
                             else:
-                                cot_outputs = self.backward_decoder(
-                                    input_ids=cot_plus_probe_ids,
-                                    attention_mask=cot_plus_probe_mask,
-                                    use_cache=False,
-                                    output_hidden_states=True,
-                                )
-                                cot_hidden = cot_outputs.hidden_states[-1]
-                            if self.paper_faithful:
-                                backward_loss = _compute_colt_backward_alignment_loss(
-                                    cot_hidden,
-                                    latent_embd,
-                                    self.pj_back,
-                                )
-                            else:
-                                cot_last_hidden = cot_hidden[:, -1, :].detach()
-                                cot_to_latent = self.pj_back(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
-                                backward_loss = 1 - F.cosine_similarity(
-                                    cot_to_latent.float(), latent_embd.float(), dim=-1
-                                ).mean()
-                            backward_loss_total += backward_loss
-                            backward_steps_num += 1
+                                decoder_backbone = _get_colt_decoder_backbone(self.backward_decoder)
+                                if decoder_backbone is not None:
+                                    cot_hidden = decoder_backbone(
+                                        input_ids=cot_plus_probe_ids,
+                                        attention_mask=cot_plus_probe_mask,
+                                        use_cache=False,
+                                    )[0]
+                                else:
+                                    cot_outputs = self.backward_decoder(
+                                        input_ids=cot_plus_probe_ids,
+                                        attention_mask=cot_plus_probe_mask,
+                                        use_cache=False,
+                                        output_hidden_states=True,
+                                    )
+                                    cot_hidden = cot_outputs.hidden_states[-1]
+                                if self.paper_faithful:
+                                    backward_loss = _compute_colt_backward_alignment_loss(
+                                        cot_hidden,
+                                        latent_embd,
+                                        self.pj_back,
+                                        probe_positions=probe_positions,
+                                    )
+                                else:
+                                    batch_indices = torch.arange(batch_size, device=cot_hidden.device)
+                                    cot_last_hidden = cot_hidden[batch_indices, probe_positions].detach()
+                                    cot_to_latent = self.pj_back(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
+                                    backward_loss = 1 - F.cosine_similarity(
+                                        cot_to_latent.float(), latent_embd.float(), dim=-1
+                                    ).mean()
+                                backward_loss_total += backward_loss
+                                backward_steps_num += 1
                     forward_idx += 1
 
                     if i == self.num_latent - 1:
@@ -1971,13 +2162,53 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         logits = self.lm_head(outputs[0])          
                         ce_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
                         ce_loss_total += ce_loss
+            if self.batch_aux_decoders:
+                forward_losses = _run_colt_forward_decoder_steps(
+                    self.decoder,
+                    self.pj_out,
+                    self.loss_function,
+                    batched_forward_records,
+                    self.config.text_config.vocab_size,
+                    batched=True,
+                )
+                for forward_loss, record in zip(forward_losses, batched_forward_records):
+                    forward_loss_total += forward_loss
+                    if record["has_targets"]:
+                        forward_steps_num += 1
+
+                backward_losses = _run_colt_backward_decoder_steps(
+                    self.backward_decoder,
+                    self.pj_back,
+                    batched_backward_records,
+                    self.pad_token_id,
+                    batched=True,
+                )
+                for backward_loss in backward_losses:
+                    backward_loss_total += backward_loss
+                    backward_steps_num += 1
+
             forward_loss_total = forward_loss_total / max(forward_steps_num, 1)
             backward_loss_total = backward_loss_total / max(backward_steps_num, 1)
             prediction_loss_total = prediction_loss_total / max(prediction_steps_num, 1)
-            print(f"ce_loss_total : {ce_loss_total}")
-            print(f"forward_loss_total : {forward_loss_total}")
-            print(f"backward_loss_total : {backward_loss_total}")
-            print(f"prediction_loss_total : {prediction_loss_total}")
+            self._colt_forward_microbatch_count += 1
+            component_log_interval = _colt_component_log_interval()
+            if (
+                component_log_interval > 0
+                and self._colt_forward_microbatch_count % component_log_interval == 0
+                and _is_colt_rank_zero()
+            ):
+                component_losses = torch.stack(
+                    [
+                        ce_loss_total.detach().float(),
+                        forward_loss_total.detach().float(),
+                        backward_loss_total.detach().float(),
+                        prediction_loss_total.detach().float(),
+                    ]
+                ).cpu().tolist()
+                print(f"ce_loss_total : {component_losses[0]}")
+                print(f"forward_loss_total : {component_losses[1]}")
+                print(f"backward_loss_total : {component_losses[2]}")
+                print(f"prediction_loss_total : {component_losses[3]}")
             loss = (
                 ce_loss_total
                 + self.forward_align_weight * forward_loss_total

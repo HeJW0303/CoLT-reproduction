@@ -37,7 +37,9 @@ def verify_empty_forward_targets() -> None:
 
     logits = torch.randn(1, 4, 8, requires_grad=True)
     labels = torch.full((1, 4), -100)
-    loss = _compute_colt_forward_cot_loss(ForCausalLMLoss, logits, labels, vocab_size=8)
+    loss = _compute_colt_forward_cot_loss(
+        ForCausalLMLoss, logits, labels, vocab_size=8, has_targets=False
+    )
 
     loss.backward()
     if not torch.isfinite(loss) or loss.item() != 0.0:
