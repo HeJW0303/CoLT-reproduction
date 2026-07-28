@@ -2112,11 +2112,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                         cot_hidden,
                                         latent_embd,
                                         self.pj_back,
-                                        probe_positions=probe_positions,
                                     )
                                 else:
-                                    batch_indices = torch.arange(batch_size, device=cot_hidden.device)
-                                    cot_last_hidden = cot_hidden[batch_indices, probe_positions].detach()
+                                    cot_last_hidden = cot_hidden[:, -1, :].detach()
                                     cot_to_latent = self.pj_back(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
                                     backward_loss = 1 - F.cosine_similarity(
                                         cot_to_latent.float(), latent_embd.float(), dim=-1
