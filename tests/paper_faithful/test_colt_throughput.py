@@ -1,4 +1,4 @@
-from scripts.lkl_8gpu.verify_colt_throughput import (
+from tests.integration.lkl_8gpu.verify_colt_throughput import (
     verify_backward_batch_equivalence,
     verify_decoder_check_runs_once,
     verify_forward_batch_equivalence,

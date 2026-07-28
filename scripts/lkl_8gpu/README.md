@@ -196,14 +196,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NCCL_DEBUG=INFO \
 训练基准前先运行确定性的 toy loss/gradient 单元测试：
 
 ```bash
-COLT_PAPER_FAITHFUL=1 python scripts/lkl_8gpu/verify_colt_throughput.py
+COLT_PAPER_FAITHFUL=1 python tests/integration/lkl_8gpu/verify_colt_throughput.py
 ```
 
 结构合批默认关闭。正式启用前，使用相同 seed 和数据顺序分别对比 3 个 optimizer step：
 
 ```bash
-bash scripts/lkl_8gpu/19_benchmark_colt_aux_batching.sh sequential
-bash scripts/lkl_8gpu/19_benchmark_colt_aux_batching.sh batched
+bash tests/integration/lkl_8gpu/19_benchmark_colt_aux_batching.sh sequential
+bash tests/integration/lkl_8gpu/19_benchmark_colt_aux_batching.sh batched
 ```
 
 `COLT_BATCH_AUX_DECODERS=1` 将三次 forward decoder 调用和两次 backward decoder

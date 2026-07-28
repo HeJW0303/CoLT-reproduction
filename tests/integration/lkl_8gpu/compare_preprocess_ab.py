@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import math
 import numbers
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "lkl_8gpu"))
 
 from validate_eval_suite import PAPER_SCORE_PROFILES
 

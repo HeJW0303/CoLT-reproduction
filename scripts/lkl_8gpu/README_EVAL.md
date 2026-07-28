@@ -389,7 +389,7 @@ profile 目录意外非空，脚本会直接拒绝运行。
 ```bash
 cd /data/nvme0/lkl/CoLT-reproduction
 COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
-bash scripts/lkl_8gpu/15_eval_preprocess_ab_8gpu.sh
+bash tests/integration/lkl_8gpu/15_eval_preprocess_ab_8gpu.sh
 ```
 
 该诊断固定评估 `Qwen3-VL-8B-Instruct-BASE-COT`，不加载 CoLT checkpoint，也不支持用环境变量切换到 CoLT。
@@ -414,7 +414,7 @@ baseline、greedy decoding 和 `legacy14_processor_resize` 不变，只把生成
 ```bash
 cd /data/nvme0/lkl/CoLT-reproduction
 COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
-bash scripts/lkl_8gpu/16_eval_base_max256_8gpu.sh
+bash tests/integration/lkl_8gpu/16_eval_base_max256_8gpu.sh
 ```
 
 结果和日志分别写入：
