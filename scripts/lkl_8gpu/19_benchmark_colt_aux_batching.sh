@@ -4,6 +4,8 @@ set -euo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_ROOT/../.." && pwd)"
+source "$SCRIPT_ROOT/common.sh"
+require_workspace_layout
 BASE_CONFIG="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_paper_faithful.yaml"
 
 mode="${1:-}"
@@ -27,7 +29,7 @@ config_dir="$REPO_ROOT/logs/colt_aux_batch_benchmark_${mode}_$run_stamp"
 config_path="$config_dir/config.yaml"
 mkdir -p "$output_dir" "$config_dir"
 
-python - "$BASE_CONFIG" "$config_path" "$output_dir" "$mode" <<'PY'
+"$CONDA_ENV_DIR/bin/python" - "$BASE_CONFIG" "$config_path" "$output_dir" "$mode" <<'PY'
 import sys
 
 import yaml
@@ -46,7 +48,7 @@ config.update(
     save_strategy="no",
     plot_loss=False,
     report_to="none",
-    run_name=f"colt_aux_batch_benchmark_{mode}",
+    run_name="colt_aux_batch_benchmark_{}".format(mode),
     overwrite_output_dir=False,
 )
 with open(destination, "w", encoding="utf-8") as handle:
