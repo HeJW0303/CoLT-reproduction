@@ -1,0 +1,167 @@
+import os
+from dataclasses import dataclass
+from typing import Mapping, Optional
+
+
+THOUGHT_SEGMENTS_OPEN = "<thought_segments>"
+THOUGHT_SEGMENTS_CLOSE = "</thought_segments>"
+CONTINUE_THINK = "<continue_think>"
+
+
+class OracleKFormatError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class OracleKAnnotation:
+    k: int
+    blocks: tuple[str, ...]
+
+    @property
+    def original_cot(self) -> str:
+        return "".join(self.blocks)
+
+
+@dataclass(frozen=True)
+class OracleKSettings:
+    enabled: bool
+    max_k: int
+    budget_conditioning: bool
+
+
+def parse_oracle_k_cot(cot_text: str, min_k: int = 1, max_k: Optional[int] = None) -> OracleKAnnotation:
+    if not cot_text.startswith(THOUGHT_SEGMENTS_OPEN):
+        raise OracleKFormatError(f"Oracle-K CoT must start with {THOUGHT_SEGMENTS_OPEN}")
+
+    count_end = cot_text.find(THOUGHT_SEGMENTS_CLOSE, len(THOUGHT_SEGMENTS_OPEN))
+    if count_end < 0:
+        raise OracleKFormatError(f"Missing {THOUGHT_SEGMENTS_CLOSE}")
+
+    count_text = cot_text[len(THOUGHT_SEGMENTS_OPEN) : count_end]
+    if not count_text.isdigit():
+        raise OracleKFormatError(f"Invalid Oracle K: {count_text!r}")
+
+    k = int(count_text)
+    if k < min_k:
+        raise OracleKFormatError(f"Oracle K={k} is below min_k={min_k}")
+    if max_k is not None and k > max_k:
+        raise OracleKFormatError(f"Oracle K={k} exceeds max_k={max_k}")
+
+    block_text = cot_text[count_end + len(THOUGHT_SEGMENTS_CLOSE) :]
+    forbidden_markers = (THOUGHT_SEGMENTS_OPEN, THOUGHT_SEGMENTS_CLOSE)
+    if any(marker in block_text for marker in forbidden_markers):
+        raise OracleKFormatError("Duplicate thought-segment metadata found inside CoT blocks")
+
+    blocks = tuple(block_text.split(CONTINUE_THINK))
+    if len(blocks) != k:
+        raise OracleKFormatError(f"Declared Oracle K={k}, but found {len(blocks)} blocks")
+    if any(block == "" for block in blocks):
+        raise OracleKFormatError("Oracle-K blocks must not be empty")
+
+    return OracleKAnnotation(k=k, blocks=blocks)
+
+
+def annotate_segmented_cot(segmented_cot: str, min_k: int = 1, max_k: Optional[int] = None) -> str:
+    if THOUGHT_SEGMENTS_OPEN in segmented_cot or THOUGHT_SEGMENTS_CLOSE in segmented_cot:
+        raise OracleKFormatError("Teacher output must not contain thought-segment metadata")
+
+    blocks = tuple(segmented_cot.split(CONTINUE_THINK))
+    k = len(blocks)
+    if any(block == "" for block in blocks):
+        raise OracleKFormatError("Teacher produced an empty block")
+    if k < min_k:
+        raise OracleKFormatError(f"Teacher K={k} is below min_k={min_k}")
+    if max_k is not None and k > max_k:
+        raise OracleKFormatError(f"Teacher K={k} exceeds max_k={max_k}")
+
+    return f"{THOUGHT_SEGMENTS_OPEN}{k}{THOUGHT_SEGMENTS_CLOSE}{segmented_cot}"
+
+
+def find_think_span(content: str) -> tuple[int, int]:
+    think_open = "<think>"
+    think_close = "</think>"
+    start = content.rfind(think_open)
+    if start < 0:
+        raise OracleKFormatError("Assistant content has no <think> section")
+    content_start = start + len(think_open)
+    end = content.find(think_close, content_start)
+    if end < 0:
+        raise OracleKFormatError("Assistant content has no closing </think>")
+    return content_start, end
+
+
+def get_assistant_cot(content: str) -> str:
+    start, end = find_think_span(content)
+    return content[start:end]
+
+
+def annotate_assistant_content(content: str, segmented_cot: str, min_k: int = 1, max_k: Optional[int] = None) -> str:
+    start, end = find_think_span(content)
+    original_cot = content[start:end]
+    recovered_cot = segmented_cot.replace(CONTINUE_THINK, "")
+    if recovered_cot != original_cot:
+        raise OracleKFormatError("Teacher output changed the original CoT text")
+
+    annotated_cot = annotate_segmented_cot(segmented_cot, min_k=min_k, max_k=max_k)
+    return content[:start] + annotated_cot + content[end:]
+
+
+def remove_assistant_annotation(content: str, min_k: int = 1, max_k: Optional[int] = None) -> str:
+    start, end = find_think_span(content)
+    annotation = parse_oracle_k_cot(content[start:end], min_k=min_k, max_k=max_k)
+    return content[:start] + annotation.original_cot + content[end:]
+
+
+def _read_bool_env(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    value = environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
+def _config_has(config, name: str) -> bool:
+    return name in getattr(config, "__dict__", {})
+
+
+def resolve_oracle_k_settings(config, environ: Optional[Mapping[str, str]] = None) -> OracleKSettings:
+    environ = os.environ if environ is None else environ
+
+    if _config_has(config, "colt_oracle_k_enabled"):
+        enabled = bool(config.colt_oracle_k_enabled)
+    else:
+        enabled = _read_bool_env(environ, "COLT_ORACLE_K_ENABLED", False)
+
+    if _config_has(config, "colt_oracle_k_max"):
+        max_k = int(config.colt_oracle_k_max)
+    else:
+        max_k = int(environ.get("COLT_ORACLE_K_MAX", "8"))
+
+    if _config_has(config, "colt_oracle_k_budget_conditioning"):
+        budget_conditioning = bool(config.colt_oracle_k_budget_conditioning)
+    else:
+        budget_conditioning = _read_bool_env(environ, "COLT_ORACLE_K_BUDGET_CONDITIONING", True)
+
+    if max_k < 1:
+        raise ValueError(f"COLT_ORACLE_K_MAX must be at least 1, got {max_k}")
+
+    if enabled or _config_has(config, "colt_oracle_k_enabled"):
+        config.colt_oracle_k_enabled = enabled
+        config.colt_oracle_k_max = max_k
+        config.colt_oracle_k_budget_conditioning = budget_conditioning
+    return OracleKSettings(enabled=enabled, max_k=max_k, budget_conditioning=budget_conditioning)
+
+
+def resolve_forced_inference_k(max_k: int, environ: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    environ = os.environ if environ is None else environ
+    value = environ.get("COLT_INFERENCE_K")
+    if value is None or value.strip() == "":
+        return None
+    forced_k = int(value)
+    if not 1 <= forced_k <= max_k:
+        raise ValueError(f"COLT_INFERENCE_K must be in [1, {max_k}], got {forced_k}")
+    return forced_k

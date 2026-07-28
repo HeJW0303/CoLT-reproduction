@@ -42,6 +42,8 @@ from ...utils import TransformersKwargs, auto_docstring, is_torchdynamo_compilin
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import check_model_inputs
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
+from .modeling_oracle_k import OracleKBudgetConditioner
+from .oracle_k import parse_oracle_k_cot, resolve_forced_inference_k, resolve_oracle_k_settings
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.cuda.amp import autocast
 
@@ -1677,6 +1679,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             "COLT_BATCH_AUX_DECODERS", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
         self._colt_forward_microbatch_count = 0
+        oracle_k_settings = resolve_oracle_k_settings(config)
+        self.oracle_k_enabled = oracle_k_settings.enabled
+        self.oracle_k_max = oracle_k_settings.max_k
+        self.oracle_k_budget_conditioning = oracle_k_settings.budget_conditioning
         # NOTE: When training under some sharding/initialization contexts (e.g. init_empty_weights / ZeRO init),
         # loading a nested decoder inside __init__ can silently produce zero/empty parameters.
         # We still initialize here, but also support lazy re-loading in forward if we detect zeroed weights.
@@ -1723,6 +1729,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             self.pj_back = nn.Identity()
 
         self.num_latent = 3
+        if self.oracle_k_enabled and self.oracle_k_budget_conditioning:
+            self.oracle_k_conditioner = OracleKBudgetConditioner(
+                self.oracle_k_max,
+                config.text_config.hidden_size,
+            )
+        else:
+            self.oracle_k_conditioner = None
         self.prj = nn.Sequential(
                 nn.Dropout(0.0),
                 nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size//2),
@@ -1762,6 +1775,44 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if self.training and self.paper_faithful and self.backward_decoder is not None:
             self.backward_decoder.gradient_checkpointing_enable()
         self.tokenizer = tokenizer
+
+    def _parse_oracle_k_steps(self, cot_ids):
+        cot_text = self.tokenizer.decode(
+            cot_ids.tolist(),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        annotation = parse_oracle_k_cot(cot_text, min_k=1, max_k=self.oracle_k_max)
+        eos = torch.tensor([self.eos_token_id], device=cot_ids.device, dtype=cot_ids.dtype)
+        step_ids = []
+        step_lens = []
+        for block in annotation.blocks:
+            block_ids = torch.tensor(
+                self.tokenizer.encode(block, add_special_tokens=False),
+                device=cot_ids.device,
+                dtype=cot_ids.dtype,
+            )
+            block_with_eos = torch.cat([block_ids, eos], dim=0)
+            step_ids.append(block_with_eos)
+            step_lens.append(block_with_eos.shape[0])
+        return annotation.k, step_ids, step_lens
+
+    def _condition_latent_with_oracle_k(self, latent_embd, oracle_k, step_index):
+        if not self.oracle_k_enabled or not self.oracle_k_budget_conditioning:
+            return latent_embd
+        return self.oracle_k_conditioner(latent_embd, oracle_k, step_index)
+
+    def _resolve_latent_steps_for_inference(self, num_hidden_generations):
+        if num_hidden_generations > 0:
+            latent_steps = num_hidden_generations
+        elif self.oracle_k_enabled:
+            forced_k = resolve_forced_inference_k(self.oracle_k_max)
+            latent_steps = forced_k if forced_k is not None else self.num_latent
+        else:
+            latent_steps = self.num_latent
+        if self.oracle_k_enabled and not 1 <= latent_steps <= self.oracle_k_max:
+            raise ValueError(f"Oracle-K inference steps must be in [1, {self.oracle_k_max}], got {latent_steps}")
+        return latent_steps
         
 
     def get_input_embeddings(self):
@@ -1843,17 +1894,29 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             cot_step_id_list = []
             cot_step_len_list = []
 
-            # Split CoT steps by nearby punctuation/newline boundaries instead of fixed equal chunks.
-            for i in range(len(cot_id_list)):
-                num_steps = max(self.num_latent, 1)
-                cot_step_id_list_i, cot_step_len_list_i = split_cot_by_dynamic_boundaries(
-                    cot_id_list[i],
-                    num_steps=num_steps,
-                    eos_token_id=self.eos_token_id,
-                    boundary_token_ids=self.cot_boundary_token_ids,
-                )
+            if self.oracle_k_enabled:
+                if len(cot_id_list) != 1:
+                    raise ValueError(
+                        "Oracle-K training currently requires per-device batch size 1; "
+                        f"received {len(cot_id_list)} samples"
+                    )
+                oracle_k, cot_step_id_list_i, cot_step_len_list_i = self._parse_oracle_k_steps(cot_id_list[0])
                 cot_step_id_list.append(cot_step_id_list_i)
                 cot_step_len_list.append(cot_step_len_list_i)
+                training_latent_steps = oracle_k
+            else:
+                # Split CoT steps by nearby punctuation/newline boundaries instead of fixed equal chunks.
+                for i in range(len(cot_id_list)):
+                    num_steps = max(self.num_latent, 1)
+                    cot_step_id_list_i, cot_step_len_list_i = split_cot_by_dynamic_boundaries(
+                        cot_id_list[i],
+                        num_steps=num_steps,
+                        eos_token_id=self.eos_token_id,
+                        boundary_token_ids=self.cot_boundary_token_ids,
+                    )
+                    cot_step_id_list.append(cot_step_id_list_i)
+                    cot_step_len_list.append(cot_step_len_list_i)
+                training_latent_steps = self.num_latent
             cot_step_id = pad_input_ids_by_position(cot_step_id_list, self.pad_token_id, device=input_ids.device)
             # Encode the question (right padding for alignment)
             question_ids = torch.nn.utils.rnn.pad_sequence(
@@ -1863,7 +1926,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             position_ids_question = None
 
             if hidden_generation_mode and labels is None:
-                latent_steps = num_hidden_generations if num_hidden_generations > 0 else self.num_latent
+                if self.oracle_k_enabled:
+                    latent_steps = num_hidden_generations
+                else:
+                    latent_steps = num_hidden_generations if num_hidden_generations > 0 else self.num_latent
                 latent_outputs = self._forward_latent_reasoning(
                     input_ids=question_ids,
                     attention_mask=attention_mask_question,
@@ -1931,13 +1997,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             batched_forward_records = []
             batched_backward_records = []
 
-            if self.num_latent != 0:
-                for i in range(self.num_latent):
+            if training_latent_steps != 0:
+                for i in range(training_latent_steps):
                     # ---------------------------
                     # A) latent transition step
                     # ---------------------------
-                    current_latent_embd = latent_embd
-
                     step_cache_position = torch.arange(
                         current_seq_len + i,
                         current_seq_len + i + 1,
@@ -1945,7 +2009,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     )
                     # For RoPE index / causal mask, attention_mask should reflect the full (cached + current) length.
                     step_attention_mask = torch.ones((batch_size,  1), dtype=torch.long, device=latent_embd.device)
-                    outputs = self.model(inputs_embeds=latent_embd,
+                    latent_step_input = self._condition_latent_with_oracle_k(
+                        latent_embd,
+                        training_latent_steps,
+                        i + 1,
+                    )
+                    current_latent_embd = latent_step_input
+                    outputs = self.model(inputs_embeds=latent_step_input,
                                 past_key_values=past_key_values,
                                 cache_position=step_cache_position,
                                 attention_mask=step_attention_mask,
@@ -2123,7 +2193,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                 backward_steps_num += 1
                     forward_idx += 1
 
-                    if i == self.num_latent - 1:
+                    if i == training_latent_steps - 1:
                         # ------------------------------------------
                         # D) final answer decoding from latent state
                         # ------------------------------------------
@@ -2275,7 +2345,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         latent_embd = hidden_states[:, -1:, :]
         latent_embd = self.prj(latent_embd)
-        latent_steps = num_hidden_generations if num_hidden_generations > 0 else max(self.num_latent, 0)
+        latent_steps = self._resolve_latent_steps_for_inference(num_hidden_generations)
         for i in range(latent_steps):
             past_seen_tokens = past_key_values.get_seq_length()
             step_cache_position = torch.arange(
@@ -2284,8 +2354,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 device=latent_embd.device,
             )
             step_attention_mask = torch.ones((latent_embd.shape[0], 1), dtype=torch.long, device=latent_embd.device)
+            latent_step_input = self._condition_latent_with_oracle_k(latent_embd, latent_steps, i + 1)
             step_outputs = self.model(
-                inputs_embeds=latent_embd,
+                inputs_embeds=latent_step_input,
                 past_key_values=past_key_values,
                 cache_position=step_cache_position,
                 attention_mask=step_attention_mask,
@@ -2413,7 +2484,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        num_hidden_generations = kwargs.pop("num_hidden_generations", self.num_latent)
+        default_hidden_generations = 0 if self.oracle_k_enabled else self.num_latent
+        num_hidden_generations = kwargs.pop("num_hidden_generations", default_hidden_generations)
         # max_new_tokens = kwargs.pop("max_new_tokens", 128)
         # do_sample = kwargs.pop("do_sample", False)
         kwargs.pop("max_new_tokens", 128)
