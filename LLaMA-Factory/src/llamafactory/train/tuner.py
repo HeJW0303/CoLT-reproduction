@@ -61,7 +61,19 @@ def _training_function(config: dict[str, Any]) -> None:
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
 
     callbacks.append(LogCallback())
-    callbacks.append(CopyFilesOnTrainBeginCallback(FILES_TO_COPY_ON_TRAIN_BEGIN))
+    files_to_copy = list(FILES_TO_COPY_ON_TRAIN_BEGIN)
+    if os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        files_to_copy.extend(
+            [
+                "LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_paper_faithful.yaml",
+                "LLaMA-Factory/src/llamafactory/model/adapter.py",
+                "LLaMA-Factory/src/llamafactory/model/model_utils/visual.py",
+                "LLaMA-Factory/src/llamafactory/train/tuner.py",
+                "scripts/lkl_8gpu/18_train_paper_faithful.sh",
+                "scripts/lkl_8gpu/verify_paper_faithful.py",
+            ]
+        )
+    callbacks.append(CopyFilesOnTrainBeginCallback(files_to_copy))
 
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())

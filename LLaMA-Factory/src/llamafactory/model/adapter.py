@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,38 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _assert_paper_faithful_visual_freeze(
+    model: "PreTrainedModel", finetuning_args: "FinetuningArguments"
+) -> None:
+    if os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    model_type = getattr(model.config, "model_type", None)
+    if model_type != "qwen3_vl":
+        raise RuntimeError(f"COLT_PAPER_FAITHFUL requires qwen3_vl, got {model_type!r}.")
+    if not finetuning_args.freeze_vision_tower or not finetuning_args.freeze_multi_modal_projector:
+        raise RuntimeError(
+            "COLT_PAPER_FAITHFUL requires freeze_vision_tower=true and "
+            "freeze_multi_modal_projector=true."
+        )
+
+    visual_parameters = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if name.startswith("visual.") or ".visual." in name
+    ]
+    if not visual_parameters:
+        raise RuntimeError("COLT_PAPER_FAITHFUL found no visual parameters to validate.")
+
+    trainable = [(name, param.numel()) for name, param in visual_parameters if param.requires_grad]
+    if trainable:
+        preview = ", ".join(f"{name} ({count:,})" for name, count in trainable[:20])
+        raise RuntimeError(f"COLT_PAPER_FAITHFUL found trainable visual parameters: {preview}")
+
+    frozen_count = sum(param.numel() for _, param in visual_parameters)
+    logger.info_rank0(f"COLT paper-faithful visual freeze verified: {frozen_count:,} parameters frozen.")
 
 
 def _setup_full_tuning(
@@ -324,5 +357,8 @@ def init_adapter(
         )
     else:
         raise NotImplementedError(f"Unknown finetuning type: {finetuning_args.finetuning_type}.")
+
+    if is_trainable:
+        _assert_paper_faithful_visual_freeze(model, finetuning_args)
 
     return model

@@ -22,7 +22,22 @@ export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT:-CoLT-reproduction}"
 
-output_dir="$OUTPUT_ROOT/colt_codefaithful"
+train_config="${COLT_TRAIN_CONFIG:-$TRAIN_CONFIG}"
+output_dir="${COLT_TRAIN_OUTPUT_DIR:-$OUTPUT_ROOT/colt_codefaithful}"
+train_entry_script="${COLT_TRAIN_ENTRY_SCRIPT:-$REPO_ROOT/scripts/lkl_8gpu/06_train.sh}"
+run_record_prefix="${COLT_TRAIN_RECORD_PREFIX:-colt_run}"
+log_prefix="${COLT_TRAIN_LOG_PREFIX:-colt_train}"
+if [[ ! -f "$train_config" ]]; then
+  echo "Missing training config: $train_config" >&2
+  exit 1
+fi
+config_output_dir="$(python -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["output_dir"])' "$train_config")"
+if [[ "$config_output_dir" != "$output_dir" ]]; then
+  echo "Training config output_dir does not match the guarded output directory." >&2
+  echo "Config: $config_output_dir" >&2
+  echo "Guard:  $output_dir" >&2
+  exit 1
+fi
 mkdir -p "$output_dir" "$LOG_ROOT"
 if find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
   if [[ "${RESUME:-0}" != "1" ]]; then
@@ -41,12 +56,23 @@ fi
 require_free_gib 200
 
 cd "$REPO_ROOT"
+if [[ "${COLT_PAPER_FAITHFUL:-0}" == "1" ]]; then
+  python "$REPO_ROOT/scripts/lkl_8gpu/verify_paper_faithful.py"
+fi
 run_stamp="$(date +%Y%m%d_%H%M%S)"
-run_record="$LOG_ROOT/colt_run_$run_stamp"
+run_record="$LOG_ROOT/${run_record_prefix}_$run_stamp"
 mkdir -p "$run_record"
-cp "$TRAIN_CONFIG" "$run_record/"
+cp "$train_config" "$run_record/"
 cp "$REPO_ROOT/LLaMA-Factory/examples/deepspeed/ds_z3_a100.json" "$run_record/"
-cp "$REPO_ROOT/scripts/lkl_8gpu/06_train.sh" "$run_record/"
+cp "$train_entry_script" "$run_record/"
+if [[ "${COLT_PAPER_FAITHFUL:-0}" == "1" ]]; then
+  cp "$REPO_ROOT/scripts/lkl_8gpu/06_train.sh" "$run_record/"
+  cp "$REPO_ROOT/scripts/lkl_8gpu/verify_paper_faithful.py" "$run_record/"
+  cp "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py" "$run_record/"
+  cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/model/adapter.py" "$run_record/"
+  cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/model/model_utils/visual.py" "$run_record/"
+  cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/train/tuner.py" "$run_record/"
+fi
 git -c safe.directory="$REPO_ROOT" rev-parse HEAD > "$run_record/git_head.txt"
 git -c safe.directory="$REPO_ROOT" status --short > "$run_record/git_status.txt"
 git -c safe.directory="$REPO_ROOT" diff --binary > "$run_record/git_diff.patch"
@@ -66,8 +92,11 @@ python -m pip freeze > "$run_record/pip_freeze.txt"
   printf 'HF_HOME=%s\n' "$HF_HOME"
   printf 'TMPDIR=%s\n' "$TMPDIR"
   printf 'COLT_DECODER_MODEL_PATH=%s\n' "$COLT_DECODER_MODEL_PATH"
+  printf 'COLT_PAPER_FAITHFUL=%s\n' "${COLT_PAPER_FAITHFUL:-0}"
+  printf 'COLT_TRAIN_CONFIG=%s\n' "$train_config"
+  printf 'COLT_TRAIN_OUTPUT_DIR=%s\n' "$output_dir"
 } > "$run_record/environment.txt"
 
-log_file="$LOG_ROOT/colt_train_$run_stamp.log"
+log_file="$LOG_ROOT/${log_prefix}_$run_stamp.log"
 echo "Training log: $log_file"
-llamafactory-cli train "$TRAIN_CONFIG" 2>&1 | tee "$log_file"
+llamafactory-cli train "$train_config" 2>&1 | tee "$log_file"

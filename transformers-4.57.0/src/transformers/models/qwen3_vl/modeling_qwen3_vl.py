@@ -1464,6 +1464,25 @@ def pad_input_ids_by_position(input_ids_list, pad_token_id, max_len=None, device
     
     return result_list
 
+
+def _compute_colt_forward_cot_loss(loss_function, ref_logits, ref_labels, vocab_size):
+    """Apply the causal LM loss exactly once to the full latent-prefix sequence."""
+    if (ref_labels[..., 1:] != -100).sum() == 0:
+        return ref_logits.sum() * 0.0
+    return loss_function(logits=ref_logits, labels=ref_labels, vocab_size=vocab_size)
+
+
+def _compute_colt_backward_alignment_loss(cot_hidden, latent_embd, projector):
+    """Train the textual branch to match a stop-gradient latent target."""
+    cot_last_hidden = cot_hidden[:, -1, :]
+    cot_to_latent = projector(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
+    return 1 - F.cosine_similarity(cot_to_latent.float(), latent_embd.detach().float(), dim=-1).mean()
+
+
+def _is_colt_paper_faithful_enabled():
+    return os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
@@ -1475,6 +1494,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.paper_faithful = _is_colt_paper_faithful_enabled()
         # NOTE: When training under some sharding/initialization contexts (e.g. init_empty_weights / ZeRO init),
         # loading a nested decoder inside __init__ can silently produce zero/empty parameters.
         # We still initialize here, but also support lazy re-loading in forward if we detect zeroed weights.
@@ -1557,6 +1577,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.post_init()
         if self.training and self.decoder is not None:
             self.decoder.gradient_checkpointing_enable()
+        if self.training and self.paper_faithful and self.backward_decoder is not None:
+            self.backward_decoder.gradient_checkpointing_enable()
         self.tokenizer = tokenizer
         
 
@@ -1700,6 +1722,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             torch_dtype=self.config.text_config.dtype,
                             resume_download=True,
                         ).to(device)
+                        if self.paper_faithful:
+                            self.backward_decoder.gradient_checkpointing_enable()
                 except Exception:
                     self._backward_decoder_reload_attempted = True
 
@@ -1817,14 +1841,27 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
                         ref_logits = self.pj_out(ref_logits)
 
-                        shift_ref_logits = ref_logits[..., :-1, :].contiguous()
-
-                        shift_ref_labels = ref_labels[..., 1:].contiguous()
-                        if (shift_ref_labels != -100).sum() == 0:
-                            forward_loss = torch.tensor(0.0, device=shift_ref_logits.device)
-                        else:    
-                            forward_loss = self.loss_function(shift_ref_logits, shift_ref_labels, vocab_size=self.config.text_config.vocab_size)
-                            forward_steps_num += 1
+                        if self.paper_faithful:
+                            forward_loss = _compute_colt_forward_cot_loss(
+                                self.loss_function,
+                                ref_logits,
+                                ref_labels,
+                                self.config.text_config.vocab_size,
+                            )
+                            if (ref_labels[..., 1:] != -100).sum() > 0:
+                                forward_steps_num += 1
+                        else:
+                            shift_ref_logits = ref_logits[..., :-1, :].contiguous()
+                            shift_ref_labels = ref_labels[..., 1:].contiguous()
+                            if (shift_ref_labels != -100).sum() == 0:
+                                forward_loss = torch.tensor(0.0, device=shift_ref_logits.device)
+                            else:
+                                forward_loss = self.loss_function(
+                                    shift_ref_logits,
+                                    shift_ref_labels,
+                                    vocab_size=self.config.text_config.vocab_size,
+                                )
+                                forward_steps_num += 1
                         
                         forward_loss_total += forward_loss
                         # print(f"forward_loss {i+1}: {forward_loss}")
@@ -1881,11 +1918,18 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                     output_hidden_states=True,
                                 )
                                 cot_hidden = cot_outputs.hidden_states[-1]
-                            cot_last_hidden = cot_hidden[:, -1, :].detach()
-                            cot_to_latent = self.pj_back(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
-                            backward_loss = 1 - F.cosine_similarity(
-                                cot_to_latent.float(), latent_embd.float(), dim=-1
-                            ).mean()
+                            if self.paper_faithful:
+                                backward_loss = _compute_colt_backward_alignment_loss(
+                                    cot_hidden,
+                                    latent_embd,
+                                    self.pj_back,
+                                )
+                            else:
+                                cot_last_hidden = cot_hidden[:, -1, :].detach()
+                                cot_to_latent = self.pj_back(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
+                                backward_loss = 1 - F.cosine_similarity(
+                                    cot_to_latent.float(), latent_embd.float(), dim=-1
+                                ).mean()
                             backward_loss_total += backward_loss
                             backward_steps_num += 1
                     forward_idx += 1

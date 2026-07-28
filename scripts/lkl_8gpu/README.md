@@ -132,6 +132,34 @@ RESUME=1 bash scripts/lkl_8gpu/06_train.sh
 
 普通启动遇到非空输出目录会拒绝覆盖；`RESUME=1` 找不到完整 `trainer_state.json` 也会拒绝。
 
+### Paper-faithful 三项修复版本
+
+公开源码忠实版本继续使用 `06_train.sh` 和 `checkpoints/colt_codefaithful`。修复 forward
+CoT 双重 causal shift、Qwen3-VL 视觉塔冻结遗漏及 backward stop-gradient 方向后的 P0
+版本必须从原始预训练模型重新开始，并使用独立入口：
+
+```bash
+bash scripts/lkl_8gpu/18_train_paper_faithful.sh
+```
+
+该脚本在训练前运行 `verify_paper_faithful.py`，并在模型加载后断言没有任何可训练的
+`visual.*` 参数。训练输出写入
+`/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_paper_faithful`，不会读取或覆盖
+`colt_codefaithful`。只有确认同一次 P0 运行的 checkpoint 完整时才可执行：
+
+```bash
+RESUME=1 bash scripts/lkl_8gpu/18_train_paper_faithful.sh
+```
+
+评估 P0 时显式指定最终模型目录，例如：
+
+```bash
+COLT_FINAL_MODEL_DIR=/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_paper_faithful \
+COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=3 \
+bash scripts/lkl_8gpu/17_eval_colt_replicas.sh all8
+```
+
 ## 6. 更新与评测
 
 以后更新代码：
