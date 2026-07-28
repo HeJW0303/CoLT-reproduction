@@ -3,6 +3,7 @@
 ._*
 __MACOSX/
 __pycache__/
+.pytest_cache/
 *.py[cod]
 
 # Local credentials and environment files
@@ -18,6 +19,9 @@ wandb/
 *.tar
 *.tar.gz
 *.zip
+
+# Local research notes and experiment reports
+/Markdown/
 
 # Runtime assets must stay outside Git
 envs/
