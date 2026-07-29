@@ -4,7 +4,8 @@ set -euo pipefail
 
 TEST_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TEST_SCRIPT_ROOT/../../.." && pwd)"
-source "$REPO_ROOT/scripts/lkl_8gpu/common.sh"
+source "$REPO_ROOT/scripts/lkl_8gpu/lib/runtime.sh"
+runtime_init
 require_workspace_layout
 BASE_CONFIG="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_paper_faithful.yaml"
 
@@ -62,11 +63,10 @@ export COLT_BENCHMARK_MODE=1
 export COLT_SKIP_FINAL_SAVE=1
 export COLT_TRAIN_CONFIG="$config_path"
 export COLT_TRAIN_OUTPUT_DIR="$output_dir"
-export COLT_TRAIN_ENTRY_SCRIPT="$TEST_SCRIPT_ROOT/19_benchmark_colt_aux_batching.sh"
 export COLT_TRAIN_RECORD_PREFIX="colt_aux_batch_benchmark_${mode}_run"
 export COLT_TRAIN_LOG_PREFIX="colt_aux_batch_benchmark_${mode}"
 
 echo "Benchmark mode: $mode"
 echo "COLT_BATCH_AUX_DECODERS=$COLT_BATCH_AUX_DECODERS"
 echo "Output directory: $output_dir"
-exec bash "$REPO_ROOT/scripts/lkl_8gpu/06_train.sh"
+exec bash "$REPO_ROOT/scripts/lkl_8gpu/colt.sh" train paper-faithful

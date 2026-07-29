@@ -1,226 +1,95 @@
-# `/data/nvme0/lkl` 双机 8 GPU 部署
+# CoLT LKL 8-GPU 统一入口
 
-这套脚本用于两台公网服务器：8x A100-SXM4-80GB 和 8x A800-SXM4-80GB。二者共享
-同一套训练与评测代码，只通过机器 profile 校验 GPU 型号。原有 `scripts/a100` 是另一台
-机器上已经验证的 Docker 工作流，不要混用。
+该目录同时服务 LKL A100 和 A800 机器。正式操作只使用一个入口：
 
-当前只支持单机 8 卡训练。两台服务器的 `eth0` 互通不等于 RDMA/NVLink 跨机互通，
-因此不要直接把 `NNODES` 改为 2。
+```bash
+bash scripts/lkl_8gpu/colt.sh help
+```
 
-## 1. 固定目录
+根目录不再按执行时间编号。实现按职责放在：
 
 ```text
-/data/nvme0/lkl/
-├── miniconda3/
-├── conda/{envs,pkgs}/
-├── CoLT-reproduction/
-│   ├── .colt_gpu_profile
-│   ├── checkpoints/
-│   ├── eval/
-│   ├── logs/
-│   ├── cache/
-│   └── tmp/
-├── models/
-├── datasets/
-├── hf-cache/
-├── torch-cache/
-├── clash
-└── config.yaml
+lkl_8gpu/
+├── colt.sh           # 唯一正式入口
+├── commands/         # setup / train / eval 实现
+├── lib/              # 无副作用公共函数
+├── profiles/         # A100 / A800 默认值
+├── requirements/     # 评测依赖约束
+└── tools/            # Python 校验、汇总和可视化工具
 ```
 
-模型、数据集、Hugging Face 缓存和 PyTorch 缓存体积大且可跨实验复用，因此保留在
-`/data/nvme0/lkl` 外层。CoLT 专属的 checkpoint、评测结果、日志、预处理缓存、临时文件和
-机器 profile 全部收进仓库目录，并由 `.gitignore` 排除。脚本不会覆盖用户的 `HOME`。
-
-## 2. 克隆与代理
-
-在两台机器上分别执行：
+## 首次准备
 
 ```bash
-cd /data/nvme0/lkl
-git clone https://github.com/HeJW0303/CoLT-reproduction.git
-cd CoLT-reproduction
-```
-
-Clash 服务运行后，需要访问 GitHub/Hugging Face 时在当前终端设置：
-
-```bash
+cd /data/nvme0/lkl/CoLT-reproduction
 export http_proxy=http://127.0.0.1:7890
 export https_proxy=http://127.0.0.1:7890
-export HTTP_PROXY="$http_proxy"
-export HTTPS_PROXY="$https_proxy"
-export ALL_PROXY=socks5h://127.0.0.1:7890
+
+bash scripts/lkl_8gpu/colt.sh profile a100  # A800 改为 a800
+bash scripts/lkl_8gpu/colt.sh setup all
+bash scripts/lkl_8gpu/colt.sh verify ready
+bash scripts/lkl_8gpu/colt.sh verify nccl
 ```
 
-代理只影响当前 shell 及其子进程。训练模型和数据下载完成后，可以 `unset` 这些变量。
+代理只在下载或安装时需要，不写入脚本和仓库。
 
-## 3. 绑定机器 profile
-
-A100 服务器：
+## 训练
 
 ```bash
-cd /data/nvme0/lkl/CoLT-reproduction
-bash scripts/lkl_8gpu/00_verify_host.sh a100
+bash scripts/lkl_8gpu/colt.sh train codefaithful
+bash scripts/lkl_8gpu/colt.sh train paper-faithful
+bash scripts/lkl_8gpu/colt.sh train oracle-k
 ```
 
-A800 服务器：
+断点恢复必须显式声明，且脚本会检查完整 Trainer checkpoint：
 
 ```bash
-cd /data/nvme0/lkl/CoLT-reproduction
-bash scripts/lkl_8gpu/00_verify_host.sh a800
+bash scripts/lkl_8gpu/colt.sh train paper-faithful --resume
 ```
 
-该命令严格检查 8 张 GPU 的型号，并写入
-`/data/nvme0/lkl/CoLT-reproduction/.colt_gpu_profile`。后续脚本自动读取；若选错 profile，会在安装或
-训练前退出。
-
-## 4. 首次安装与数据准备
-
-新版 Conda 首次访问 Anaconda 官方源会要求接受服务条款。这是交互式确认，不是创建失败。
-可以先查看条款，再由服务器账号本人执行接受命令：
+辅助 decoder 合批仍默认关闭；完成 loss/gradient 对齐后才启用：
 
 ```bash
-/data/nvme0/lkl/miniconda3/bin/conda tos view \
-  --override-channels --channel https://repo.anaconda.com/pkgs/main
-/data/nvme0/lkl/miniconda3/bin/conda tos accept \
-  --override-channels --channel https://repo.anaconda.com/pkgs/main
-/data/nvme0/lkl/miniconda3/bin/conda tos accept \
-  --override-channels --channel https://repo.anaconda.com/pkgs/r
+bash scripts/lkl_8gpu/colt.sh train paper-faithful --batch-aux
 ```
 
-也可以在 `conda create` 显示 `[(a)ccept/(r)eject/(v)iew]` 时输入 `a`。接受结果会保存在
-当前用户配置中，通常只需操作一次。`--yes` 只确认创建环境，不能代替接受服务条款。
+## 评测
 
-两台机器使用相同命令：
+A100 默认使用 0-7，A800 默认使用 4-7；均可通过 `--gpus` 显式覆盖。默认每卡 3 个
+模型 worker，启用 CPU 图像预取，关闭逐样本 `empty_cache()`，使用 Gloo 同步。
 
 ```bash
-bash scripts/lkl_8gpu/01_setup_env.sh
-bash scripts/lkl_8gpu/02_download_assets.sh
-bash scripts/lkl_8gpu/03_prepare_data.sh
-bash scripts/lkl_8gpu/04_verify_ready.sh
-bash scripts/lkl_8gpu/05_nccl_smoke.sh
+# 本地 code-faithful checkpoint，A100 8 卡，8 个数据集
+bash scripts/lkl_8gpu/colt.sh eval codefaithful all8 --gpus 0,1,2,3,4,5,6,7
+
+# 官方 CoLT-8B，sampling + 256，A800 后 4 卡
+bash scripts/lkl_8gpu/colt.sh eval official chartqa --gpus 4,5,6,7 --generation official
+
+# 本地 checkpoint，真正采用 greedy + 8192
+bash scripts/lkl_8gpu/colt.sh eval codefaithful chartqa --generation respect-args
+
+# Qwen3-VL textual-CoT baseline
+bash scripts/lkl_8gpu/colt.sh eval baseline all8 --gpus 0,1,2,3,4,5,6,7
 ```
 
-`01_setup_env.sh` 会创建 Python 3.11 环境
-`/data/nvme0/lkl/conda/envs/colt`，安装固定版本的 PyTorch 2.6.0+cu124、FlashAttention、
-DeepSpeed、LLaMA-Factory 和仓库内 Transformers。DeepSpeed 以 `DS_BUILD_OPS=0` 安装，
-当前 ZeRO-3 配置不需要系统 CUDA Toolkit 或 NVCC。脚本不调用 `apt`，如果预检提示缺少
-`git`、`curl`、`unzip` 或 `tmux`，需先让管理员安装系统包。
+模型路径优先级固定为：
 
-模型、数据均使用固定 Hugging Face revision 下载并校验。下载中断后可直接重跑步骤 2；
-数据解压中断后可直接重跑步骤 3。
+```text
+--model-path > COLT_EVAL_MODEL_PATH > target 默认路径
+```
 
-## 5. 训练与恢复
+启动日志会打印 `Model source` 和 `Resolved model`，并同时记录请求/实际的
+`do_sample` 与 `max_new_tokens`。结果目录指纹基于实际模型、代码和推理设置，防止错误
+复用其他 checkpoint 的预测。
 
-建议在 tmux 中运行：
+完整性检查也可单独执行：
 
 ```bash
-tmux new-session -A -s colt-train
-cd /data/nvme0/lkl/CoLT-reproduction
-bash scripts/lkl_8gpu/06_train.sh
+bash scripts/lkl_8gpu/colt.sh verify model codefaithful
+bash scripts/lkl_8gpu/colt.sh verify model official --model-path /absolute/model/path
 ```
 
-日志位于 `/data/nvme0/lkl/CoLT-reproduction/logs`，训练输出位于
-`/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_codefaithful`。脚本会记录 Git SHA、工作区 diff、依赖版本、
-训练 YAML 和 DeepSpeed 配置。
+## 实验脚本
 
-只有确认是同一次训练的完整 checkpoint 后才使用恢复模式：
-
-```bash
-RESUME=1 bash scripts/lkl_8gpu/06_train.sh
-```
-
-普通启动遇到非空输出目录会拒绝覆盖；`RESUME=1` 找不到完整 `trainer_state.json` 也会拒绝。
-
-### Paper-faithful 三项修复版本
-
-公开源码忠实版本继续使用 `06_train.sh` 和 `checkpoints/colt_codefaithful`。修复 forward
-CoT 双重 causal shift、Qwen3-VL 视觉塔冻结遗漏及 backward stop-gradient 方向后的 P0
-版本必须从原始预训练模型重新开始，并使用独立入口：
-
-```bash
-bash scripts/lkl_8gpu/18_train_paper_faithful.sh
-```
-
-该脚本在训练前运行 `verify_paper_faithful.py`，并在模型加载后断言没有任何可训练的
-`visual.*` 参数。训练输出写入
-`/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_paper_faithful`，不会读取或覆盖
-`colt_codefaithful`。只有确认同一次 P0 运行的 checkpoint 完整时才可执行：
-
-```bash
-RESUME=1 bash scripts/lkl_8gpu/18_train_paper_faithful.sh
-```
-
-评估 P0 时显式指定最终模型目录，例如：
-
-```bash
-COLT_FINAL_MODEL_DIR=/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_paper_faithful \
-COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
-VLMEVAL_WORKERS_PER_GPU=3 \
-bash scripts/lkl_8gpu/17_eval_colt_replicas.sh all8
-```
-
-## 6. 更新与评测
-
-以后更新代码：
-
-```bash
-cd /data/nvme0/lkl/CoLT-reproduction
-git pull --ff-only origin main
-```
-
-训练完成后：
-
-```bash
-bash scripts/lkl_8gpu/07_verify_final_model.sh
-bash scripts/lkl_8gpu/08_setup_eval.sh
-bash scripts/lkl_8gpu/10_eval_smoke.sh
-```
-
-完整评测、8 卡评测和诊断入口见 `scripts/lkl_8gpu/README_EVAL.md`。
-
-## 7. 常用覆盖项
-
-默认值适合这两台机器。确有需要时可临时覆盖：
-
-```bash
-COLT_TRITON_CACHE_DIR=/dev/shm/colt-triton bash scripts/lkl_8gpu/06_train.sh
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NCCL_DEBUG=INFO \
-  bash scripts/lkl_8gpu/05_nccl_smoke.sh
-```
-
-不要把代理、Hugging Face token 或其他密钥提交到仓库。
-
-### Paper-faithful 辅助 decoder 吞吐验证
-
-训练基准前先运行确定性的 toy loss/gradient 单元测试：
-
-```bash
-COLT_PAPER_FAITHFUL=1 python tests/integration/lkl_8gpu/verify_colt_throughput.py
-```
-
-结构合批默认关闭。正式启用前，使用相同 seed 和数据顺序分别对比 3 个 optimizer step：
-
-```bash
-bash tests/integration/lkl_8gpu/19_benchmark_colt_aux_batching.sh sequential
-bash tests/integration/lkl_8gpu/19_benchmark_colt_aux_batching.sh batched
-```
-
-### Oracle-K predictor training on the LKL A100/A800 layout
-
-The second-stage Oracle-K predictor run uses the repaired paper-faithful hot path,
-GT K supervision, and dynamic inference settings. The default output directory is
-`/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_oracle_k_predictor`.
-
-```bash
-bash scripts/lkl_8gpu/19_train_oracle_k_predictor.sh
-```
-
-Set `COLT_BATCH_AUX_DECODERS=1` only after the unbatched short-run comparison has
-passed. The entry point runs `tests/oracle_k` before launching the eight-GPU job.
-
-`COLT_BATCH_AUX_DECODERS=1` 将三次 forward decoder 调用和两次 backward decoder
-调用分别合并。`COLT_COMPONENT_LOG_EVERY` 控制 rank 0 的 component loss 日志间隔，
-单位为 microbatch，默认值为 8。基准同时设置 `COLT_BENCHMARK_MODE=1` 和
-`COLT_SKIP_FINAL_SAVE=1`，因此不会保存最终模型；正式训练不会同时设置这两个变量，
-仍会正常保存最终模型。
+吞吐 A/B、预处理 A/B 等诊断入口位于 `tests/integration/lkl_8gpu/`，不作为正式训练或
+评测入口。正式流程不要从该目录启动。

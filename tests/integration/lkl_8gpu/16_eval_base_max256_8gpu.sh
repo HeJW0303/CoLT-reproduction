@@ -4,8 +4,19 @@ set -euo pipefail
 export COLT_REQUIRE_FINAL_MODEL=0
 TEST_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TEST_SCRIPT_ROOT/../../.." && pwd)"
-source "$REPO_ROOT/scripts/lkl_8gpu/eval_common.sh"
+source "$REPO_ROOT/scripts/lkl_8gpu/lib/runtime.sh"
+runtime_init
 require_workspace_layout
+activate_colt_env
+EVAL_DATA_ROOT="${COLT_EVAL_DATA_ROOT:-$EVAL_ROOT/LMUData}"
+EVAL_OUTPUT_ROOT="${COLT_EVAL_OUTPUT_ROOT:-$EVAL_ROOT/results}"
+EVAL_LOG_ROOT="${COLT_EVAL_LOG_ROOT:-$LOG_ROOT/eval}"
+export COLT_EVAL_SEED="${COLT_EVAL_SEED:-1234}"
+export LMUData="$EVAL_DATA_ROOT"
+export PYTHONPATH="$VLMEVAL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1 VLMEVAL_FAIL_ON_ERROR=1 VLMEVAL_ATOMIC_WRITES=1
+mkdir -p "$EVAL_DATA_ROOT" "$EVAL_OUTPUT_ROOT" "$EVAL_LOG_ROOT"
 
 datasets=(AI2D_TEST TextVQA_VAL)
 eval_model_name="Qwen3-VL-8B-Instruct-BASE-COT-MAX256"
@@ -113,7 +124,7 @@ print(
 )
 PY
 
-bash "$REPO_ROOT/scripts/lkl_8gpu/09_download_eval_data.sh" "${datasets[@]}"
+bash "$REPO_ROOT/scripts/lkl_8gpu/colt.sh" download "${datasets[@]}"
 
 IFS=',' read -r -a gpu_ids <<< "$gpu_csv"
 if (( ${#gpu_ids[@]} != 8 )); then
@@ -160,8 +171,8 @@ eval_fingerprint="$(
     find "$VLMEVAL_ROOT/vlmeval" -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum
     sha256sum \
       "$TEST_SCRIPT_ROOT/16_eval_base_max256_8gpu.sh" \
-      "$REPO_ROOT/scripts/lkl_8gpu/validate_eval_suite.py" \
-      "$REPO_ROOT/scripts/lkl_8gpu/eval_common.sh" \
+      "$REPO_ROOT/scripts/lkl_8gpu/tools/validate_eval_suite.py" \
+      "$REPO_ROOT/scripts/lkl_8gpu/lib/runtime.sh" \
       "$BASE_MODEL_DIR/model.safetensors.index.json" \
       "$BASE_MODEL_DIR/config.json" \
       "$BASE_MODEL_DIR/preprocessor_config.json"
@@ -207,7 +218,7 @@ if [[ "${EVAL_VERBOSE:-0}" == "1" ]]; then
 fi
 torchrun "${args[@]}"
 
-python "$REPO_ROOT/scripts/lkl_8gpu/validate_eval_suite.py" \
+python "$REPO_ROOT/scripts/lkl_8gpu/tools/validate_eval_suite.py" \
   "$work_dir" \
   "$eval_model_name" \
   "$eval_id" \

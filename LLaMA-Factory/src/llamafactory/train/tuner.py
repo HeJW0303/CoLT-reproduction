@@ -69,8 +69,11 @@ def _training_function(config: dict[str, Any]) -> None:
                 "LLaMA-Factory/src/llamafactory/model/adapter.py",
                 "LLaMA-Factory/src/llamafactory/model/model_utils/visual.py",
                 "LLaMA-Factory/src/llamafactory/train/tuner.py",
-                "scripts/lkl_8gpu/18_train_paper_faithful.sh",
-                "scripts/lkl_8gpu/verify_paper_faithful.py",
+                "scripts/lkl_8gpu/colt.sh",
+                "scripts/lkl_8gpu/commands/train.sh",
+                "scripts/lkl_8gpu/lib/runtime.sh",
+                "scripts/lkl_8gpu/lib/gpu.sh",
+                "scripts/lkl_8gpu/tools/verify_paper_faithful.py",
             ]
         )
     if os.environ.get("COLT_ORACLE_K_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}:
@@ -81,10 +84,13 @@ def _training_function(config: dict[str, Any]) -> None:
                 "transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py",
                 "transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py",
                 "scripts/a100/18_train_oracle_k.sh",
-                "scripts/lkl_8gpu/19_train_oracle_k_predictor.sh",
+                "scripts/lkl_8gpu/colt.sh",
+                "scripts/lkl_8gpu/commands/train.sh",
+                "scripts/lkl_8gpu/lib/runtime.sh",
+                "scripts/lkl_8gpu/lib/gpu.sh",
             ]
         )
-    callbacks.append(CopyFilesOnTrainBeginCallback(files_to_copy))
+    callbacks.append(CopyFilesOnTrainBeginCallback(list(dict.fromkeys(files_to_copy))))
 
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())

@@ -4,7 +4,19 @@ set -euo pipefail
 export COLT_REQUIRE_FINAL_MODEL=0
 TEST_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TEST_SCRIPT_ROOT/../../.." && pwd)"
-source "$REPO_ROOT/scripts/lkl_8gpu/eval_common.sh"
+source "$REPO_ROOT/scripts/lkl_8gpu/lib/runtime.sh"
+runtime_init
+require_workspace_layout
+activate_colt_env
+EVAL_DATA_ROOT="${COLT_EVAL_DATA_ROOT:-$EVAL_ROOT/LMUData}"
+EVAL_OUTPUT_ROOT="${COLT_EVAL_OUTPUT_ROOT:-$EVAL_ROOT/results}"
+EVAL_LOG_ROOT="${COLT_EVAL_LOG_ROOT:-$LOG_ROOT/eval}"
+export COLT_EVAL_SEED="${COLT_EVAL_SEED:-1234}"
+export LMUData="$EVAL_DATA_ROOT"
+export PYTHONPATH="$VLMEVAL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1 VLMEVAL_FAIL_ON_ERROR=1 VLMEVAL_ATOMIC_WRITES=1
+mkdir -p "$EVAL_DATA_ROOT" "$EVAL_OUTPUT_ROOT" "$EVAL_LOG_ROOT"
 
 datasets=(AI2D_TEST TextVQA_VAL)
 variants=(
@@ -141,7 +153,7 @@ for gpu in "${gpu_ids[@]}"; do
   echo "Physical GPU $gpu detected: ${memory_used:-unknown} MiB in use; memory usage is not enforced."
 done
 
-bash "$REPO_ROOT/scripts/lkl_8gpu/09_download_eval_data.sh" "${datasets[@]}"
+bash "$REPO_ROOT/scripts/lkl_8gpu/colt.sh" download "${datasets[@]}"
 export CUDA_VISIBLE_DEVICES="$gpu_csv"
 export PRED_FORMAT=xlsx
 export EVAL_FORMAT=csv
@@ -167,9 +179,9 @@ fingerprint="$(
     sha256sum \
       "$TEST_SCRIPT_ROOT/15_eval_preprocess_ab_8gpu.sh" \
       "$TEST_SCRIPT_ROOT/compare_preprocess_ab.py" \
-      "$REPO_ROOT/scripts/lkl_8gpu/validate_eval_suite.py" \
-      "$REPO_ROOT/scripts/lkl_8gpu/eval_common.sh" \
-      "$REPO_ROOT/scripts/lkl_8gpu/09_download_eval_data.sh" \
+      "$REPO_ROOT/scripts/lkl_8gpu/tools/validate_eval_suite.py" \
+      "$REPO_ROOT/scripts/lkl_8gpu/lib/runtime.sh" \
+      "$REPO_ROOT/scripts/lkl_8gpu/commands/eval.sh" \
       "$BASE_MODEL_DIR/model.safetensors.index.json" \
       "$BASE_MODEL_DIR/config.json" \
       "$BASE_MODEL_DIR/preprocessor_config.json" \
@@ -227,7 +239,7 @@ for variant in "${variants[@]}"; do
   fi
   torchrun "${args[@]}"
 
-  python "$REPO_ROOT/scripts/lkl_8gpu/validate_eval_suite.py" \
+  python "$REPO_ROOT/scripts/lkl_8gpu/tools/validate_eval_suite.py" \
     "$work_dir" \
     "$model_name" \
     "$eval_id" \
