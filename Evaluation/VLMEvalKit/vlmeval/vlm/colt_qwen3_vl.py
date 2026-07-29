@@ -259,7 +259,7 @@ class Qwen3VLChat(BaseModel):
         return response.strip()
 
     @torch.inference_mode()
-    def generate_prepared(self, prepared):
+    def _generate_prepared_token_ids(self, prepared):
         messages = prepared["messages"]
         self._reseed_sample(messages, prepared["dataset"])
         inputs = prepared["inputs"].to(self.model.device)
@@ -279,17 +279,40 @@ class Qwen3VLChat(BaseModel):
                     f"[CoLT Oracle-K] predicted_k={predicted_k.reshape(-1).tolist()} used_k={used_k}",
                     flush=True,
                 )
-        generated_ids = generated_ids[:, inputs.input_ids.shape[1] :]
+        return generated_ids[:, inputs.input_ids.shape[1] :]
+
+    def _decode_generated_ids(self, generated_ids, *, skip_special_tokens):
         with self._processor_lock:
-            response = self.processor.batch_decode(
+            return self.processor.batch_decode(
                 generated_ids,
-                skip_special_tokens=True,
+                skip_special_tokens=skip_special_tokens,
                 clean_up_tokenization_spaces=False,
             )[0]
 
+    @torch.inference_mode()
+    def generate_prepared(self, prepared):
+        generated_ids = self._generate_prepared_token_ids(prepared)
+        response = self._decode_generated_ids(generated_ids, skip_special_tokens=True)
         if self.verbose:
             print(f"[CoLT raw response] {response}", flush=True)
         return self._extract_final_answer(response) if self.post_process else response
+
+    @torch.inference_mode()
+    def diagnose_prepared(self, prepared):
+        """Generate once and retain token-level evidence for empty-response audits."""
+        generated_ids = self._generate_prepared_token_ids(prepared)
+        clean_response = self._decode_generated_ids(generated_ids, skip_special_tokens=True)
+        raw_response = self._decode_generated_ids(generated_ids, skip_special_tokens=False)
+        final_response = self._extract_final_answer(clean_response) if self.post_process else clean_response
+        return {
+            "token_ids": generated_ids[0].detach().cpu().tolist(),
+            "raw_response": raw_response,
+            "clean_response": clean_response,
+            "final_response": final_response,
+            "model_eos_token_id": getattr(self.model, "eos_token_id", None),
+            "tokenizer_eos_token_id": self.processor.tokenizer.eos_token_id,
+            "tokenizer_pad_token_id": self.processor.tokenizer.pad_token_id,
+        }
 
     def generate_inner(self, message, dataset=None):
         return self.generate_prepared(self._prepare_preprocessed_request(message, dataset))
