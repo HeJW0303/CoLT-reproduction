@@ -27,6 +27,14 @@ resolve_eval_model() {
   EVAL_MODEL_PATH="$(cd "$EVAL_MODEL_PATH" && pwd -P)"
 }
 
+generation_log_label() {
+  case "$1" in
+    official) printf '%s\n' "sampling_max256" ;;
+    respect-args) printf '%s\n' "greedy_max8192" ;;
+    *) die "Unknown generation mode for log naming: $1" ;;
+  esac
+}
+
 verify_eval_model() {
   local target="$1" mode=trained
   case "$target" in

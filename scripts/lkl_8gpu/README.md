@@ -82,6 +82,16 @@ bash scripts/lkl_8gpu/colt.sh eval baseline all8 --gpus 0,1,2,3,4,5,6,7
 `do_sample` 与 `max_new_tokens`。结果目录指纹基于实际模型、代码和推理设置，防止错误
 复用其他 checkpoint 的预测。
 
+评测日志按 target 分目录保存，并在文件名中直接标明实际解码配置：
+
+```text
+logs/eval/official/official_chartqa_sampling_max256_YYYYMMDD_HHMMSS.log
+logs/eval/codefaithful/codefaithful_chartqa_greedy_max8192_YYYYMMDD_HHMMSS.log
+```
+
+`--generation official` 对应 `sampling_max256`，`--generation respect-args` 对应
+`greedy_max8192`。
+
 完整性检查也可单独执行：
 
 ```bash

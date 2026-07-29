@@ -183,7 +183,9 @@ cmd_eval() {
   fi
   python "$COLT_SCRIPT_ROOT/tools/verify_eval_env.py" --repo-root "$REPO_ROOT" --adapter "$adapter_mode"
 
-  local nproc=$(( ${#COLT_GPU_IDS[@]} * workers )) fingerprint profile eval_id work_dir log_file
+  local nproc=$(( ${#COLT_GPU_IDS[@]} * workers )) fingerprint profile eval_id work_dir log_dir log_file
+  local generation_label
+  generation_label="$(generation_log_label "$generation")"
   fingerprint="$(python "$COLT_SCRIPT_ROOT/tools/eval_fingerprint.py" \
     --repo-root "$REPO_ROOT" --model-dir "$source_model_path" \
     --setting "target=$target" --setting "group=$group" --setting "generation=$generation" \
@@ -193,8 +195,9 @@ cmd_eval() {
   profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
   work_dir="$EVAL_OUTPUT_ROOT/$target/$group/$profile"
   eval_id="$(printf '%s_%s' "$target" "$profile" | tr '[:lower:]-' '[:upper:]_')"
-  log_file="$EVAL_LOG_ROOT/${target}_${group}_${profile}_${run_id}.log"
-  mkdir -p "$work_dir"
+  log_dir="$EVAL_LOG_ROOT/$target"
+  log_file="$log_dir/${target}_${group}_${generation_label}_${run_id}.log"
+  mkdir -p "$work_dir" "$log_dir"
   exec > >(tee -a "$log_file") 2>&1
 
   export CUDA_VISIBLE_DEVICES="$gpu_csv" MMEVAL_ROOT="$work_dir" VLMEVAL_EVAL_ID="$eval_id"

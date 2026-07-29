@@ -88,6 +88,19 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "COLT_EVAL_MODEL_PATH")
 
+    def test_generation_modes_have_unambiguous_log_labels(self) -> None:
+        result = self.run_bash(
+            f'source "{SCRIPT_ROOT}/lib/runtime.sh"; '
+            f'source "{SCRIPT_ROOT}/lib/model.sh"; '
+            'generation_log_label official; '
+            'generation_log_label respect-args'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["sampling_max256", "greedy_max8192"],
+        )
+
     def test_root_contains_only_unified_shell_entry(self) -> None:
         root_shells = sorted(path.name for path in SCRIPT_ROOT.glob("*.sh"))
         self.assertEqual(root_shells, ["colt.sh"])
