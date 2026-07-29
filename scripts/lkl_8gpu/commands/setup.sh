@@ -172,20 +172,30 @@ verify_ready() {
   export COLT_DECODER_MODEL_PATH="$DECODER_MODEL_DIR"
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
   python "$COLT_SCRIPT_ROOT/tools/validate_dataset.py" --data-root "$DATA_ROOT"
-  python - "$REPO_ROOT" "$BASE_MODEL_DIR" "$DECODER_MODEL_DIR" <<'PY'
+  python - \
+    "$REPO_ROOT" \
+    "$BASE_MODEL_DIR" \
+    "$DECODER_MODEL_DIR" \
+    "$BASE_MODEL_REVISION" \
+    "$DECODER_MODEL_REVISION" <<'PY'
 import sys
 from importlib.metadata import version
 from pathlib import Path
 import torch, transformers
 
-repo, base, decoder = map(Path, sys.argv[1:])
+repo, base, decoder = map(Path, sys.argv[1:4])
+base_revision, decoder_revision = sys.argv[4:6]
 assert torch.__version__ == "2.6.0+cu124", torch.__version__
 assert transformers.__version__ == "4.57.0", transformers.__version__
 assert Path(transformers.__file__).resolve().is_relative_to(repo / "transformers-4.57.0")
 assert version("flash-attn") == "2.7.4.post1"
 assert torch.cuda.device_count() == 8
+assert (base / ".colt_verified_revision").read_text().strip() == base_revision
+assert (decoder / ".colt_verified_revision").read_text().strip() == decoder_revision
 for model in (base, decoder):
-    assert (model / "model.safetensors.index.json").is_file(), model
+    has_index = (model / "model.safetensors.index.json").is_file()
+    has_single_file = any(model.glob("*.safetensors"))
+    assert has_index or has_single_file, f"No safetensors weights under {model}"
 print("Static training readiness: OK")
 PY
   require_free_gib 200
@@ -196,7 +206,11 @@ verify_nccl() {
   require_workspace_layout
   activate_colt_env
   validate_gpu_profile
-  export CUDA_VISIBLE_DEVICES="${COLT_TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
+  local gpu_csv="${COLT_TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
+  parse_gpu_csv "$gpu_csv"
+  [[ "${#COLT_GPU_IDS[@]}" -eq 8 ]] || die "NCCL smoke requires exactly 8 GPU ids: $gpu_csv"
+  require_selected_gpus_free
+  export CUDA_VISIBLE_DEVICES="$gpu_csv"
   export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
   torchrun --standalone --nproc_per_node=8 "$COLT_SCRIPT_ROOT/tools/nccl_smoke.py"
   echo "Eight-rank NCCL smoke test passed."
