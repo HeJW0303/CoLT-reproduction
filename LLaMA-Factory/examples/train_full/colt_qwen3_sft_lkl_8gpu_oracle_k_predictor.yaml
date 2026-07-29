@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: /workspace/models/Qwen3-VL-8B-Instruct
+model_name_or_path: /data/nvme0/lkl/models/Qwen3-VL-8B-Instruct
 image_max_pixels: 802816
 video_max_pixels: 100352
 video_maxlen: 128
@@ -18,18 +18,18 @@ deepspeed: LLaMA-Factory/examples/deepspeed/ds_z3_a100.json
 ### dataset
 dataset: onethinker_sft_image_oracle_k
 template: qwen3_vl
-dataset_dir: /workspace/data/CoLT_Train_Dataset
-media_dir: /workspace/data/CoLT_Train_Dataset
+dataset_dir: /data/nvme0/lkl/datasets/CoLT_Train_Dataset
+media_dir: /data/nvme0/lkl/datasets/CoLT_Train_Dataset
 use_fast_tokenizer: false
 cutoff_len: 16640
 overwrite_cache: true
 preprocessing_num_workers: 32
 preprocessing_batch_size: 32
 max_samples: 1000000
-tokenized_path: /workspace/cache/colt/onethinker_sft_oracle_k_tokenized
+tokenized_path: /data/nvme0/lkl/CoLT-reproduction/cache/colt/onethinker_sft_oracle_k_predictor_tokenized
 
 ### output
-output_dir: /workspace/outputs/colt_oracle_k_predictor
+output_dir: /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_oracle_k_predictor
 logging_steps: 1
 save_steps: 1000
 save_strategy: steps
@@ -52,4 +52,4 @@ flash_attn: fa2
 
 ### eval
 report_to: wandb
-run_name: colt_sft_8b_a100_oracle_k_predictor
+run_name: colt_sft_8b_lkl_8gpu_oracle_k_predictor

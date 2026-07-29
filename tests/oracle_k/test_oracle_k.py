@@ -101,10 +101,91 @@ class OracleKSettingsTest(unittest.TestCase):
         self.assertTrue(reloaded.enabled)
         self.assertEqual(reloaded.max_k, 6)
 
+    def test_predictor_settings_persist_to_config(self):
+        config = DummyConfig()
+        settings = oracle_k.resolve_oracle_k_settings(
+            config,
+            environ={
+                "COLT_ORACLE_K_ENABLED": "1",
+                "COLT_ORACLE_K_MAX": "8",
+                "COLT_ORACLE_K_PREDICTOR_ENABLED": "1",
+                "COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT": "0.35",
+                "COLT_ORACLE_K_DYNAMIC_INFERENCE": "1",
+            },
+        )
+
+        self.assertTrue(settings.predictor_enabled)
+        self.assertAlmostEqual(settings.predictor_loss_weight, 0.35)
+        self.assertTrue(settings.dynamic_inference)
+        self.assertTrue(config.colt_oracle_k_predictor_enabled)
+        self.assertAlmostEqual(config.colt_oracle_k_predictor_loss_weight, 0.35)
+        self.assertTrue(config.colt_oracle_k_dynamic_inference)
+
+        with patch.dict(os.environ, {}, clear=True):
+            reloaded = oracle_k.resolve_oracle_k_settings(config)
+        self.assertTrue(reloaded.predictor_enabled)
+        self.assertAlmostEqual(reloaded.predictor_loss_weight, 0.35)
+        self.assertTrue(reloaded.dynamic_inference)
+
+    def test_dynamic_inference_requires_predictor(self):
+        with self.assertRaisesRegex(ValueError, "DYNAMIC_INFERENCE requires"):
+            oracle_k.resolve_oracle_k_settings(
+                DummyConfig(),
+                environ={
+                    "COLT_ORACLE_K_ENABLED": "1",
+                    "COLT_ORACLE_K_DYNAMIC_INFERENCE": "1",
+                },
+            )
+
+    def test_predictor_requires_oracle_k(self):
+        with self.assertRaisesRegex(ValueError, "PREDICTOR_ENABLED requires"):
+            oracle_k.resolve_oracle_k_settings(
+                DummyConfig(),
+                environ={"COLT_ORACLE_K_PREDICTOR_ENABLED": "1"},
+            )
+
+    def test_predictor_loss_weight_must_be_finite(self):
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            oracle_k.resolve_oracle_k_settings(
+                DummyConfig(),
+                environ={
+                    "COLT_ORACLE_K_ENABLED": "1",
+                    "COLT_ORACLE_K_PREDICTOR_ENABLED": "1",
+                    "COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT": "nan",
+                },
+            )
+
     def test_forced_inference_k_validation(self):
         self.assertEqual(oracle_k.resolve_forced_inference_k(8, {"COLT_INFERENCE_K": "5"}), 5)
         with self.assertRaisesRegex(ValueError, "must be in"):
             oracle_k.resolve_forced_inference_k(8, {"COLT_INFERENCE_K": "9"})
+
+    def test_inference_k_priority(self):
+        select = oracle_k.select_oracle_k_inference_steps
+        self.assertEqual(
+            select(8, 3, num_hidden_generations=6, forced_k=5, predicted_k=4, dynamic_inference=True),
+            6,
+        )
+        self.assertEqual(select(8, 3, forced_k=5, predicted_k=4, dynamic_inference=True), 5)
+        self.assertEqual(select(8, 3, predicted_k=4, dynamic_inference=True), 4)
+        self.assertEqual(select(8, 3, predicted_k=4, dynamic_inference=False), 3)
+
+    def test_explicit_k_does_not_depend_on_forced_environment_value(self):
+        self.assertEqual(
+            oracle_k.select_oracle_k_inference_steps(
+                8,
+                3,
+                num_hidden_generations=6,
+                forced_k=999,
+                predicted_k=4,
+                dynamic_inference=True,
+            ),
+            6,
+        )
+
+    def test_dynamic_inference_requires_prediction(self):
+        with self.assertRaisesRegex(ValueError, "requires one predicted K"):
+            oracle_k.select_oracle_k_inference_steps(8, 3, dynamic_inference=True)
 
 
 class TeacherSegmentationTest(unittest.TestCase):
@@ -301,6 +382,19 @@ class OracleKPackagingTest(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "torch is only installed in the CoLT training environment")
 class OracleKConditionerTest(unittest.TestCase):
+    def test_pooling_uses_last_valid_token_for_left_and_right_padding(self):
+        hidden_states = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        attention_mask = torch.tensor([[1, 1, 0, 0], [0, 1, 1, 1]])
+
+        pooled = modeling_oracle_k.pool_last_valid_hidden(hidden_states, attention_mask)
+
+        self.assertTrue(torch.equal(pooled[0], hidden_states[0, 1]))
+        self.assertTrue(torch.equal(pooled[1], hidden_states[1, 3]))
+
+    def test_pooling_rejects_empty_question(self):
+        with self.assertRaisesRegex(ValueError, "at least one valid token"):
+            modeling_oracle_k.pool_last_valid_hidden(torch.zeros(1, 2, 3), torch.zeros(1, 2))
+
     def test_budget_and_step_embeddings_receive_gradients(self):
         conditioner = modeling_oracle_k.OracleKBudgetConditioner(max_k=8, hidden_size=4)
         latent = torch.zeros(1, 1, 4, requires_grad=True)
@@ -309,6 +403,23 @@ class OracleKConditionerTest(unittest.TestCase):
 
         self.assertGreater(conditioner.budget_embedding.weight.grad[3].abs().sum().item(), 0)
         self.assertGreater(conditioner.step_embedding.weight.grad[2].abs().sum().item(), 0)
+
+    def test_k_predictor_outputs_all_classes_and_receives_gradients(self):
+        predictor = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=6)
+        pooled_hidden = torch.randn(3, 6, requires_grad=True)
+
+        logits = predictor(pooled_hidden)
+        loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 3, 7]))
+        loss.backward()
+
+        self.assertEqual(logits.shape, (3, 8))
+        self.assertGreater(predictor.network[-1].weight.grad.abs().sum().item(), 0)
+        self.assertGreater(pooled_hidden.grad.abs().sum().item(), 0)
+
+    def test_k_predictor_rejects_unpooled_hidden_states(self):
+        predictor = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=6)
+        with self.assertRaisesRegex(ValueError, "expects"):
+            predictor(torch.zeros(2, 3, 6))
 
 
 if __name__ == "__main__":

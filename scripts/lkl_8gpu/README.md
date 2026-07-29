@@ -206,6 +206,19 @@ bash tests/integration/lkl_8gpu/19_benchmark_colt_aux_batching.sh sequential
 bash tests/integration/lkl_8gpu/19_benchmark_colt_aux_batching.sh batched
 ```
 
+### Oracle-K predictor training on the LKL A100/A800 layout
+
+The second-stage Oracle-K predictor run uses the repaired paper-faithful hot path,
+GT K supervision, and dynamic inference settings. The default output directory is
+`/data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_oracle_k_predictor`.
+
+```bash
+bash scripts/lkl_8gpu/19_train_oracle_k_predictor.sh
+```
+
+Set `COLT_BATCH_AUX_DECODERS=1` only after the unbatched short-run comparison has
+passed. The entry point runs `tests/oracle_k` before launching the eight-GPU job.
+
 `COLT_BATCH_AUX_DECODERS=1` 将三次 forward decoder 调用和两次 backward decoder
 调用分别合并。`COLT_COMPONENT_LOG_EVERY` 控制 rank 0 的 component loss 日志间隔，
 单位为 microbatch，默认值为 8。基准同时设置 `COLT_BENCHMARK_MODE=1` 和

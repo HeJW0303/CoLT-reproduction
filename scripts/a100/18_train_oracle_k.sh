@@ -8,9 +8,9 @@ activate_colt_env
 oracle_config="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_oracle_k_a100.yaml"
 oracle_data="${COLT_ORACLE_K_DATA_FILE:-$DATA_ROOT/colt_sft_image_oracle_k.json}"
 oracle_dataset_name="${COLT_ORACLE_K_DATASET_NAME:-onethinker_sft_image_oracle_k}"
-output_dir="${COLT_ORACLE_K_OUTPUT_DIR:-$OUTPUT_ROOT/colt_oracle_k}"
+output_dir="${COLT_ORACLE_K_OUTPUT_DIR:-$OUTPUT_ROOT/colt_oracle_k_predictor}"
 tokenized_path="${COLT_ORACLE_K_TOKENIZED_PATH:-$CACHE_ROOT/colt/onethinker_sft_oracle_k_tokenized}"
-run_name="${COLT_ORACLE_K_RUN_NAME:-colt_sft_8b_a100_oracle_k}"
+run_name="${COLT_ORACLE_K_RUN_NAME:-colt_sft_8b_a100_oracle_k_predictor}"
 oracle_original_start="${COLT_ORACLE_K_ORIGINAL_START:-0}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -27,18 +27,23 @@ export COLT_DECODER_MODEL_PATH="$DECODER_MODEL_DIR"
 export COLT_ORACLE_K_ENABLED=1
 export COLT_ORACLE_K_MAX="${COLT_ORACLE_K_MAX:-8}"
 export COLT_ORACLE_K_BUDGET_CONDITIONING="${COLT_ORACLE_K_BUDGET_CONDITIONING:-1}"
+export COLT_ORACLE_K_PREDICTOR_ENABLED="${COLT_ORACLE_K_PREDICTOR_ENABLED:-1}"
+export COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT="${COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT:-0.2}"
+export COLT_ORACLE_K_DYNAMIC_INFERENCE="${COLT_ORACLE_K_DYNAMIC_INFERENCE:-1}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_PROJECT="${WANDB_PROJECT:-CoLT-oracle-k}"
+export WANDB_PROJECT="${WANDB_PROJECT:-CoLT-oracle-k-predictor}"
 
-python - "$oracle_config" "$COLT_ORACLE_K_MAX" "$COLT_ORACLE_K_BUDGET_CONDITIONING" "$BASE_MODEL_DIR" <<'PY'
+python - "$oracle_config" "$COLT_ORACLE_K_MAX" "$COLT_ORACLE_K_BUDGET_CONDITIONING" \
+  "$BASE_MODEL_DIR" "$COLT_ORACLE_K_PREDICTOR_ENABLED" \
+  "$COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT" "$COLT_ORACLE_K_DYNAMIC_INFERENCE" <<'PY'
 import os
 import sys
 from pathlib import Path
 
 from transformers import AutoConfig, AutoTokenizer
-from transformers.models.qwen3_vl.oracle_k import parse_oracle_k_cot
+from transformers.models.qwen3_vl.oracle_k import parse_oracle_k_cot, resolve_oracle_k_settings
 
 base_model_path = sys.argv[4]
 config = AutoConfig.from_pretrained(base_model_path, local_files_only=True)
@@ -47,7 +52,19 @@ assert os.environ["COLT_ORACLE_K_ENABLED"] == "1"
 assert int(sys.argv[2]) >= 1
 assert os.environ["COLT_ORACLE_K_MAX"] == sys.argv[2]
 assert os.environ["COLT_ORACLE_K_BUDGET_CONDITIONING"] == sys.argv[3]
+assert os.environ["COLT_ORACLE_K_PREDICTOR_ENABLED"] == sys.argv[5]
+assert os.environ["COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT"] == sys.argv[6]
+assert os.environ["COLT_ORACLE_K_DYNAMIC_INFERENCE"] == sys.argv[7]
 assert Path(sys.argv[1]).is_file()
+settings = resolve_oracle_k_settings(config)
+expected_predictor = sys.argv[5].strip().lower() in {"1", "true", "yes", "on"}
+expected_dynamic = sys.argv[7].strip().lower() in {"1", "true", "yes", "on"}
+assert settings.enabled
+assert settings.predictor_enabled is expected_predictor
+assert settings.dynamic_inference is expected_dynamic
+assert settings.predictor_loss_weight == float(sys.argv[6])
+assert config.colt_oracle_k_predictor_enabled is expected_predictor
+assert config.colt_oracle_k_dynamic_inference is expected_dynamic
 base_tokenizer = AutoTokenizer.from_pretrained(base_model_path, local_files_only=True)
 tokenizer = AutoTokenizer.from_pretrained(os.environ["COLT_DECODER_MODEL_PATH"], local_files_only=True)
 assert base_tokenizer.get_vocab() == tokenizer.get_vocab(), "Base and decoder token ID mappings differ"
@@ -110,7 +127,9 @@ if find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
     echo "RESUME=1 was requested, but no complete Trainer checkpoint was found." >&2
     exit 1
   fi
-  python - "$latest_checkpoint/config.json" "$COLT_ORACLE_K_MAX" "$COLT_ORACLE_K_BUDGET_CONDITIONING" <<'PY'
+  python - "$latest_checkpoint/config.json" "$COLT_ORACLE_K_MAX" "$COLT_ORACLE_K_BUDGET_CONDITIONING" \
+    "$COLT_ORACLE_K_PREDICTOR_ENABLED" "$COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT" \
+    "$COLT_ORACLE_K_DYNAMIC_INFERENCE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -121,12 +140,20 @@ if not config_path.is_file():
 with config_path.open(encoding="utf-8") as file:
     config = json.load(file)
 expected_budget = sys.argv[3].strip().lower() in {"1", "true", "yes", "on"}
+expected_predictor = sys.argv[4].strip().lower() in {"1", "true", "yes", "on"}
+expected_dynamic = sys.argv[6].strip().lower() in {"1", "true", "yes", "on"}
 if config.get("colt_oracle_k_enabled") is not True:
     raise ValueError("Checkpoint is not an Oracle-K checkpoint")
 if int(config.get("colt_oracle_k_max", -1)) != int(sys.argv[2]):
     raise ValueError("Checkpoint colt_oracle_k_max differs from this run")
 if bool(config.get("colt_oracle_k_budget_conditioning")) != expected_budget:
     raise ValueError("Checkpoint budget-conditioning setting differs from this run")
+if bool(config.get("colt_oracle_k_predictor_enabled")) != expected_predictor:
+    raise ValueError("Checkpoint K-predictor setting differs from this run")
+if abs(float(config.get("colt_oracle_k_predictor_loss_weight", -1.0)) - float(sys.argv[5])) > 1e-12:
+    raise ValueError("Checkpoint K-predictor loss weight differs from this run")
+if bool(config.get("colt_oracle_k_dynamic_inference")) != expected_dynamic:
+    raise ValueError("Checkpoint dynamic-inference setting differs from this run")
 print("Oracle-K resume config: OK")
 PY
   echo "LLaMA-Factory will resume from: $latest_checkpoint"
@@ -152,6 +179,9 @@ python -m pip freeze > "$run_record/pip_freeze.txt"
   printf 'COLT_ORACLE_K_ENABLED=%s\n' "$COLT_ORACLE_K_ENABLED"
   printf 'COLT_ORACLE_K_MAX=%s\n' "$COLT_ORACLE_K_MAX"
   printf 'COLT_ORACLE_K_BUDGET_CONDITIONING=%s\n' "$COLT_ORACLE_K_BUDGET_CONDITIONING"
+  printf 'COLT_ORACLE_K_PREDICTOR_ENABLED=%s\n' "$COLT_ORACLE_K_PREDICTOR_ENABLED"
+  printf 'COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT=%s\n' "$COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT"
+  printf 'COLT_ORACLE_K_DYNAMIC_INFERENCE=%s\n' "$COLT_ORACLE_K_DYNAMIC_INFERENCE"
   printf 'COLT_ORACLE_K_DATA_FILE=%s\n' "$oracle_data"
   printf 'COLT_ORACLE_K_DATASET_NAME=%s\n' "$oracle_dataset_name"
   printf 'COLT_ORACLE_K_OUTPUT_DIR=%s\n' "$output_dir"

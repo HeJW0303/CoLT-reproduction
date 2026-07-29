@@ -77,9 +77,11 @@ def _training_function(config: dict[str, Any]) -> None:
         files_to_copy.extend(
             [
                 "LLaMA-Factory/examples/train_full/colt_qwen3_sft_oracle_k_a100.yaml",
+                "LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_oracle_k_predictor.yaml",
                 "transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py",
                 "transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py",
                 "scripts/a100/18_train_oracle_k.sh",
+                "scripts/lkl_8gpu/19_train_oracle_k_predictor.sh",
             ]
         )
     callbacks.append(CopyFilesOnTrainBeginCallback(files_to_copy))

@@ -59,6 +59,9 @@ cd "$REPO_ROOT"
 if [[ "${COLT_PAPER_FAITHFUL:-0}" == "1" ]]; then
   python "$REPO_ROOT/scripts/lkl_8gpu/verify_paper_faithful.py"
 fi
+if [[ "${COLT_ORACLE_K_ENABLED:-0}" == "1" ]]; then
+  python -m unittest discover -s "$REPO_ROOT/tests/oracle_k" -p 'test_*.py' -v
+fi
 run_stamp="$(date +%Y%m%d_%H%M%S)"
 run_record="$LOG_ROOT/${run_record_prefix}_$run_stamp"
 mkdir -p "$run_record"
@@ -72,6 +75,15 @@ if [[ "${COLT_PAPER_FAITHFUL:-0}" == "1" ]]; then
   cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/model/adapter.py" "$run_record/"
   cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/model/model_utils/visual.py" "$run_record/"
   cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/train/tuner.py" "$run_record/"
+fi
+if [[ "${COLT_ORACLE_K_ENABLED:-0}" == "1" ]]; then
+  cp "$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_oracle_k_predictor.yaml" "$run_record/"
+  cp "$REPO_ROOT/LLaMA-Factory/src/llamafactory/train/tuner.py" "$run_record/"
+  cp "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py" "$run_record/"
+  cp "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py" "$run_record/"
+  cp "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py" "$run_record/"
+  cp "$REPO_ROOT/tests/oracle_k/test_oracle_k.py" "$run_record/"
+  cp "$REPO_ROOT/scripts/lkl_8gpu/19_train_oracle_k_predictor.sh" "$run_record/"
 fi
 git -c safe.directory="$REPO_ROOT" rev-parse HEAD > "$run_record/git_head.txt"
 git -c safe.directory="$REPO_ROOT" status --short > "$run_record/git_status.txt"
@@ -97,6 +109,10 @@ python -m pip freeze > "$run_record/pip_freeze.txt"
   printf 'COLT_COMPONENT_LOG_EVERY=%s\n' "${COLT_COMPONENT_LOG_EVERY:-8}"
   printf 'COLT_BENCHMARK_MODE=%s\n' "${COLT_BENCHMARK_MODE:-0}"
   printf 'COLT_SKIP_FINAL_SAVE=%s\n' "${COLT_SKIP_FINAL_SAVE:-0}"
+  printf 'COLT_ORACLE_K_ENABLED=%s\n' "${COLT_ORACLE_K_ENABLED:-0}"
+  printf 'COLT_ORACLE_K_PREDICTOR_ENABLED=%s\n' "${COLT_ORACLE_K_PREDICTOR_ENABLED:-0}"
+  printf 'COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT=%s\n' "${COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT:-0.2}"
+  printf 'COLT_ORACLE_K_DYNAMIC_INFERENCE=%s\n' "${COLT_ORACLE_K_DYNAMIC_INFERENCE:-0}"
   printf 'COLT_TRAIN_CONFIG=%s\n' "$train_config"
   printf 'COLT_TRAIN_OUTPUT_DIR=%s\n' "$output_dir"
 } > "$run_record/environment.txt"

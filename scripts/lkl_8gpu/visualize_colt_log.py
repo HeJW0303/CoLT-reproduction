@@ -72,7 +72,9 @@ def parse_args() -> argparse.Namespace:
         description="Visualize Trainer and CoLT component metrics from a training log."
     )
     parser.add_argument(
+        "-l",
         "--log",
+        "--log-path",
         type=Path,
         nargs="+",
         default=[DEFAULT_LOG],
@@ -82,7 +84,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=DEFAULT_OUTPUT, help="Directory for PNG/CSV/JSON outputs"
+        "-o",
+        "--output-dir",
+        "--output-path",
+        dest="output_dir",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help="Directory for PNG/CSV/JSON outputs",
     )
     parser.add_argument(
         "--rolling-window", type=int, default=30, help="Rolling window for smoothed curves"
