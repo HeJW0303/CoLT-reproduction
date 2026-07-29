@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass
 from typing import Mapping, Optional
@@ -27,6 +28,9 @@ class OracleKSettings:
     enabled: bool
     max_k: int
     budget_conditioning: bool
+    predictor_enabled: bool
+    predictor_loss_weight: float
+    dynamic_inference: bool
 
 
 def parse_oracle_k_cot(cot_text: str, min_k: int = 1, max_k: Optional[int] = None) -> OracleKAnnotation:
@@ -124,6 +128,19 @@ def _read_bool_env(environ: Mapping[str, str], name: str, default: bool) -> bool
     raise ValueError(f"{name} must be a boolean value, got {value!r}")
 
 
+def _read_float_env(environ: Mapping[str, str], name: str, default: float) -> float:
+    value = environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a floating-point value, got {value!r}") from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{name} must be finite and non-negative, got {parsed}")
+    return parsed
+
+
 def _config_has(config, name: str) -> bool:
     return name in getattr(config, "__dict__", {})
 
@@ -146,14 +163,50 @@ def resolve_oracle_k_settings(config, environ: Optional[Mapping[str, str]] = Non
     else:
         budget_conditioning = _read_bool_env(environ, "COLT_ORACLE_K_BUDGET_CONDITIONING", True)
 
+    if _config_has(config, "colt_oracle_k_predictor_enabled"):
+        predictor_enabled = bool(config.colt_oracle_k_predictor_enabled)
+    else:
+        # Keep existing Oracle-K checkpoints at the Oracle-K-only behavior unless
+        # the second-stage predictor is explicitly enabled.
+        predictor_enabled = _read_bool_env(environ, "COLT_ORACLE_K_PREDICTOR_ENABLED", False)
+
+    if _config_has(config, "colt_oracle_k_predictor_loss_weight"):
+        predictor_loss_weight = float(config.colt_oracle_k_predictor_loss_weight)
+    else:
+        predictor_loss_weight = _read_float_env(environ, "COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT", 0.2)
+
+    if _config_has(config, "colt_oracle_k_dynamic_inference"):
+        dynamic_inference = bool(config.colt_oracle_k_dynamic_inference)
+    else:
+        dynamic_inference = _read_bool_env(environ, "COLT_ORACLE_K_DYNAMIC_INFERENCE", False)
+
     if max_k < 1:
         raise ValueError(f"COLT_ORACLE_K_MAX must be at least 1, got {max_k}")
+    if not math.isfinite(predictor_loss_weight) or predictor_loss_weight < 0:
+        raise ValueError(
+            "COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT must be finite and non-negative, "
+            f"got {predictor_loss_weight}"
+        )
+    if predictor_enabled and not enabled:
+        raise ValueError("COLT_ORACLE_K_PREDICTOR_ENABLED requires COLT_ORACLE_K_ENABLED")
+    if dynamic_inference and not predictor_enabled:
+        raise ValueError("COLT_ORACLE_K_DYNAMIC_INFERENCE requires COLT_ORACLE_K_PREDICTOR_ENABLED")
 
     if enabled or _config_has(config, "colt_oracle_k_enabled"):
         config.colt_oracle_k_enabled = enabled
         config.colt_oracle_k_max = max_k
         config.colt_oracle_k_budget_conditioning = budget_conditioning
-    return OracleKSettings(enabled=enabled, max_k=max_k, budget_conditioning=budget_conditioning)
+        config.colt_oracle_k_predictor_enabled = predictor_enabled
+        config.colt_oracle_k_predictor_loss_weight = predictor_loss_weight
+        config.colt_oracle_k_dynamic_inference = dynamic_inference
+    return OracleKSettings(
+        enabled=enabled,
+        max_k=max_k,
+        budget_conditioning=budget_conditioning,
+        predictor_enabled=predictor_enabled,
+        predictor_loss_weight=predictor_loss_weight,
+        dynamic_inference=dynamic_inference,
+    )
 
 
 def resolve_forced_inference_k(max_k: int, environ: Optional[Mapping[str, str]] = None) -> Optional[int]:
@@ -165,3 +218,26 @@ def resolve_forced_inference_k(max_k: int, environ: Optional[Mapping[str, str]] 
     if not 1 <= forced_k <= max_k:
         raise ValueError(f"COLT_INFERENCE_K must be in [1, {max_k}], got {forced_k}")
     return forced_k
+
+
+def select_oracle_k_inference_steps(
+    max_k: int,
+    default_k: int,
+    num_hidden_generations: int = 0,
+    forced_k: Optional[int] = None,
+    predicted_k: Optional[int] = None,
+    dynamic_inference: bool = False,
+) -> int:
+    if num_hidden_generations > 0:
+        latent_steps = num_hidden_generations
+    elif forced_k is not None:
+        latent_steps = forced_k
+    elif dynamic_inference:
+        if predicted_k is None:
+            raise ValueError("Dynamic Oracle-K inference requires one predicted K value")
+        latent_steps = predicted_k
+    else:
+        latent_steps = default_k
+    if not 1 <= latent_steps <= max_k:
+        raise ValueError(f"Oracle-K inference steps must be in [1, {max_k}], got {latent_steps}")
+    return latent_steps

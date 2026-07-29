@@ -42,6 +42,24 @@ num_latent=3
 随机生成结果。完成 code-faithful 评估后，再建立独立的 greedy 对照，不能混在同一
 结果目录中。
 
+当前入口支持独立的解码对照模式。`COLT_GENERATION_MODE=respect_args` 会通过
+symlink overlay 加载仓库当前的模型代码，真正采用 adapter 请求的
+`do_sample=False` 和 `max_new_tokens=8192`；原始 checkpoint 目录和权重不会被修改。
+结果目录会包含 `respect_args` 标记，和默认 `official` 结果分开保存：
+
+```bash
+cd /data/nvme0/lkl/CoLT-reproduction
+COLT_GPU_PROFILE=a100 \
+COLT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+VLMEVAL_WORKERS_PER_GPU=1 \
+COLT_GENERATION_MODE=respect_args \
+bash scripts/lkl_8gpu/17_eval_colt_replicas.sh all8
+```
+
+日志必须同时显示 `requested_do_sample=False`、`effective_do_sample=False`、
+`requested_max_new_tokens=8192` 和 `effective_max_new_tokens=8192`。该模式用于
+生成协议消融，不替代官方 code-faithful 结果。
+
 ## 3. 服务器执行顺序
 
 全部命令都在已完成 profile 绑定的原生 Conda 主机上执行：

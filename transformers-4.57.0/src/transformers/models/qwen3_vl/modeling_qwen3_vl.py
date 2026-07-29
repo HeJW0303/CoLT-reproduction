@@ -42,8 +42,13 @@ from ...utils import TransformersKwargs, auto_docstring, is_torchdynamo_compilin
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import check_model_inputs
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
-from .modeling_oracle_k import OracleKBudgetConditioner
-from .oracle_k import parse_oracle_k_cot, resolve_forced_inference_k, resolve_oracle_k_settings
+from .modeling_oracle_k import OracleKBudgetConditioner, OracleKPredictor, pool_last_valid_hidden
+from .oracle_k import (
+    parse_oracle_k_cot,
+    resolve_forced_inference_k,
+    resolve_oracle_k_settings,
+    select_oracle_k_inference_steps,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.cuda.amp import autocast
 
@@ -1288,6 +1293,8 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    k_logits: Optional[torch.FloatTensor] = None
+    predicted_k: Optional[torch.LongTensor] = None
 
 class LowRankProjector(nn.Module):
     def __init__(self, input_dim, output_dim, rank=64):
@@ -1683,6 +1690,18 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.oracle_k_enabled = oracle_k_settings.enabled
         self.oracle_k_max = oracle_k_settings.max_k
         self.oracle_k_budget_conditioning = oracle_k_settings.budget_conditioning
+        self.oracle_k_predictor_enabled = oracle_k_settings.predictor_enabled
+        self.oracle_k_predictor_loss_weight = oracle_k_settings.predictor_loss_weight
+        self.oracle_k_dynamic_inference = oracle_k_settings.dynamic_inference
+        self.last_oracle_k_prediction = None
+        self.last_oracle_k_used = None
+        if self.oracle_k_enabled and self.oracle_k_predictor_enabled:
+            self.oracle_k_predictor = OracleKPredictor(
+                self.oracle_k_max,
+                config.text_config.hidden_size,
+            )
+        else:
+            self.oracle_k_predictor = None
         # NOTE: When training under some sharding/initialization contexts (e.g. init_empty_weights / ZeRO init),
         # loading a nested decoder inside __init__ can silently produce zero/empty parameters.
         # We still initialize here, but also support lazy re-loading in forward if we detect zeroed weights.
@@ -1802,17 +1821,44 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             return latent_embd
         return self.oracle_k_conditioner(latent_embd, oracle_k, step_index)
 
-    def _resolve_latent_steps_for_inference(self, num_hidden_generations):
-        if num_hidden_generations > 0:
-            latent_steps = num_hidden_generations
-        elif self.oracle_k_enabled:
+    def _pool_question_hidden(self, hidden_states, attention_mask):
+        return pool_last_valid_hidden(hidden_states, attention_mask)
+
+    def _predict_oracle_k(self, hidden_states, attention_mask):
+        if self.oracle_k_predictor is None:
+            return None
+        pooled_hidden = self._pool_question_hidden(hidden_states, attention_mask)
+        return self.oracle_k_predictor(pooled_hidden)
+
+    def _resolve_latent_steps_for_inference(self, num_hidden_generations, predicted_k=None):
+        if not self.oracle_k_enabled:
+            return num_hidden_generations if num_hidden_generations > 0 else self.num_latent
+
+        forced_k = None
+        if num_hidden_generations <= 0:
             forced_k = resolve_forced_inference_k(self.oracle_k_max)
-            latent_steps = forced_k if forced_k is not None else self.num_latent
-        else:
-            latent_steps = self.num_latent
-        if self.oracle_k_enabled and not 1 <= latent_steps <= self.oracle_k_max:
-            raise ValueError(f"Oracle-K inference steps must be in [1, {self.oracle_k_max}], got {latent_steps}")
-        return latent_steps
+        predicted_k_value = None
+        if predicted_k is not None:
+            if (
+                predicted_k.numel() != 1
+                and self.oracle_k_dynamic_inference
+                and num_hidden_generations <= 0
+                and forced_k is None
+            ):
+                raise ValueError(
+                    "Dynamic Oracle-K inference currently requires batch size 1; "
+                    f"received {predicted_k.numel()} predicted K values"
+                )
+            if predicted_k.numel() == 1:
+                predicted_k_value = int(predicted_k.reshape(-1)[0].item())
+        return select_oracle_k_inference_steps(
+            max_k=self.oracle_k_max,
+            default_k=self.num_latent,
+            num_hidden_generations=num_hidden_generations,
+            forced_k=forced_k,
+            predicted_k=predicted_k_value,
+            dynamic_inference=self.oracle_k_dynamic_inference,
+        )
         
 
     def get_input_embeddings(self):
@@ -1876,6 +1922,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         Example:
             TODO: Add example
         """
+        k_logits = None
+        predicted_k = None
         if self.latent_reasoning_mode:
             # Prepare the inputs of each process
             # seperate the question, cot procedure and answer of each sample
@@ -1979,6 +2027,20 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             hidden_states = outputs[0]
             latent_embd = hidden_states[:, -1:, :]
             current_seq_len = outputs.past_key_values.get_seq_length()
+            if self.oracle_k_predictor_enabled:
+                k_logits = self._predict_oracle_k(hidden_states, attention_mask_question)
+                predicted_k = torch.argmax(k_logits.detach(), dim=-1) + 1
+                k_targets = torch.full(
+                    (hidden_states.shape[0],),
+                    oracle_k - 1,
+                    dtype=torch.long,
+                    device=k_logits.device,
+                )
+                k_loss_total = F.cross_entropy(k_logits.float(), k_targets)
+                k_accuracy = (predicted_k == k_targets + 1).float().mean()
+            else:
+                k_loss_total = hidden_states.new_zeros(())
+                k_accuracy = hidden_states.new_zeros(())
 
             # Loss buckets for three training objectives:
             # 1) forward_loss_total: latent -> CoT step decoding loss
@@ -2271,17 +2333,23 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         forward_loss_total.detach().float(),
                         backward_loss_total.detach().float(),
                         prediction_loss_total.detach().float(),
+                        k_loss_total.detach().float(),
+                        k_accuracy.detach().float(),
                     ]
                 ).cpu().tolist()
                 print(f"ce_loss_total : {component_losses[0]}")
                 print(f"forward_loss_total : {component_losses[1]}")
                 print(f"backward_loss_total : {component_losses[2]}")
                 print(f"prediction_loss_total : {component_losses[3]}")
+                if self.oracle_k_predictor_enabled:
+                    print(f"k_loss_total : {component_losses[4]}")
+                    print(f"k_accuracy : {component_losses[5]}")
             loss = (
                 ce_loss_total
                 + self.forward_align_weight * forward_loss_total
                 + self.backward_align_weight * backward_loss_total
                 + self.prediction_weight * prediction_loss_total
+                + self.oracle_k_predictor_loss_weight * k_loss_total
             )
 
         elif self.latent_reasoning_mode == False:
@@ -2314,6 +2382,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
+            k_logits=k_logits,
+            predicted_k=predicted_k,
         )
 
     def _forward_latent_reasoning(
@@ -2345,7 +2415,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         latent_embd = hidden_states[:, -1:, :]
         latent_embd = self.prj(latent_embd)
-        latent_steps = self._resolve_latent_steps_for_inference(num_hidden_generations)
+        k_logits = self._predict_oracle_k(hidden_states, attention_mask)
+        predicted_k = torch.argmax(k_logits, dim=-1) + 1 if k_logits is not None else None
+        latent_steps = self._resolve_latent_steps_for_inference(num_hidden_generations, predicted_k=predicted_k)
+        self.last_oracle_k_prediction = predicted_k.detach().cpu() if predicted_k is not None else None
+        self.last_oracle_k_used = latent_steps
         for i in range(latent_steps):
             past_seen_tokens = past_key_values.get_seq_length()
             step_cache_position = torch.arange(
@@ -2374,6 +2448,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             hidden_states=(latent_embd,),
             rope_deltas=outputs.rope_deltas,
+            k_logits=k_logits,
+            predicted_k=predicted_k,
         )
 
     @torch.no_grad()
@@ -2466,10 +2542,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     def generate(self, *args, **kwargs):
         if not self.latent_reasoning_mode:
             return super().generate(*args, **kwargs)
-        has_do_sample = "do_sample" in kwargs
-        has_max_new_tokens = "max_new_tokens" in kwargs
-        has_temperature = "temperature" in kwargs
-        has_top_k = "top_k" in kwargs
+        requested_do_sample = kwargs.get("do_sample")
+        requested_max_new_tokens = kwargs.get("max_new_tokens")
 
         if len(args) > 0:
             input_ids = args[0]
@@ -2486,24 +2560,41 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         default_hidden_generations = 0 if self.oracle_k_enabled else self.num_latent
         num_hidden_generations = kwargs.pop("num_hidden_generations", default_hidden_generations)
-        # max_new_tokens = kwargs.pop("max_new_tokens", 128)
-        # do_sample = kwargs.pop("do_sample", False)
-        kwargs.pop("max_new_tokens", 128)
-        max_new_tokens = 256 
-        kwargs.pop("do_sample", False)
-        do_sample = True
+        respect_generation_args = os.environ.get("COLT_RESPECT_GENERATION_ARGS", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if respect_generation_args:
+            max_new_tokens = kwargs.pop("max_new_tokens", 128)
+            do_sample = kwargs.pop("do_sample", False)
+        else:
+            kwargs.pop("max_new_tokens", 128)
+            max_new_tokens = 256
+            kwargs.pop("do_sample", False)
+            do_sample = True
         temperature = kwargs.pop("temperature", 0.6)
         top_k = kwargs.pop("top_k", 20)
         eos_token_id = kwargs.pop("eos_token_id", None)
 
-        print(
-            f"[latent-generate] kwargs_has: do_sample={has_do_sample}, "
-            f"max_new_tokens={has_max_new_tokens}, temperature={has_temperature}, top_k={has_top_k}"
+        generation_config_signature = (
+            requested_do_sample,
+            do_sample,
+            requested_max_new_tokens,
+            max_new_tokens,
         )
-        # print(
-        #     f"[latent-generate] resolved: do_sample={do_sample}, "
-        #     f"max_new_tokens={max_new_tokens}, temperature={temperature}, top_k={top_k}"
-        # )
+        if generation_config_signature != getattr(self, "_last_logged_generation_config", None):
+            print(
+                "[latent-generate] "
+                f"requested_do_sample={requested_do_sample} "
+                f"effective_do_sample={do_sample} "
+                f"requested_max_new_tokens={requested_max_new_tokens} "
+                f"effective_max_new_tokens={max_new_tokens} "
+                f"respect_generation_args={respect_generation_args}",
+                flush=True,
+            )
+            self._last_logged_generation_config = generation_config_signature
 
         return self.latent_reasoning_generate(
             input_ids=input_ids,

@@ -136,9 +136,19 @@ class Qwen3VLChat(BaseModel):
             f"reseed_per_sample={self.reseed_per_sample}"
         )
         if getattr(self.model, "latent_reasoning_mode", False):
+            respect_generation_args = os.environ.get("COLT_RESPECT_GENERATION_ARGS", "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
             print(
-                "[CoLT eval adapter] The official CoLT generate() currently forces "
-                "do_sample=True and max_new_tokens=256."
+                "[CoLT generation config] "
+                f"requested_do_sample={self.do_sample} "
+                f"effective_do_sample={self.do_sample if respect_generation_args else True} "
+                f"requested_max_new_tokens={self.max_new_tokens} "
+                f"effective_max_new_tokens={self.max_new_tokens if respect_generation_args else 256} "
+                f"respect_generation_args={respect_generation_args}"
             )
         else:
             print("[Qwen3-VL eval adapter] Native Hugging Face generation is active; latent reasoning is disabled.")
@@ -261,6 +271,14 @@ class Qwen3VLChat(BaseModel):
             temperature=self.temperature,
             top_k=self.top_k,
         )
+        if os.environ.get("COLT_LOG_PREDICTED_K", "0") == "1":
+            predicted_k = getattr(self.model, "last_oracle_k_prediction", None)
+            used_k = getattr(self.model, "last_oracle_k_used", None)
+            if predicted_k is not None:
+                print(
+                    f"[CoLT Oracle-K] predicted_k={predicted_k.reshape(-1).tolist()} used_k={used_k}",
+                    flush=True,
+                )
         generated_ids = generated_ids[:, inputs.input_ids.shape[1] :]
         with self._processor_lock:
             response = self.processor.batch_decode(

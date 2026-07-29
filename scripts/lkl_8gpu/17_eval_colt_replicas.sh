@@ -10,6 +10,20 @@ prefetch="${VLMEVAL_PREFETCH:-1}"
 empty_cache_every_n="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"
 dist_backend="${VLMEVAL_DIST_BACKEND:-gloo}"
 reseed_per_sample="${COLT_RESEED_PER_SAMPLE:-1}"
+generation_mode="${COLT_GENERATION_MODE:-official}"
+
+case "$generation_mode" in
+  official)
+    export COLT_RESPECT_GENERATION_ARGS=0
+    ;;
+  respect_args)
+    export COLT_RESPECT_GENERATION_ARGS=1
+    ;;
+  *)
+    echo "COLT_GENERATION_MODE must be official or respect_args: $generation_mode" >&2
+    exit 1
+    ;;
+esac
 
 case "$group" in
   chartqa)
@@ -71,10 +85,32 @@ exec > >(tee -a "$log_file") 2>&1
 bash "$REPO_ROOT/scripts/lkl_8gpu/07_verify_final_model.sh"
 bash "$REPO_ROOT/scripts/lkl_8gpu/09_download_eval_data.sh" "${datasets[@]}"
 
+if [[ "$generation_mode" == "respect_args" ]]; then
+  # Existing checkpoints contain the code snapshot used during training. Use a
+  # symlink overlay so this diagnostic can load the current generation code
+  # without modifying the audited checkpoint directory or its weights.
+  runtime_model_dir="$EVAL_ROOT/runtime_models/colt_${run_id}_${generation_mode}"
+  mkdir -p "$runtime_model_dir"
+  for model_file in "$FINAL_MODEL_DIR"/*; do
+    ln -s "$model_file" "$runtime_model_dir/$(basename "$model_file")"
+  done
+  for source_file in \
+    "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py" \
+    "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py" \
+    "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py"; do
+    ln -sfn "$source_file" "$runtime_model_dir/$(basename "$source_file")"
+  done
+  export COLT_EVAL_MODEL_PATH="$runtime_model_dir"
+  echo "Generation diagnostic model overlay: $COLT_EVAL_MODEL_PATH"
+fi
+
 eval_fingerprint="$(
   {
+    printf 'generation_mode=%s\n' "$generation_mode"
     sha256sum \
       "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py" \
+      "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py" \
+      "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py" \
       "$VLMEVAL_ROOT/run.py" \
       "$VLMEVAL_ROOT/vlmeval/inference.py" \
       "$VLMEVAL_ROOT/vlmeval/vlm/colt_qwen3_vl.py" \
@@ -84,7 +120,7 @@ eval_fingerprint="$(
       -printf '%f %s %T@\n' | sort
   } | sha256sum | cut -c1-12
 )"
-eval_profile="replicas${nproc_per_node}_w${workers_per_gpu}_p${prefetch}_c${empty_cache_every_n}_r${reseed_per_sample}_${group}_seed${COLT_EVAL_SEED}_${eval_fingerprint}"
+eval_profile="replicas${nproc_per_node}_w${workers_per_gpu}_p${prefetch}_c${empty_cache_every_n}_r${reseed_per_sample}_${generation_mode}_${group}_seed${COLT_EVAL_SEED}_${eval_fingerprint}"
 work_dir="$EVAL_OUTPUT_ROOT/throughput_replicas/$group/$eval_profile"
 eval_id="COLT_${eval_profile}"
 
@@ -112,6 +148,13 @@ echo "CPU preprocessing prefetch: $VLMEVAL_PREFETCH"
 echo "empty_cache frequency: $VLMEVAL_EMPTY_CACHE_EVERY_N (0=disabled)"
 echo "Distributed backend: $VLMEVAL_DIST_BACKEND"
 echo "Per-sample reseeding: $COLT_RESEED_PER_SAMPLE"
+echo "Generation mode: $generation_mode"
+echo "Requested generation: do_sample=false max_new_tokens=8192"
+if [[ "$generation_mode" == "respect_args" ]]; then
+  echo "Effective generation: do_sample=false max_new_tokens=8192"
+else
+  echo "Effective generation: do_sample=true max_new_tokens=256"
+fi
 echo "Evaluation fingerprint: $eval_fingerprint"
 echo "Evaluation id: $eval_id"
 echo "Results: $work_dir"
