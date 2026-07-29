@@ -87,6 +87,7 @@ cmd_eval() {
   local generation="${COLT_GENERATION_MODE:-}"
   local prefetch="${VLMEVAL_PREFETCH:-1}" empty_cache="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"
   local backend="${VLMEVAL_DIST_BACKEND:-gloo}" reseed="${COLT_RESEED_PER_SAMPLE:-1}"
+  local empty_response_policy="${COLT_EMPTY_RESPONSE_POLICY:-allow}"
   local verbose="${EVAL_VERBOSE:-0}" reuse=1
   while (( $# > 0 )); do
     case "$1" in
@@ -98,6 +99,7 @@ cmd_eval() {
       --empty-cache-every) [[ $# -ge 2 ]] || die "--empty-cache-every requires a value"; empty_cache="$2"; shift 2 ;;
       --dist-backend) [[ $# -ge 2 ]] || die "--dist-backend requires a value"; backend="$2"; shift 2 ;;
       --reseed-per-sample) [[ $# -ge 2 ]] || die "--reseed-per-sample requires a value"; reseed="$2"; shift 2 ;;
+      --empty-response-policy) [[ $# -ge 2 ]] || die "--empty-response-policy requires a value"; empty_response_policy="$2"; shift 2 ;;
       --verbose) verbose=1; shift ;;
       --no-reuse) reuse=0; shift ;;
       *) die "Unknown eval option: $1" ;;
@@ -118,6 +120,11 @@ cmd_eval() {
   [[ "$empty_cache" =~ ^[0-9]+$ ]] || die "--empty-cache-every must be a non-negative integer"
   [[ "$backend" == gloo || "$backend" == nccl ]] || die "--dist-backend must be gloo or nccl"
   [[ "$reseed" == 0 || "$reseed" == 1 ]] || die "--reseed-per-sample must be 0 or 1"
+  [[ "$empty_response_policy" == allow || "$empty_response_policy" == prevent ]] || die \
+    "--empty-response-policy must be allow or prevent"
+  if [[ "$target" == baseline && "$empty_response_policy" != allow ]]; then
+    die "baseline does not support --empty-response-policy prevent"
+  fi
 
   runtime_init
   require_workspace_layout
@@ -150,6 +157,11 @@ cmd_eval() {
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
   export PYTHONUNBUFFERED=1 VLMEVAL_FAIL_ON_ERROR=1 VLMEVAL_ATOMIC_WRITES=1
   export COLT_DECODER_MODEL_PATH="$DECODER_MODEL_DIR"
+  if [[ "$empty_response_policy" == prevent ]]; then
+    export COLT_PREVENT_EMPTY_RESPONSE=1
+  else
+    export COLT_PREVENT_EMPTY_RESPONSE=0
+  fi
   touch "$VLMEVAL_ROOT/.env"
   python -m pip check
 
@@ -170,9 +182,12 @@ cmd_eval() {
     export COLT_RESPECT_GENERATION_ARGS=1
   else
     unset COLT_DISABLE_LATENT_REASONING
-    if [[ "$generation" == respect-args ]]; then
-      create_generation_overlay "$source_model_path" "$run_id"
+    if [[ "$generation" == respect-args || "$empty_response_policy" == prevent ]]; then
+      local overlay_variant="${generation//-/_}_${empty_response_policy}"
+      create_generation_overlay "$source_model_path" "$run_id" "$overlay_variant"
       runtime_model_path="$EVAL_RUNTIME_MODEL_PATH"
+    fi
+    if [[ "$generation" == respect-args ]]; then
       effective_sample=False
       effective_tokens=8192
       export COLT_RESPECT_GENERATION_ARGS=1
@@ -185,14 +200,15 @@ cmd_eval() {
 
   local nproc=$(( ${#COLT_GPU_IDS[@]} * workers )) fingerprint profile eval_id work_dir log_dir log_file
   local generation_label
-  generation_label="$(generation_log_label "$generation")"
+  generation_label="$(generation_log_label "$generation" "$empty_response_policy")"
   fingerprint="$(python "$COLT_SCRIPT_ROOT/tools/eval_fingerprint.py" \
     --repo-root "$REPO_ROOT" --model-dir "$source_model_path" \
     --setting "target=$target" --setting "group=$group" --setting "generation=$generation" \
     --setting "seed=${COLT_EVAL_SEED:-1234}" --setting "workers=$workers" \
     --setting "prefetch=$prefetch" --setting "empty_cache=$empty_cache" \
-    --setting "backend=$backend" --setting "reseed=$reseed")"
-  profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
+    --setting "backend=$backend" --setting "reseed=$reseed" \
+    --setting "empty_response_policy=$empty_response_policy")"
+  profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
   work_dir="$EVAL_OUTPUT_ROOT/$target/$group/$profile"
   eval_id="$(printf '%s_%s' "$target" "$profile" | tr '[:lower:]-' '[:upper:]_')"
   log_dir="$EVAL_LOG_ROOT/$target"
@@ -216,6 +232,7 @@ cmd_eval() {
   echo "Physical GPUs: $gpu_csv"
   echo "Workers per GPU: $workers; total workers: $nproc"
   echo "Prefetch: $prefetch; empty_cache every N: $empty_cache; backend: $backend"
+  echo "Empty response policy: $empty_response_policy"
   echo "requested_do_sample=False"
   echo "effective_do_sample=$effective_sample"
   echo "requested_max_new_tokens=8192"

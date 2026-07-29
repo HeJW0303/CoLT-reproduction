@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--indices", required=True, help="Comma-separated dataset index values.")
     parser.add_argument("--generation", choices=("official", "respect-args"), required=True)
     parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument("--empty-response-policy", choices=("allow", "prevent"), default="allow")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -38,6 +39,7 @@ def main() -> None:
     os.environ["COLT_EVAL_MODEL_PATH"] = str(args.model_path.resolve())
     os.environ["COLT_RESPECT_GENERATION_ARGS"] = "1" if args.generation == "respect-args" else "0"
     os.environ["COLT_RESEED_PER_SAMPLE"] = "1"
+    os.environ["COLT_PREVENT_EMPTY_RESPONSE"] = "1" if args.empty_response_policy == "prevent" else "0"
 
     from vlmeval.dataset import build_dataset
     from vlmeval.vlm.colt_qwen3_vl import Qwen3VLChat
@@ -52,6 +54,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=0.6,
         top_k=20,
+        prevent_empty_response=args.empty_response_policy == "prevent",
         max_pixels=256 * 32 * 32,
         system_prompt=SYSTEM_PROMPT,
         post_process=True,
@@ -72,6 +75,7 @@ def main() -> None:
                 "index": index,
                 "question": str(row["question"]),
                 "answer": str(row["answer"]),
+                "empty_response_policy": args.empty_response_policy,
                 **diagnostic,
             }
             empty_count += int(not diagnostic["final_response"].strip())

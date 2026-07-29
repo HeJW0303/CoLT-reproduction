@@ -32,6 +32,7 @@ class Qwen3VLChat(BaseModel):
         do_sample: bool = False,
         temperature: float = 0.6,
         top_k: int = 20,
+        prevent_empty_response: bool = False,
         use_custom_prompt: bool = False,
         system_prompt: str | None = None,
         post_process: bool = True,
@@ -51,6 +52,12 @@ class Qwen3VLChat(BaseModel):
         self.do_sample = do_sample
         self.temperature = temperature
         self.top_k = top_k
+        self.prevent_empty_response = os.environ.get("COLT_PREVENT_EMPTY_RESPONSE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        } or prevent_empty_response
         self._use_custom_prompt = use_custom_prompt
         self.system_prompt = system_prompt
         self.post_process = post_process
@@ -148,6 +155,7 @@ class Qwen3VLChat(BaseModel):
                 f"effective_do_sample={self.do_sample if respect_generation_args else True} "
                 f"requested_max_new_tokens={self.max_new_tokens} "
                 f"effective_max_new_tokens={self.max_new_tokens if respect_generation_args else 256} "
+                f"prevent_empty_response={self.prevent_empty_response} "
                 f"respect_generation_args={respect_generation_args}"
             )
         else:
@@ -270,6 +278,7 @@ class Qwen3VLChat(BaseModel):
             do_sample=self.do_sample,
             temperature=self.temperature,
             top_k=self.top_k,
+            prevent_empty_response=self.prevent_empty_response,
         )
         if os.environ.get("COLT_LOG_PREDICTED_K", "0") == "1":
             predicted_k = getattr(self.model, "last_oracle_k_prediction", None)

@@ -2468,6 +2468,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         eos_token_id: Optional[int] = None,
+        prevent_empty_response: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.LongTensor:
         latent_outputs = self._forward_latent_reasoning(
@@ -2487,7 +2488,20 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         generated_tokens = []
         eos_id = self.eos_token_id if eos_token_id is None else eos_token_id
         next_input_ids = None
-        for _ in range(max_new_tokens):
+        visible_text_generated = [False] * input_ids.shape[0]
+
+        def select_next_token(logits):
+            if do_sample:
+                sample_logits = logits / max(temperature, 1e-5)
+                if top_k is not None and top_k > 0:
+                    topk_values, _ = torch.topk(sample_logits, min(top_k, sample_logits.shape[-1]), dim=-1)
+                    min_topk = topk_values[:, -1].unsqueeze(-1)
+                    sample_logits = sample_logits.masked_fill(sample_logits < min_topk, float("-inf"))
+                probs = torch.softmax(sample_logits, dim=-1)
+                return torch.multinomial(probs, num_samples=1)
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        for generation_step in range(max_new_tokens):
             past_seen_tokens = past_key_values.get_seq_length()
             step_cache_position = torch.arange(
                 past_seen_tokens,
@@ -2517,19 +2531,42 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
             past_key_values = step_outputs.past_key_values
             next_token_logits = self.lm_head(step_outputs[0][:, -1, :])
-            if do_sample:
-                sample_logits = next_token_logits / max(temperature, 1e-5)
-                if top_k is not None and top_k > 0:
-                    topk_values, _ = torch.topk(sample_logits, min(top_k, sample_logits.shape[-1]), dim=-1)
-                    min_topk = topk_values[:, -1].unsqueeze(-1)
-                    sample_logits = sample_logits.masked_fill(sample_logits < min_topk, float("-inf"))
-                probs = torch.softmax(sample_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            next_token = select_next_token(next_token_logits)
+
+            if prevent_empty_response and eos_id is not None:
+                proposed_tokens = next_token.squeeze(-1).detach().cpu().tolist()
+                blocked_rows = [
+                    row
+                    for row, token_id in enumerate(proposed_tokens)
+                    if token_id == eos_id and not visible_text_generated[row]
+                ]
+                if blocked_rows:
+                    replacement_logits = next_token_logits[blocked_rows].clone()
+                    special_ids = [
+                        token_id
+                        for token_id in self.tokenizer.all_special_ids
+                        if 0 <= token_id < replacement_logits.shape[-1]
+                    ]
+                    replacement_logits[:, special_ids] = float("-inf")
+                    next_token[blocked_rows] = select_next_token(replacement_logits)
+                    print(
+                        f"[latent-generate] prevented_empty_eos step={generation_step} rows={blocked_rows}",
+                        flush=True,
+                    )
 
             generated_tokens.append(next_token)
             next_input_ids = next_token
+            if prevent_empty_response and not all(visible_text_generated):
+                generated_so_far = torch.cat(generated_tokens, dim=1).detach().cpu().tolist()
+                for row, token_ids in enumerate(generated_so_far):
+                    if not visible_text_generated[row]:
+                        visible_text_generated[row] = bool(
+                            self.tokenizer.decode(
+                                token_ids,
+                                skip_special_tokens=True,
+                                clean_up_tokenization_spaces=False,
+                            ).strip()
+                        )
             if eos_id is not None and torch.all(next_token.squeeze(-1) == eos_id):
                 break
 
@@ -2577,12 +2614,14 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         temperature = kwargs.pop("temperature", 0.6)
         top_k = kwargs.pop("top_k", 20)
         eos_token_id = kwargs.pop("eos_token_id", None)
+        prevent_empty_response = kwargs.pop("prevent_empty_response", False)
 
         generation_config_signature = (
             requested_do_sample,
             do_sample,
             requested_max_new_tokens,
             max_new_tokens,
+            prevent_empty_response,
         )
         if generation_config_signature != getattr(self, "_last_logged_generation_config", None):
             print(
@@ -2591,6 +2630,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 f"effective_do_sample={do_sample} "
                 f"requested_max_new_tokens={requested_max_new_tokens} "
                 f"effective_max_new_tokens={max_new_tokens} "
+                f"prevent_empty_response={prevent_empty_response} "
                 f"respect_generation_args={respect_generation_args}",
                 flush=True,
             )
@@ -2610,6 +2650,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             temperature=temperature,
             top_k=top_k,
             eos_token_id=eos_token_id,
+            prevent_empty_response=prevent_empty_response,
             **kwargs,
         )
 

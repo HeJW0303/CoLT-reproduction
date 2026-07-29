@@ -93,12 +93,13 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             f'source "{SCRIPT_ROOT}/lib/runtime.sh"; '
             f'source "{SCRIPT_ROOT}/lib/model.sh"; '
             'generation_log_label official; '
-            'generation_log_label respect-args'
+            'generation_log_label respect-args; '
+            'generation_log_label respect-args prevent'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
-            ["sampling_max256", "greedy_max8192"],
+            ["sampling_max256", "greedy_max8192", "greedy_max8192_prevent-empty"],
         )
 
     def test_root_contains_only_unified_shell_entry(self) -> None:
@@ -124,6 +125,26 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("baseline only supports greedy + 8192", result.stderr)
+
+    def test_baseline_rejects_empty_response_prevention(self) -> None:
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT_ROOT / "colt.sh"),
+                "eval",
+                "baseline",
+                "chartqa",
+                "--empty-response-policy",
+                "prevent",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("baseline does not support", result.stderr)
 
 
 if __name__ == "__main__":

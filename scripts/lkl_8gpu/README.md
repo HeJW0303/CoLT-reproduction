@@ -92,6 +92,15 @@ logs/eval/codefaithful/codefaithful_chartqa_greedy_max8192_YYYYMMDD_HHMMSS.log
 `--generation official` 对应 `sampling_max256`，`--generation respect-args` 对应
 `greedy_max8192`。
 
+模型在尚未生成可见文本时可能直接输出 EOS。严格复现默认保留该行为并将空响应计为错误；
+诊断性评测可显式阻止“空文本前的 EOS”，且该设置会进入日志名、结果目录和 fingerprint：
+
+```bash
+bash scripts/lkl_8gpu/colt.sh eval codefaithful chartqa \
+  --generation respect-args \
+  --empty-response-policy prevent
+```
+
 完整性检查也可单独执行：
 
 ```bash

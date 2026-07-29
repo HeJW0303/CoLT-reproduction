@@ -43,6 +43,7 @@ Evaluation options:
   --empty-cache-every N       0 disables per-sample empty_cache
   --dist-backend {gloo|nccl}
   --reseed-per-sample {0|1}
+  --empty-response-policy {allow|prevent}
   --verbose
   --no-reuse
 

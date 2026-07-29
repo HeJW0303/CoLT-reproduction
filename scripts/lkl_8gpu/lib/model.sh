@@ -28,11 +28,18 @@ resolve_eval_model() {
 }
 
 generation_log_label() {
+  local label
   case "$1" in
-    official) printf '%s\n' "sampling_max256" ;;
-    respect-args) printf '%s\n' "greedy_max8192" ;;
+    official) label="sampling_max256" ;;
+    respect-args) label="greedy_max8192" ;;
     *) die "Unknown generation mode for log naming: $1" ;;
   esac
+  case "${2:-allow}" in
+    allow) ;;
+    prevent) label="${label}_prevent-empty" ;;
+    *) die "Unknown empty response policy for log naming: $2" ;;
+  esac
+  printf '%s\n' "$label"
 }
 
 verify_eval_model() {
@@ -53,8 +60,8 @@ verify_eval_model() {
 }
 
 create_generation_overlay() {
-  local source_model="$1" run_id="$2"
-  local overlay="$EVAL_ROOT/runtime_models/${run_id}_$$_respect_args"
+  local source_model="$1" run_id="$2" variant="${3:-generation_overlay}"
+  local overlay="$EVAL_ROOT/runtime_models/${run_id}_$$_${variant}"
   mkdir -p "$overlay"
   local model_file source_file
   for model_file in "$source_model"/* "$source_model"/.[!.]*; do
