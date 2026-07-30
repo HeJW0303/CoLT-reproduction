@@ -15,7 +15,7 @@ CONDA_ENV_DIR="${COLT_CONDA_ENV_DIR:-/data/nvme0/lkl/conda/envs/colt}"
 BASE_MODEL_DIR="${COLT_BASE_MODEL_DIR:-/data/nvme0/lkl/models/Qwen3-VL-8B-Instruct}"
 DECODER_MODEL_DIR="${COLT_DECODER_MODEL_DIR:-/data/nvme0/lkl/models/Qwen3-0.6B}"
 TRAIN_DATA_DIR="${COLT_DATA_ROOT:-/data/nvme0/lkl/datasets/CoLT_Train_Dataset}"
-ORACLE_DATA_FILE="${COLT_ORACLE_K_DATA_FILE:-$TRAIN_DATA_DIR/colt_sft_image_oracle_k.json}"
+ORACLE_DATA_FILE="${COLT_ORACLE_K_DATA_FILE:-}"
 EVAL_DATA_ROOT="${COLT_EVAL_DATA_ROOT:-$REPO_ROOT/eval/LMUData}"
 PIPELINE_ROOT="${COLT_PIPELINE_ROOT:-$REPO_ROOT/pipeline_runs}"
 PIPELINE_CACHE_ROOT="${COLT_PIPELINE_CACHE_ROOT:-$REPO_ROOT/cache}"
@@ -77,7 +77,6 @@ done
 [[ -d "$BASE_MODEL_DIR" ]] || die "Missing base model directory: $BASE_MODEL_DIR"
 [[ -d "$DECODER_MODEL_DIR" ]] || die "Missing decoder model directory: $DECODER_MODEL_DIR"
 [[ -d "$TRAIN_DATA_DIR" ]] || die "Missing training dataset directory: $TRAIN_DATA_DIR"
-[[ -f "$ORACLE_DATA_FILE" ]] || die "Missing Oracle-K data file: $ORACLE_DATA_FILE"
 [[ -f "$TRAIN_DATA_DIR/dataset_info.json" ]] || die "Missing dataset registry: $TRAIN_DATA_DIR/dataset_info.json"
 [[ "$GPU_PROFILE" == a100 || "$GPU_PROFILE" == a800 ]] || die "COLT_GPU_PROFILE must be a100 or a800"
 [[ "$GPU_CSV" == "0,1,2,3,4,5,6,7" ]] || die "This pipeline requires all 8 GPUs in order: 0,1,2,3,4,5,6,7"
@@ -87,14 +86,16 @@ for model_dir in "$BASE_MODEL_DIR" "$DECODER_MODEL_DIR"; do
   compgen -G "$model_dir/*.safetensors" >/dev/null || die "No safetensors weights under $model_dir"
 done
 
-"$CONDA_ENV_DIR/bin/python" - "$TRAIN_DATA_DIR/dataset_info.json" "$ORACLE_DATA_FILE" <<'PY'
+ORACLE_DATA_FILE="$("$CONDA_ENV_DIR/bin/python" - \
+  "$TRAIN_DATA_DIR/dataset_info.json" "$ORACLE_DATA_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 registry_path = Path(sys.argv[1]).resolve()
-oracle_path = Path(sys.argv[2]).resolve()
+explicit_oracle = sys.argv[2]
 registry = json.loads(registry_path.read_text(encoding="utf-8"))
+oracle_path = None
 for name in ("onethinker_sft_image", "onethinker_sft_image_oracle_k"):
     if name not in registry:
         raise RuntimeError(f"dataset_info.json does not register {name}")
@@ -104,13 +105,18 @@ for name in ("onethinker_sft_image", "onethinker_sft_image_oracle_k"):
     registered = registered.resolve()
     if not registered.is_file():
         raise RuntimeError(f"Registered dataset file does not exist for {name}: {registered}")
-    if name == "onethinker_sft_image_oracle_k" and registered != oracle_path:
-        raise RuntimeError(
-            f"Oracle-K registry mismatch: dataset_info.json points to {registered}, "
-            f"but COLT_ORACLE_K_DATA_FILE is {oracle_path}"
-        )
-print("Training dataset registry: OK")
+    if name == "onethinker_sft_image_oracle_k":
+        oracle_path = registered
+if explicit_oracle and Path(explicit_oracle).resolve() != oracle_path:
+    raise RuntimeError(
+        f"Oracle-K registry mismatch: dataset_info.json points to {oracle_path}, "
+        f"but COLT_ORACLE_K_DATA_FILE is {Path(explicit_oracle).resolve()}"
+    )
+print(oracle_path)
 PY
+)"
+echo "Training dataset registry: OK"
+echo "Oracle-K data: $ORACLE_DATA_FILE"
 
 run_stamp="$(date +%Y%m%d_%H%M%S)"
 if [[ -n "$explicit_run_dir" ]]; then

@@ -183,12 +183,15 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             train_data = root / "train_data"
             train_data.mkdir()
             paper_data = train_data / "colt_sft_image.json"
-            oracle_data = train_data / "colt_sft_image_oracle_k.json"
+            oracle_data = train_data / "oracle_nested" / "colt_sft_image_oracle_k.json"
+            oracle_data.parent.mkdir()
             paper_data.write_text("[]\n", encoding="utf-8")
             oracle_data.write_text("[]\n", encoding="utf-8")
             registry = {
                 "onethinker_sft_image": {"file_name": paper_data.name},
-                "onethinker_sft_image_oracle_k": {"file_name": oracle_data.name},
+                "onethinker_sft_image_oracle_k": {
+                    "file_name": str(oracle_data.relative_to(train_data))
+                },
             }
             (train_data / "dataset_info.json").write_text(
                 json.dumps(registry), encoding="utf-8"
@@ -202,7 +205,6 @@ class Lkl8GpuScriptTests(unittest.TestCase):
                 COLT_BASE_MODEL_DIR=str(base_model),
                 COLT_DECODER_MODEL_DIR=str(decoder_model),
                 COLT_DATA_ROOT=str(train_data),
-                COLT_ORACLE_K_DATA_FILE=str(oracle_data),
                 COLT_EVAL_DATA_ROOT=str(root / "eval_data"),
                 COLT_PIPELINE_ROOT=str(root / "pipeline_runs"),
                 COLT_PIPELINE_CACHE_ROOT=str(root / "cache"),
@@ -236,6 +238,10 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             self.assertNotIn("--prefetch", result.stdout)
             self.assertIn("eval paper-faithful all8", result.stdout)
             self.assertIn("eval oracle-k all8", result.stdout)
+            environment_text = (run_dir / "pipeline_environment.txt").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"oracle_data={oracle_data.resolve()}", environment_text)
 
 
 if __name__ == "__main__":
