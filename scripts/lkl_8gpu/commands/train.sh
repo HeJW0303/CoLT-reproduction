@@ -36,6 +36,7 @@ cmd_train() {
       record_prefix=colt_codefaithful_run
       log_prefix=colt_codefaithful_train
       export COLT_PAPER_FAITHFUL=0 COLT_ORACLE_K_ENABLED=0 COLT_ORACLE_K_PREDICTOR_ENABLED=0
+      export COLT_ORACLE_K_DYNAMIC_INFERENCE=0
       ;;
     paper-faithful)
       default_config="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_paper_faithful.yaml"
@@ -43,6 +44,7 @@ cmd_train() {
       record_prefix=colt_paper_faithful_run
       log_prefix=colt_paper_faithful_train
       export COLT_PAPER_FAITHFUL=1 COLT_ORACLE_K_ENABLED=0 COLT_ORACLE_K_PREDICTOR_ENABLED=0
+      export COLT_ORACLE_K_DYNAMIC_INFERENCE=0
       ;;
     oracle-k)
       default_config="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_oracle_k_predictor.yaml"

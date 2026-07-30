@@ -249,6 +249,17 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         self.assertIn("preprocessing_num_workers=1", source)
         self.assertIn('export COLT_TMP_ROOT="$PIPELINE_TMP_ROOT"', source)
 
+    def test_non_oracle_training_disables_dynamic_k(self) -> None:
+        train_source = (SCRIPT_ROOT / "commands" / "train.sh").read_text(encoding="utf-8")
+        self.assertEqual(train_source.count("export COLT_ORACLE_K_DYNAMIC_INFERENCE=0"), 2)
+
+        pipeline_source = PIPELINE_SCRIPT.read_text(encoding="utf-8")
+        paper_stage = pipeline_source.index("run_stage paper_train")
+        dynamic_k = pipeline_source.index("export COLT_ORACLE_K_DYNAMIC_INFERENCE=1")
+        oracle_stage = pipeline_source.index("run_stage oracle_train")
+        self.assertLess(paper_stage, dynamic_k)
+        self.assertLess(dynamic_k, oracle_stage)
+
 
 if __name__ == "__main__":
     unittest.main()

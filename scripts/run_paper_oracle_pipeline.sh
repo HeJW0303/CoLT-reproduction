@@ -251,9 +251,8 @@ export COLT_ORACLE_K_DATASET_NAME=onethinker_sft_image_oracle_k
 export COLT_ORACLE_K_DATA_FILE="$ORACLE_DATA_FILE"
 export COLT_ORACLE_K_TOKENIZED_PATH="$oracle_tokenized"
 export COLT_ORACLE_K_OUTPUT_DIR="$ORACLE_OUTPUT"
-export COLT_ORACLE_K_DYNAMIC_INFERENCE=1
 unset RESUME COLT_TRAIN_CONFIG COLT_TRAIN_OUTPUT_DIR COLT_EVAL_MODEL_PATH
-unset COLT_BENCHMARK_MODE COLT_SKIP_FINAL_SAVE COLT_INFERENCE_K
+unset COLT_BENCHMARK_MODE COLT_SKIP_FINAL_SAVE COLT_INFERENCE_K COLT_ORACLE_K_DYNAMIC_INFERENCE
 
 cat > "$RUN_DIR/pipeline_environment.txt" <<EOF
 git_head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
@@ -364,6 +363,7 @@ echo "Generation mode: $generation_mode"
 
 run_stage paper_train train_target paper-faithful "$PAPER_CONFIG" "$PAPER_OUTPUT"
 run_stage paper_eval evaluate_target paper-faithful "$PAPER_OUTPUT"
+export COLT_ORACLE_K_DYNAMIC_INFERENCE=1
 run_stage oracle_train train_target oracle-k "$ORACLE_CONFIG" "$ORACLE_OUTPUT"
 export COLT_LOG_PREDICTED_K=1
 run_stage oracle_eval evaluate_target oracle-k "$ORACLE_OUTPUT"
