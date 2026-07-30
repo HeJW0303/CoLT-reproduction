@@ -1482,14 +1482,15 @@ def _compute_colt_forward_cot_loss(loss_function, ref_logits, ref_labels, vocab_
 
 
 def _compute_colt_backward_alignment_loss(cot_hidden, latent_embd, projector, probe_positions=None):
-    """Train the textual branch to match a stop-gradient latent target."""
+    """Align the latent state to the official fixed textual semantic anchor."""
     if probe_positions is None:
         cot_last_hidden = cot_hidden[:, -1, :]
     else:
         batch_indices = torch.arange(cot_hidden.shape[0], device=cot_hidden.device)
         cot_last_hidden = cot_hidden[batch_indices, probe_positions]
+    cot_last_hidden = cot_last_hidden.detach()
     cot_to_latent = projector(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
-    return 1 - F.cosine_similarity(cot_to_latent.float(), latent_embd.detach().float(), dim=-1).mean()
+    return 1 - F.cosine_similarity(cot_to_latent.float(), latent_embd.float(), dim=-1).mean()
 
 
 def _ensure_colt_decoder_initialized(
@@ -1657,6 +1658,10 @@ def _is_colt_paper_faithful_enabled():
     return os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_colt_aux_batching_enabled():
+    return os.environ.get("COLT_BATCH_AUX_DECODERS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_colt_rank_zero():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
@@ -1682,9 +1687,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.paper_faithful = _is_colt_paper_faithful_enabled()
-        self.batch_aux_decoders = self.paper_faithful and os.environ.get(
-            "COLT_BATCH_AUX_DECODERS", "0"
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.batch_aux_decoders = self.paper_faithful and _is_colt_aux_batching_enabled()
         self._colt_forward_microbatch_count = 0
         oracle_k_settings = resolve_oracle_k_settings(config)
         self.oracle_k_enabled = oracle_k_settings.enabled
@@ -1791,8 +1794,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.post_init()
         if self.training and self.decoder is not None:
             self.decoder.gradient_checkpointing_enable()
-        if self.training and self.paper_faithful and self.backward_decoder is not None:
-            self.backward_decoder.gradient_checkpointing_enable()
         self.tokenizer = tokenizer
 
     def _parse_oracle_k_steps(self, cot_ids):
@@ -2007,7 +2008,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 self._decoder_name_or_path,
                 self.config.text_config.dtype,
                 decoder_device,
-                enable_gradient_checkpointing=self.paper_faithful,
             )
 
             past_key_values = DynamicCache(config=self.config.text_config)
@@ -2219,7 +2219,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                 "input_ids": cot_plus_probe_ids,
                                 "attention_mask": cot_plus_probe_mask,
                                 "probe_positions": probe_positions,
-                                "latent_embd": latent_embd.detach() if self.paper_faithful else latent_embd,
+                                "latent_embd": latent_embd,
                             }
                             if self.batch_aux_decoders:
                                 batched_backward_records.append(backward_record)
@@ -2239,18 +2239,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                         output_hidden_states=True,
                                     )
                                     cot_hidden = cot_outputs.hidden_states[-1]
-                                if self.paper_faithful:
-                                    backward_loss = _compute_colt_backward_alignment_loss(
-                                        cot_hidden,
-                                        latent_embd,
-                                        self.pj_back,
-                                    )
-                                else:
-                                    cot_last_hidden = cot_hidden[:, -1, :].detach()
-                                    cot_to_latent = self.pj_back(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
-                                    backward_loss = 1 - F.cosine_similarity(
-                                        cot_to_latent.float(), latent_embd.float(), dim=-1
-                                    ).mean()
+                                backward_loss = _compute_colt_backward_alignment_loss(
+                                    cot_hidden,
+                                    latent_embd,
+                                    self.pj_back,
+                                )
                                 backward_loss_total += backward_loss
                                 backward_steps_num += 1
                     forward_idx += 1

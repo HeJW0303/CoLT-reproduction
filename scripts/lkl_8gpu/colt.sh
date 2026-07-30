@@ -31,6 +31,13 @@ Evaluation targets:
   official        local hulianyuyy/CoLT-8B snapshot
   baseline        Qwen3-VL-8B-Instruct textual-CoT baseline
 
+Training options:
+  --resume                    Resume a verified interrupted checkpoint
+  --batch-aux                 Opt in to auxiliary decoder batching (default: off)
+
+COLT_BATCH_AUX_DECODERS=1 is equivalent to --batch-aux for paper-faithful
+and oracle-k training.
+
 Dataset groups:
   smoke, chartqa, mmstar, phase1, phase2, phase3, remaining7, all8
 

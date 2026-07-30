@@ -16,6 +16,8 @@ cmd_train() {
   done
   [[ "$resume" == 0 || "$resume" == 1 ]] || die "RESUME must be 0 or 1"
   [[ "$batch_aux" == 0 || "$batch_aux" == 1 ]] || die "COLT_BATCH_AUX_DECODERS must be 0 or 1"
+  [[ "$target" != codefaithful || "$batch_aux" == 0 ]] || die \
+    "Auxiliary decoder batching requires paper-faithful or oracle-k training."
 
   runtime_init
   require_workspace_layout

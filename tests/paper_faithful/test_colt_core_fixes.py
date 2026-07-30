@@ -1,10 +1,12 @@
 import os
 
-from scripts.lkl_8gpu.verify_paper_faithful import (
+from scripts.lkl_8gpu.tools.verify_paper_faithful import (
+    verify_aux_batching_switch,
+    verify_backward_decoder_official_behavior,
     verify_backward_gradient_ownership,
     verify_empty_forward_targets,
     verify_forward_causal_alignment,
-    verify_visual_freeze_keys,
+    verify_visual_partial_adaptation,
 )
 
 
@@ -16,11 +18,11 @@ def test_empty_forward_targets() -> None:
     verify_empty_forward_targets()
 
 
-def test_visual_freeze_keys() -> None:
+def test_visual_partial_adaptation() -> None:
     previous = os.environ.get("COLT_PAPER_FAITHFUL")
     os.environ["COLT_PAPER_FAITHFUL"] = "1"
     try:
-        verify_visual_freeze_keys()
+        verify_visual_partial_adaptation()
     finally:
         if previous is None:
             os.environ.pop("COLT_PAPER_FAITHFUL", None)
@@ -30,3 +32,11 @@ def test_visual_freeze_keys() -> None:
 
 def test_backward_gradient_ownership() -> None:
     verify_backward_gradient_ownership()
+
+
+def test_backward_decoder_official_behavior() -> None:
+    verify_backward_decoder_official_behavior()
+
+
+def test_aux_batching_switch() -> None:
+    verify_aux_batching_switch()

@@ -36,7 +36,15 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-def _assert_paper_faithful_visual_freeze(
+def _matches_parameter_prefix(name: str, prefix: str) -> bool:
+    return name.startswith(f"{prefix}.") or f".{prefix}." in name
+
+
+def _parameter_count(param: "torch.nn.Parameter") -> int:
+    return int(getattr(param, "ds_numel", param.numel()))
+
+
+def _assert_paper_faithful_visual_policy(
     model: "PreTrainedModel", finetuning_args: "FinetuningArguments"
 ) -> None:
     if os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() not in {"1", "true", "yes", "on"}:
@@ -51,21 +59,41 @@ def _assert_paper_faithful_visual_freeze(
             "freeze_multi_modal_projector=true."
         )
 
-    visual_parameters = [
-        (name, param)
-        for name, param in model.named_parameters()
-        if name.startswith("visual.") or ".visual." in name
-    ]
-    if not visual_parameters:
-        raise RuntimeError("COLT_PAPER_FAITHFUL found no visual parameters to validate.")
+    named_parameters = list(model.named_parameters())
+    frozen_prefixes = ("visual.patch_embed", "visual.blocks", "visual.merger")
+    trainable_prefixes = ("visual.pos_embed", "visual.deepstack_merger_list")
 
-    trainable = [(name, param.numel()) for name, param in visual_parameters if param.requires_grad]
-    if trainable:
-        preview = ", ".join(f"{name} ({count:,})" for name, count in trainable[:20])
-        raise RuntimeError(f"COLT_PAPER_FAITHFUL found trainable visual parameters: {preview}")
+    frozen_count = 0
+    trainable_count = 0
+    for prefix in frozen_prefixes:
+        matching = [(name, param) for name, param in named_parameters if _matches_parameter_prefix(name, prefix)]
+        if not matching:
+            raise RuntimeError(f"COLT_PAPER_FAITHFUL found no parameters for required frozen module {prefix!r}.")
+        unexpected = [name for name, param in matching if param.requires_grad]
+        if unexpected:
+            raise RuntimeError(
+                f"COLT_PAPER_FAITHFUL expected {prefix!r} to be frozen, but found trainable parameters: "
+                + ", ".join(unexpected[:20])
+            )
+        frozen_count += sum(_parameter_count(param) for _, param in matching)
 
-    frozen_count = sum(param.numel() for _, param in visual_parameters)
-    logger.info_rank0(f"COLT paper-faithful visual freeze verified: {frozen_count:,} parameters frozen.")
+    for prefix in trainable_prefixes:
+        matching = [(name, param) for name, param in named_parameters if _matches_parameter_prefix(name, prefix)]
+        if not matching:
+            raise RuntimeError(f"COLT_PAPER_FAITHFUL found no parameters for partial visual module {prefix!r}.")
+        unexpected = [name for name, param in matching if not param.requires_grad]
+        if unexpected:
+            raise RuntimeError(
+                f"COLT_PAPER_FAITHFUL expected {prefix!r} to remain trainable, but found frozen parameters: "
+                + ", ".join(unexpected[:20])
+            )
+        trainable_count += sum(_parameter_count(param) for _, param in matching)
+
+    logger.info_rank0(
+        "COLT paper-faithful partial visual adaptation verified: "
+        f"{frozen_count:,} backbone/projector parameters frozen; "
+        f"{trainable_count:,} position/deepstack parameters trainable."
+    )
 
 
 def _setup_full_tuning(
@@ -359,6 +387,6 @@ def init_adapter(
         raise NotImplementedError(f"Unknown finetuning type: {finetuning_args.finetuning_type}.")
 
     if is_trainable:
-        _assert_paper_faithful_visual_freeze(model, finetuning_args)
+        _assert_paper_faithful_visual_policy(model, finetuning_args)
 
     return model

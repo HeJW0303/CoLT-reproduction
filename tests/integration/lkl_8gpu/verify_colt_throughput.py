@@ -248,8 +248,13 @@ def verify_backward_batch_equivalence() -> None:
     _assert_close("backward step-equal total", batched_total, sequential_total)
     for name in sequential_gradients:
         _assert_close(f"backward gradient {name}", batched_gradients[name], sequential_gradients[name])
-    if any(sequential_gradients[f"latent.{index}"] is not None for index in range(2)):
-        raise RuntimeError("Backward alignment leaked gradients into a latent target.")
+    decoder_gradient_names = [name for name in sequential_gradients if name.startswith("decoder.")]
+    if any(sequential_gradients[name] is not None for name in decoder_gradient_names):
+        raise RuntimeError("Backward alignment leaked gradients into the fixed textual semantic anchor.")
+    for index in range(2):
+        gradient = sequential_gradients[f"latent.{index}"]
+        if gradient is None or not torch.isfinite(gradient).all() or gradient.abs().sum().item() == 0:
+            raise RuntimeError(f"Backward alignment did not update latent state {index}.")
 
 
 def verify_hot_path_has_no_tensor_conditions_or_tensor_prints() -> None:
@@ -273,7 +278,7 @@ def main() -> None:
     verify_forward_batch_equivalence()
     print("T2 OK: Bx3 forward losses and decoder/pj_in/pj_out/latent gradients match sequential execution.")
     verify_backward_batch_equivalence()
-    print("T3 OK: Bx2 backward losses and decoder/pj_back gradients match; latent targets stay detached.")
+    print("T3 OK: Bx2 backward losses and latent/pj_back gradients match; textual anchors stay detached.")
     verify_hot_path_has_no_tensor_conditions_or_tensor_prints()
     print("T4 OK: training forward has no known per-step tensor conditions or per-microbatch tensor prints.")
 

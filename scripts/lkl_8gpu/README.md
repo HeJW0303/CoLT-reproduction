@@ -41,16 +41,27 @@ bash scripts/lkl_8gpu/colt.sh train paper-faithful
 bash scripts/lkl_8gpu/colt.sh train oracle-k
 ```
 
+`paper-faithful` and `oracle-k` share the conservative repaired training semantics: the forward CoT
+loss uses one causal shift, while the official partial visual adaptation, backward semantic-anchor
+gradient direction, and backward decoder behavior are preserved.
+
 断点恢复必须显式声明，且脚本会检查完整 Trainer checkpoint：
 
 ```bash
 bash scripts/lkl_8gpu/colt.sh train paper-faithful --resume
 ```
 
-辅助 decoder 合批仍默认关闭；完成 loss/gradient 对齐后才启用：
+辅助 decoder 合批默认关闭，可通过命令参数显式启用：
 
 ```bash
 bash scripts/lkl_8gpu/colt.sh train paper-faithful --batch-aux
+bash scripts/lkl_8gpu/colt.sh train oracle-k --batch-aux
+```
+
+也可以使用等价的环境变量形式：
+
+```bash
+COLT_BATCH_AUX_DECODERS=1 bash scripts/lkl_8gpu/colt.sh train paper-faithful
 ```
 
 ## 评测

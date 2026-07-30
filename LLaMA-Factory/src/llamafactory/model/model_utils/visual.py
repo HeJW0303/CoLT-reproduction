@@ -15,7 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -356,16 +355,7 @@ _register_composite_model(
 _register_composite_model(
     model_type="qwen3_vl",
     projector_key="visual.merger",
-    vision_model_keys=(
-        [
-            "visual.patch_embed",
-            "visual.pos_embed",
-            "visual.blocks",
-            "visual.deepstack_merger_list",
-        ]
-        if os.environ.get("COLT_PAPER_FAITHFUL", "0").strip().lower() in {"1", "true", "yes", "on"}
-        else ["visual.patch_embed", "visual.blocks"]
-    ),
+    vision_model_keys=["visual.patch_embed", "visual.blocks"],
     language_model_keys=["language_model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
 )
