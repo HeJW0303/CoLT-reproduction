@@ -126,8 +126,12 @@ elif [[ -n "${COLT_PIPELINE_RUN_DIR:-}" ]]; then
   [[ "$COLT_PIPELINE_RUN_DIR" == /* ]] || die "COLT_PIPELINE_RUN_DIR must be absolute"
   RUN_DIR="$COLT_PIPELINE_RUN_DIR"
 else
-  RUN_DIR="$PIPELINE_ROOT/paper_oracle_${mode}_$run_stamp"
+RUN_DIR="$PIPELINE_ROOT/paper_oracle_${mode}_$run_stamp"
 fi
+
+run_key="$(printf '%s' "$RUN_DIR" | cksum | awk '{print $1}')"
+PIPELINE_TMP_ROOT="${COLT_PIPELINE_TMP_ROOT:-/tmp/colt_pipeline_$run_key}"
+[[ "$PIPELINE_TMP_ROOT" == /* ]] || die "COLT_PIPELINE_TMP_ROOT must be absolute"
 
 CONFIG_DIR="$RUN_DIR/configs"
 STATE_DIR="$RUN_DIR/state"
@@ -202,6 +206,7 @@ if mode == "smoke":
         save_strategy="no",
         report_to="none",
         plot_loss=False,
+        preprocessing_num_workers=1,
         seed=42,
         data_seed=42,
     )
@@ -236,7 +241,7 @@ export COLT_EVAL_ROOT="$RUN_DIR/eval"
 export COLT_EVAL_DATA_ROOT="$EVAL_DATA_ROOT"
 export COLT_EVAL_OUTPUT_ROOT="$RUN_DIR/eval/results"
 export COLT_EVAL_LOG_ROOT="$RUN_DIR/logs/eval"
-export COLT_TMP_ROOT="$RUN_DIR/tmp"
+export COLT_TMP_ROOT="$PIPELINE_TMP_ROOT"
 export COLT_GPU_PROFILE="$GPU_PROFILE"
 export COLT_TRAIN_GPUS="$GPU_CSV"
 export COLT_EVAL_GPUS="$GPU_CSV"
@@ -255,6 +260,7 @@ git_head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 mode=$mode
 repo_root=$REPO_ROOT
 runtime_root=$RUNTIME_ROOT
+tmp_root=$PIPELINE_TMP_ROOT
 conda_env=$CONDA_ENV_DIR
 conda_init=$CONDA_INIT_SH
 base_model=$BASE_MODEL_DIR

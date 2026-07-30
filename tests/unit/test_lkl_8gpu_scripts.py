@@ -243,6 +243,12 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             )
             self.assertIn(f"oracle_data={oracle_data.resolve()}", environment_text)
 
+    def test_pipeline_smoke_uses_short_temp_path_and_single_preprocessor(self) -> None:
+        source = PIPELINE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("/tmp/colt_pipeline_$run_key", source)
+        self.assertIn("preprocessing_num_workers=1", source)
+        self.assertIn('export COLT_TMP_ROOT="$PIPELINE_TMP_ROOT"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
