@@ -33,6 +33,32 @@ class OracleKSettings:
     dynamic_inference: bool
 
 
+@dataclass(frozen=True)
+class OracleKTrainingStep:
+    active: bool
+    forward_index: int
+    backward_index: Optional[int]
+
+
+def build_oracle_k_training_plan(local_k: int, synchronized_k: int) -> tuple[OracleKTrainingStep, ...]:
+    """Describe real and zero-loss steps for distributed Oracle-K training."""
+    if local_k < 1:
+        raise ValueError(f"local_k must be at least 1, got {local_k}")
+    if synchronized_k < local_k:
+        raise ValueError(
+            f"synchronized_k must be at least local_k, got local_k={local_k}, synchronized_k={synchronized_k}"
+        )
+
+    return tuple(
+        OracleKTrainingStep(
+            active=step < local_k,
+            forward_index=min(step, local_k - 1),
+            backward_index=None if step == 0 else min(step - 1, local_k - 1),
+        )
+        for step in range(synchronized_k)
+    )
+
+
 def parse_oracle_k_cot(cot_text: str, min_k: int = 1, max_k: Optional[int] = None) -> OracleKAnnotation:
     if not cot_text.startswith(THOUGHT_SEGMENTS_OPEN):
         raise OracleKFormatError(f"Oracle-K CoT must start with {THOUGHT_SEGMENTS_OPEN}")

@@ -196,6 +196,37 @@ def verify_forward_batch_equivalence() -> None:
         _assert_close(f"forward gradient {name}", batched_gradients[name], sequential_gradients[name])
 
 
+def _run_forward_dummy_case(seed: int, batched: bool):
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_forward_decoder_steps
+
+    decoder, pj_in, pj_out, latents, records, vocab_size = _make_forward_case(seed)
+    records[2]["has_targets"] = False
+    records[2]["labels"].fill_(-100)
+    losses = _run_colt_forward_decoder_steps(
+        decoder, pj_out, _causal_loss, records, vocab_size, batched=batched
+    )
+    torch.stack(losses).sum().backward()
+    return losses, latents, decoder.forward_calls
+
+
+def verify_dummy_forward_step_has_zero_gradient() -> None:
+    for batched, expected_calls in ((False, 3), (True, 1)):
+        losses, latents, calls = _run_forward_dummy_case(41, batched=batched)
+        if calls != expected_calls:
+            raise RuntimeError(
+                f"Dummy forward call count mismatch for batched={batched}: {calls} != {expected_calls}."
+            )
+        if losses[2].detach().abs().item() != 0.0:
+            raise RuntimeError(f"Dummy forward loss was nonzero for batched={batched}.")
+        dummy_gradient = latents[2].grad
+        if dummy_gradient is None or dummy_gradient.abs().sum().item() != 0.0:
+            raise RuntimeError(f"Dummy forward step changed gradients for batched={batched}.")
+        for index in (0, 1):
+            active_gradient = latents[index].grad
+            if active_gradient is None or active_gradient.abs().sum().item() == 0.0:
+                raise RuntimeError(f"Active forward step {index} lost its gradient for batched={batched}.")
+
+
 def _make_backward_case(seed: int):
     torch.manual_seed(seed)
     decoder = ToyBackwardDecoder(vocab_size=11, hidden_size=5)
@@ -257,6 +288,63 @@ def verify_backward_batch_equivalence() -> None:
             raise RuntimeError(f"Backward alignment did not update latent state {index}.")
 
 
+def _run_backward_dummy_case(seed: int, batched: bool):
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
+
+    decoder, pj_back, latents, records = _make_backward_case(seed)
+    records[1]["active"] = False
+    losses = _run_colt_backward_decoder_steps(
+        decoder, pj_back, records, pad_token_id=0, batched=batched
+    )
+    torch.stack(losses).sum().backward()
+    return losses, latents, decoder.backbone.forward_calls
+
+
+def verify_dummy_backward_step_has_zero_gradient() -> None:
+    for batched, expected_calls in ((False, 2), (True, 1)):
+        losses, latents, calls = _run_backward_dummy_case(53, batched=batched)
+        if calls != expected_calls:
+            raise RuntimeError(
+                f"Dummy backward call count mismatch for batched={batched}: {calls} != {expected_calls}."
+            )
+        if losses[1].detach().abs().item() != 0.0:
+            raise RuntimeError(f"Dummy backward loss was nonzero for batched={batched}.")
+        dummy_gradient = latents[1].grad
+        if dummy_gradient is None or dummy_gradient.abs().sum().item() != 0.0:
+            raise RuntimeError(f"Dummy backward step changed gradients for batched={batched}.")
+        active_gradient = latents[0].grad
+        if active_gradient is None or active_gradient.abs().sum().item() == 0.0:
+            raise RuntimeError(f"Active backward step lost its gradient for batched={batched}.")
+
+
+def verify_oracle_k_global_max_sync() -> None:
+    from transformers.models.qwen3_vl import modeling_qwen3_vl
+
+    distributed = torch.distributed
+    originals = {
+        "is_available": distributed.is_available,
+        "is_initialized": distributed.is_initialized,
+        "all_reduce": distributed.all_reduce,
+    }
+
+    def fake_all_reduce(value, op):
+        if op != distributed.ReduceOp.MAX:
+            raise RuntimeError(f"Oracle-K synchronization used the wrong reduction: {op}")
+        value.fill_(7)
+
+    try:
+        distributed.is_available = lambda: True
+        distributed.is_initialized = lambda: True
+        distributed.all_reduce = fake_all_reduce
+        synchronized = modeling_qwen3_vl._synchronize_colt_oracle_k(2, torch.device("cpu"))
+    finally:
+        for name, original in originals.items():
+            setattr(distributed, name, original)
+
+    if synchronized != 7:
+        raise RuntimeError(f"Oracle-K synchronization did not return the global maximum: {synchronized}")
+
+
 def verify_hot_path_has_no_tensor_conditions_or_tensor_prints() -> None:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 
@@ -281,6 +369,12 @@ def main() -> None:
     print("T3 OK: Bx2 backward losses and latent/pj_back gradients match; textual anchors stay detached.")
     verify_hot_path_has_no_tensor_conditions_or_tensor_prints()
     print("T4 OK: training forward has no known per-step tensor conditions or per-microbatch tensor prints.")
+    verify_dummy_backward_step_has_zero_gradient()
+    print("T5 OK: synchronized dummy backward steps execute but contribute zero loss and gradient.")
+    verify_oracle_k_global_max_sync()
+    print("T6 OK: Oracle-K distributed synchronization uses the global maximum K.")
+    verify_dummy_forward_step_has_zero_gradient()
+    print("T7 OK: synchronized dummy forward steps execute but contribute zero loss and gradient.")
 
 
 if __name__ == "__main__":

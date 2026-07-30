@@ -186,6 +186,36 @@ class OracleKSettingsTest(unittest.TestCase):
                 environ={"COLT_ORACLE_K_PREDICTOR_ENABLED": "1"},
             )
 
+
+class OracleKDistributedTrainingPlanTest(unittest.TestCase):
+    def test_all_ranks_execute_the_global_maximum_number_of_calls(self):
+        plans = [oracle_k.build_oracle_k_training_plan(local_k, 8) for local_k in (1, 3, 5, 8)]
+
+        self.assertEqual({len(plan) for plan in plans}, {8})
+        self.assertEqual(
+            [[step.active for step in plan].count(True) for plan in plans],
+            [1, 3, 5, 8],
+        )
+        self.assertTrue(all(sum(step.backward_index is not None for step in plan) == 7 for plan in plans))
+
+    def test_dummy_steps_reuse_last_valid_local_indices(self):
+        plan = oracle_k.build_oracle_k_training_plan(local_k=2, synchronized_k=5)
+
+        self.assertEqual([step.forward_index for step in plan], [0, 1, 1, 1, 1])
+        self.assertEqual([step.backward_index for step in plan], [None, 0, 1, 1, 1])
+        self.assertEqual([step.active for step in plan], [True, True, False, False, False])
+
+    def test_single_rank_plan_preserves_the_original_local_k_path(self):
+        plan = oracle_k.build_oracle_k_training_plan(local_k=4, synchronized_k=4)
+
+        self.assertTrue(all(step.active for step in plan))
+        self.assertEqual([step.forward_index for step in plan], [0, 1, 2, 3])
+        self.assertEqual([step.backward_index for step in plan], [None, 0, 1, 2])
+
+    def test_synchronized_k_cannot_be_smaller_than_local_k(self):
+        with self.assertRaisesRegex(ValueError, "synchronized_k must be at least local_k"):
+            oracle_k.build_oracle_k_training_plan(local_k=3, synchronized_k=2)
+
     def test_predictor_loss_weight_must_be_finite(self):
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             oracle_k.resolve_oracle_k_settings(

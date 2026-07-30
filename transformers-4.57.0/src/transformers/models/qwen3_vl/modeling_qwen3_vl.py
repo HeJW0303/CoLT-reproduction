@@ -44,6 +44,7 @@ from ...utils.generic import check_model_inputs
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from .modeling_oracle_k import OracleKBudgetConditioner, OracleKPredictor, pool_last_valid_hidden
 from .oracle_k import (
+    build_oracle_k_training_plan,
     parse_oracle_k_cot,
     resolve_forced_inference_k,
     resolve_oracle_k_settings,
@@ -1621,14 +1622,13 @@ def _run_colt_backward_decoder_steps(decoder, projector, records, pad_token_id, 
         losses = []
         for record in records:
             hidden = run_backbone(record["input_ids"], record["attention_mask"])
-            losses.append(
-                _compute_colt_backward_alignment_loss(
-                    hidden,
-                    record["latent_embd"],
-                    projector,
-                    probe_positions=record["probe_positions"],
-                )
+            loss = _compute_colt_backward_alignment_loss(
+                hidden,
+                record["latent_embd"],
+                projector,
+                probe_positions=record["probe_positions"],
             )
+            losses.append(loss if record.get("active", True) else loss * 0.0)
         return losses
 
     max_length = max(record["input_ids"].shape[1] for record in records)
@@ -1643,14 +1643,13 @@ def _run_colt_backward_decoder_steps(decoder, projector, records, pad_token_id, 
 
     losses = []
     for hidden, record in zip(hidden_steps, records):
-        losses.append(
-            _compute_colt_backward_alignment_loss(
-                hidden,
-                record["latent_embd"],
-                projector,
-                probe_positions=record["probe_positions"],
-            )
+        loss = _compute_colt_backward_alignment_loss(
+            hidden,
+            record["latent_embd"],
+            projector,
+            probe_positions=record["probe_positions"],
         )
+        losses.append(loss if record.get("active", True) else loss * 0.0)
     return losses
 
 
@@ -1666,6 +1665,15 @@ def _is_colt_rank_zero():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
     return int(os.environ.get("RANK", "0")) == 0
+
+
+def _synchronize_colt_oracle_k(local_k, device):
+    """Return the largest GT K so ZeRO-3 ranks execute identical module calls."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return local_k
+    synchronized_k = torch.tensor(local_k, dtype=torch.long, device=device)
+    torch.distributed.all_reduce(synchronized_k, op=torch.distributed.ReduceOp.MAX)
+    return int(synchronized_k.item())
 
 
 def _colt_component_log_interval():
@@ -2047,7 +2055,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             # 2) backward_loss_total: CoT step -> latent alignment loss
             # 3) prediction_loss_total: latent_t -> latent_{t+1} prediction loss
             # 4) ce_loss_total: final answer decoding loss
-            forward_idx = 0
             forward_loss_total = 0.0
             backward_loss_total = 0.0
             prediction_loss_total = 0.0
@@ -2059,53 +2066,84 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             batched_forward_records = []
             batched_backward_records = []
 
-            if training_latent_steps != 0:
-                for i in range(training_latent_steps):
+            synchronized_latent_steps = (
+                _synchronize_colt_oracle_k(training_latent_steps, input_ids.device)
+                if self.oracle_k_enabled
+                else training_latent_steps
+            )
+            oracle_k_plan = (
+                build_oracle_k_training_plan(training_latent_steps, synchronized_latent_steps)
+                if self.oracle_k_enabled
+                else None
+            )
+            if synchronized_latent_steps != 0:
+                for i in range(synchronized_latent_steps):
+                    active_step = oracle_k_plan[i].active if oracle_k_plan is not None else True
                     # ---------------------------
                     # A) latent transition step
                     # ---------------------------
-                    step_cache_position = torch.arange(
-                        current_seq_len + i,
-                        current_seq_len + i + 1,
-                        device=latent_embd.device,
-                    )
                     # For RoPE index / causal mask, attention_mask should reflect the full (cached + current) length.
                     step_attention_mask = torch.ones((batch_size,  1), dtype=torch.long, device=latent_embd.device)
                     latent_step_input = self._condition_latent_with_oracle_k(
                         latent_embd,
                         training_latent_steps,
-                        i + 1,
+                        min(i + 1, training_latent_steps),
                     )
                     current_latent_embd = latent_step_input
-                    outputs = self.model(inputs_embeds=latent_step_input,
-                                past_key_values=past_key_values,
-                                cache_position=step_cache_position,
-                                attention_mask=step_attention_mask,
-                                position_ids=None,
+                    if active_step:
+                        step_cache_position = torch.arange(
+                            current_seq_len + i,
+                            current_seq_len + i + 1,
+                            device=latent_embd.device,
+                        )
+                        outputs = self.model(
+                            inputs_embeds=latent_step_input,
+                            past_key_values=past_key_values,
+                            cache_position=step_cache_position,
+                            attention_mask=step_attention_mask,
+                            position_ids=None,
                             **kwargs,
                         )
-                    past_key_values = outputs.past_key_values
+                        past_key_values = outputs.past_key_values
+                    else:
+                        # Keep ZeRO-3 module/gradient-hook ordering identical without
+                        # advancing the real latent state or its local-K KV cache.
+                        dummy_cache = DynamicCache(config=self.config.text_config)
+                        outputs = self.model(
+                            inputs_embeds=latent_step_input,
+                            past_key_values=dummy_cache,
+                            cache_position=torch.arange(1, device=latent_embd.device),
+                            attention_mask=step_attention_mask,
+                            position_ids=None,
+                            **kwargs,
+                        )
                     hidden_states = outputs[0]
                     next_latent_embd = hidden_states[:, -1:, :] + self.alpha * self.prj(hidden_states[:, -1:, :])
                     pred_next_latent = self.latent_predictor(current_latent_embd.to(next_latent_embd.dtype))
                     prediction_loss = F.mse_loss(pred_next_latent, next_latent_embd.detach())
-                    prediction_loss_total += prediction_loss
-                    prediction_steps_num += 1
+                    prediction_loss_total += prediction_loss if active_step else prediction_loss * 0.0
+                    if active_step:
+                        prediction_steps_num += 1
 
                     # -----------------------------------------------
                     # B) forward supervision: latent -> CoT decoding
                     # -----------------------------------------------
-                    latent_embd = next_latent_embd
+                    if active_step:
+                        latent_embd = next_latent_embd
+                    supervised_latent_embd = latent_embd if active_step else next_latent_embd
+                    step_ref_idx = oracle_k_plan[i].forward_index if oracle_k_plan is not None else i
                     decoder_embeddings = self.decoder.get_input_embeddings()
                     decoder_embed_dtype = decoder_embeddings.weight.dtype
-                    cot_step_embed = decoder_embeddings(cot_step_id[forward_idx]).to(decoder_embed_dtype)
-                    latent_for_ref = self.pj_in(latent_embd) * self.latent_to_decoder_scale.to(latent_embd.device, latent_embd.dtype)
+                    cot_step_embed = decoder_embeddings(cot_step_id[step_ref_idx]).to(decoder_embed_dtype)
+                    latent_for_ref = self.pj_in(supervised_latent_embd) * self.latent_to_decoder_scale.to(
+                        supervised_latent_embd.device, supervised_latent_embd.dtype
+                    )
                     latent_for_ref = latent_for_ref.to(decoder_embed_dtype)
                     ref_embds = torch.concat([latent_for_ref, cot_step_embed], dim=1)
                     
-                    current_ref_ids = cot_step_id[forward_idx]
-                    current_ref_lens_cpu = [cot_step_len_list[b][forward_idx] for b in range(batch_size)]
-                    has_forward_targets = any(length > 0 for length in current_ref_lens_cpu)
+                    current_ref_ids = cot_step_id[step_ref_idx]
+                    current_ref_lens_cpu = [cot_step_len_list[b][step_ref_idx] for b in range(batch_size)]
+                    has_forward_targets = active_step and any(length > 0 for length in current_ref_lens_cpu)
                     current_ref_lens = torch.tensor(
                         current_ref_lens_cpu,
                         dtype=torch.long,
@@ -2117,6 +2155,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         .expand(batch_size, -1)
                         < current_ref_lens.unsqueeze(1)
                     )
+                    if not active_step:
+                        current_ref_valid = torch.zeros_like(current_ref_valid)
                     prefix_mask = torch.ones((batch_size, 1), dtype=torch.long, device=current_ref_ids.device)
                     ref_attention_mask = torch.cat([prefix_mask, current_ref_valid.long()], dim=1)
                     ref_labels = current_ref_ids.masked_fill(~current_ref_valid, -100)
@@ -2176,10 +2216,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     # ----------------------------------------------------
                     # C) backward alignment: CoT step (+probe) -> latent
                     # ----------------------------------------------------
-                    if self.backward_decoder is not None and forward_idx >= 1:
-                        backward_ref_ids = cot_step_id[forward_idx-1]
+                    if self.backward_decoder is not None and i >= 1:
+                        backward_ref_idx = (
+                            oracle_k_plan[i].backward_index if oracle_k_plan is not None else i - 1
+                        )
+                        backward_ref_ids = cot_step_id[backward_ref_idx]
                         backward_ref_lens_cpu = [
-                            cot_step_len_list[b][forward_idx - 1] for b in range(batch_size)
+                            cot_step_len_list[b][backward_ref_idx] for b in range(batch_size)
                         ]
                         backward_ref_lens = torch.tensor(
                             backward_ref_lens_cpu,
@@ -2192,99 +2235,110 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             .expand(batch_size, -1)
                             < backward_ref_lens.unsqueeze(1)
                         ).long()
-                        if any(length > 0 for length in backward_ref_lens_cpu):
-                            # Encode CoT step, then force one extra "probe" step.
-                            # Use this extra-step hidden state to align with current latent state.
-                            probe_token = torch.full(
-                                (batch_size, 1),
-                                self.eos_token_id,
-                                dtype=backward_ref_ids.dtype,
-                                device=backward_ref_ids.device,
-                            )
-                            cot_plus_probe_ids = torch.cat([backward_ref_ids, probe_token], dim=1)
-                            cot_plus_probe_mask = torch.cat(
-                                [
-                                    cot_step_attention_mask,
-                                    torch.ones((batch_size, 1), dtype=torch.long, device=current_ref_ids.device),
-                                ],
-                                dim=1,
-                            )
-                            probe_positions = torch.full(
-                                (batch_size,),
-                                cot_plus_probe_ids.shape[1] - 1,
-                                dtype=torch.long,
-                                device=cot_plus_probe_ids.device,
-                            )
-                            backward_record = {
-                                "input_ids": cot_plus_probe_ids,
-                                "attention_mask": cot_plus_probe_mask,
-                                "probe_positions": probe_positions,
-                                "latent_embd": latent_embd,
-                            }
-                            if self.batch_aux_decoders:
-                                batched_backward_records.append(backward_record)
-                            else:
-                                decoder_backbone = _get_colt_decoder_backbone(self.backward_decoder)
-                                if decoder_backbone is not None:
-                                    cot_hidden = decoder_backbone(
-                                        input_ids=cot_plus_probe_ids,
-                                        attention_mask=cot_plus_probe_mask,
-                                        use_cache=False,
-                                    )[0]
-                                else:
-                                    cot_outputs = self.backward_decoder(
-                                        input_ids=cot_plus_probe_ids,
-                                        attention_mask=cot_plus_probe_mask,
-                                        use_cache=False,
-                                        output_hidden_states=True,
-                                    )
-                                    cot_hidden = cot_outputs.hidden_states[-1]
-                                backward_loss = _compute_colt_backward_alignment_loss(
-                                    cot_hidden,
-                                    latent_embd,
-                                    self.pj_back,
-                                )
-                                backward_loss_total += backward_loss
-                                backward_steps_num += 1
-                    forward_idx += 1
-
-                    if i == training_latent_steps - 1:
-                        # ------------------------------------------
-                        # D) final answer decoding from latent state
-                        # ------------------------------------------
-                        IGNORE_INDEX = -100
-                        labels = torch.nn.utils.rnn.pad_sequence(answer_id_list, batch_first=True, padding_value=IGNORE_INDEX)
-                        labels = torch.cat(
+                        has_backward_targets = any(length > 0 for length in backward_ref_lens_cpu)
+                        if not self.oracle_k_enabled and not has_backward_targets:
+                            continue
+                        backward_active = active_step and has_backward_targets
+                        # Encode CoT step, then force one extra "probe" step.
+                        # Dummy records keep the same ZeRO-3 call graph but carry zero loss.
+                        probe_token = torch.full(
+                            (batch_size, 1),
+                            self.eos_token_id,
+                            dtype=backward_ref_ids.dtype,
+                            device=backward_ref_ids.device,
+                        )
+                        cot_plus_probe_ids = torch.cat([backward_ref_ids, probe_token], dim=1)
+                        cot_plus_probe_mask = torch.cat(
                             [
-                                torch.full((batch_size, 1), IGNORE_INDEX, dtype=labels.dtype, device=labels.device),
-                                labels,
+                                cot_step_attention_mask,
+                                torch.ones((batch_size, 1), dtype=torch.long, device=current_ref_ids.device),
                             ],
                             dim=1,
                         )
-                        # Decode the final answer in natural language
-                        label_input_ids = torch.nn.utils.rnn.pad_sequence(answer_id_list, batch_first=True, padding_value=self.pad_token_id)
-                        embds = self.model.get_input_embeddings()(label_input_ids)
-                        embds = torch.concat([latent_embd, embds], dim=1)
-                        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else current_seq_len + i
-                        step_cache_position = torch.arange(
-                            past_seen_tokens,
-                            past_seen_tokens + embds.shape[1],
-                            device=latent_embd.device,
+                        probe_positions = torch.full(
+                            (batch_size,),
+                            cot_plus_probe_ids.shape[1] - 1,
+                            dtype=torch.long,
+                            device=cot_plus_probe_ids.device,
                         )
-                        step_attention_mask = torch.ones(
-                            (batch_size, embds.shape[1]), dtype=torch.long, device=latent_embd.device
-                        )
-                        outputs = self.model(inputs_embeds=embds,
-                                    past_key_values=past_key_values,
-                                    cache_position=step_cache_position,
-                                    attention_mask=step_attention_mask,
-                                    position_ids=None,
-                                    **kwargs,
+                        backward_record = {
+                            "input_ids": cot_plus_probe_ids,
+                            "attention_mask": cot_plus_probe_mask,
+                            "probe_positions": probe_positions,
+                            "latent_embd": supervised_latent_embd,
+                            "active": backward_active,
+                        }
+                        if self.batch_aux_decoders:
+                            batched_backward_records.append(backward_record)
+                        else:
+                            decoder_backbone = _get_colt_decoder_backbone(self.backward_decoder)
+                            if decoder_backbone is not None:
+                                cot_hidden = decoder_backbone(
+                                    input_ids=cot_plus_probe_ids,
+                                    attention_mask=cot_plus_probe_mask,
+                                    use_cache=False,
+                                )[0]
+                            else:
+                                cot_outputs = self.backward_decoder(
+                                    input_ids=cot_plus_probe_ids,
+                                    attention_mask=cot_plus_probe_mask,
+                                    use_cache=False,
+                                    output_hidden_states=True,
                                 )
+                                cot_hidden = cot_outputs.hidden_states[-1]
+                            backward_loss = _compute_colt_backward_alignment_loss(
+                                cot_hidden,
+                                supervised_latent_embd,
+                                self.pj_back,
+                            )
+                            backward_loss_total += backward_loss if backward_active else backward_loss * 0.0
+                            if backward_active:
+                                backward_steps_num += 1
 
-                        logits = self.lm_head(outputs[0])          
-                        ce_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
-                        ce_loss_total += ce_loss
+                # D) Decode the final answer once all ranks have completed the
+                # synchronized latent loop, using this rank's local-K state.
+                IGNORE_INDEX = -100
+                labels = torch.nn.utils.rnn.pad_sequence(
+                    answer_id_list, batch_first=True, padding_value=IGNORE_INDEX
+                )
+                labels = torch.cat(
+                    [
+                        torch.full((batch_size, 1), IGNORE_INDEX, dtype=labels.dtype, device=labels.device),
+                        labels,
+                    ],
+                    dim=1,
+                )
+                label_input_ids = torch.nn.utils.rnn.pad_sequence(
+                    answer_id_list, batch_first=True, padding_value=self.pad_token_id
+                )
+                embds = self.model.get_input_embeddings()(label_input_ids)
+                embds = torch.concat([latent_embd, embds], dim=1)
+                past_seen_tokens = (
+                    past_key_values.get_seq_length() if past_key_values is not None else current_seq_len + training_latent_steps
+                )
+                step_cache_position = torch.arange(
+                    past_seen_tokens,
+                    past_seen_tokens + embds.shape[1],
+                    device=latent_embd.device,
+                )
+                step_attention_mask = torch.ones(
+                    (batch_size, embds.shape[1]), dtype=torch.long, device=latent_embd.device
+                )
+                outputs = self.model(
+                    inputs_embeds=embds,
+                    past_key_values=past_key_values,
+                    cache_position=step_cache_position,
+                    attention_mask=step_attention_mask,
+                    position_ids=None,
+                    **kwargs,
+                )
+
+                logits = self.lm_head(outputs[0])
+                ce_loss_total += self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                )
             if self.batch_aux_decoders:
                 forward_losses = _run_colt_forward_decoder_steps(
                     self.decoder,
@@ -2306,9 +2360,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     self.pad_token_id,
                     batched=True,
                 )
-                for backward_loss in backward_losses:
+                for backward_loss, record in zip(backward_losses, batched_backward_records):
                     backward_loss_total += backward_loss
-                    backward_steps_num += 1
+                    if record.get("active", True):
+                        backward_steps_num += 1
 
             forward_loss_total = forward_loss_total / max(forward_steps_num, 1)
             backward_loss_total = backward_loss_total / max(backward_steps_num, 1)

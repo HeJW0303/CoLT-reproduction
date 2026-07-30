@@ -249,6 +249,16 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         self.assertIn("preprocessing_num_workers=1", source)
         self.assertIn('export COLT_TMP_ROOT="$PIPELINE_TMP_ROOT"', source)
 
+    def test_evaluation_acceleration_is_enabled_by_default(self) -> None:
+        eval_source = (SCRIPT_ROOT / "commands" / "eval.sh").read_text(encoding="utf-8")
+        pipeline_source = PIPELINE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('workers="${VLMEVAL_WORKERS_PER_GPU:-3}"', eval_source)
+        self.assertIn('prefetch="${VLMEVAL_PREFETCH:-1}"', eval_source)
+        self.assertIn('empty_cache="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"', eval_source)
+        self.assertNotIn("--workers", pipeline_source.split("evaluate_target()", 1)[1])
+        self.assertNotIn("--prefetch", pipeline_source.split("evaluate_target()", 1)[1])
+
     def test_non_oracle_training_disables_dynamic_k(self) -> None:
         train_source = (SCRIPT_ROOT / "commands" / "train.sh").read_text(encoding="utf-8")
         self.assertEqual(train_source.count("export COLT_ORACLE_K_DYNAMIC_INFERENCE=0"), 2)
