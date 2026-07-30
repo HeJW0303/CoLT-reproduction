@@ -108,8 +108,18 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             ["sampling_max256", "greedy_max8192", "greedy_max8192_prevent-empty"],
         )
 
-    def test_root_contains_only_unified_shell_entry(self) -> None:
-        root_shells = sorted(path.name for path in SCRIPT_ROOT.glob("*.sh"))
+    def test_tracked_root_contains_only_unified_shell_entry(self) -> None:
+        pathspec = f":(glob){SCRIPT_ROOT.relative_to(REPO_ROOT)}/*.sh"
+        result = subprocess.run(
+            ["git", "ls-files", pathspec],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        root_shells = sorted(Path(path).name for path in result.stdout.splitlines())
         self.assertEqual(root_shells, ["colt.sh"])
 
     def test_baseline_rejects_sampling_protocol_before_runtime_init(self) -> None:
