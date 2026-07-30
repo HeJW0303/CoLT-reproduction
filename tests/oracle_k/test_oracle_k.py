@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +30,9 @@ def load_module(name: str, path: Path):
 oracle_k = load_module("test_colt_oracle_k", QWEN_MODULE_ROOT / "oracle_k.py")
 segmenter = load_module("test_colt_segment_teacher_blocks", REPO_ROOT / "scripts/oracle_k/segment_teacher_blocks.py")
 packager = load_module("test_colt_package_oracle_dataset", REPO_ROOT / "scripts/oracle_k/package_oracle_dataset.py")
+register_dataset = load_module(
+    "test_colt_register_oracle_dataset", REPO_ROOT / "scripts/oracle_k/register_oracle_dataset.py"
+)
 modeling_oracle_k = (
     load_module("test_colt_modeling_oracle_k", QWEN_MODULE_ROOT / "modeling_oracle_k.py")
     if torch is not None
@@ -37,6 +42,43 @@ modeling_oracle_k = (
 
 class DummyConfig:
     pass
+
+
+class OracleKDatasetRegistrationTest(unittest.TestCase):
+    def test_legacy_registration_is_upgraded_with_role_tags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry_path = Path(directory) / "dataset_info.json"
+            legacy_entry = {
+                "file_name": "oracle/colt_sft_image_oracle_k.json",
+                "formatting": "sharegpt",
+                "columns": {"messages": "messages", "images": "images"},
+            }
+            registry_path.write_text(
+                json.dumps({"onethinker_sft_image_oracle_k": legacy_entry}),
+                encoding="utf-8",
+            )
+            argv = [
+                "register_oracle_dataset.py",
+                "--dataset-info",
+                str(registry_path),
+                "--file-name",
+                legacy_entry["file_name"],
+            ]
+            with patch.object(sys, "argv", argv):
+                register_dataset.main()
+
+            registered = json.loads(registry_path.read_text(encoding="utf-8"))[
+                "onethinker_sft_image_oracle_k"
+            ]
+            self.assertEqual(
+                registered["tags"],
+                {
+                    "role_tag": "role",
+                    "content_tag": "content",
+                    "user_tag": "user",
+                    "assistant_tag": "assistant",
+                },
+            )
 
 
 class OracleKFormatTest(unittest.TestCase):

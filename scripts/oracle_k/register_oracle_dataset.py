@@ -14,13 +14,22 @@ def main() -> None:
 
     with args.dataset_info.open(encoding="utf-8") as file:
         dataset_info = json.load(file)
-    entry = {
+    legacy_entry = {
         "file_name": args.file_name,
         "formatting": "sharegpt",
         "columns": {"messages": "messages", "images": "images"},
     }
+    entry = {
+        **legacy_entry,
+        "tags": {
+            "role_tag": "role",
+            "content_tag": "content",
+            "user_tag": "user",
+            "assistant_tag": "assistant",
+        },
+    }
     existing = dataset_info.get(args.dataset_name)
-    if existing is not None and existing != entry:
+    if existing is not None and existing not in (entry, legacy_entry):
         raise ValueError(f"Existing {args.dataset_name} registration differs: {existing}")
     dataset_info[args.dataset_name] = entry
 
