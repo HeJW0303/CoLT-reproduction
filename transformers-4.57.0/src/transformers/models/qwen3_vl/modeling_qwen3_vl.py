@@ -19,6 +19,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -1706,6 +1708,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.oracle_k_dynamic_inference = oracle_k_settings.dynamic_inference
         self.last_oracle_k_prediction = None
         self.last_oracle_k_used = None
+        self._oracle_k_predictor_preflight_done = False
+        self._oracle_k_first_batch_logged = False
+        self._oracle_k_metric_loss_sum = None
+        self._oracle_k_metric_correct = None
+        self._oracle_k_metric_count = None
         if self.oracle_k_enabled and self.oracle_k_predictor_enabled:
             self.oracle_k_predictor = OracleKPredictor(
                 self.oracle_k_max,
@@ -1836,8 +1843,208 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     def _predict_oracle_k(self, hidden_states, attention_mask):
         if self.oracle_k_predictor is None:
             return None
+        self._prepare_oracle_k_predictor()
         pooled_hidden = self._pool_question_hidden(hidden_states, attention_mask)
         return self.oracle_k_predictor(pooled_hidden)
+
+    @staticmethod
+    def _oracle_k_flag(name, default="0"):
+        return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _oracle_k_parameter_stats(name, parameter):
+        values = parameter.detach().float()
+        finite = torch.isfinite(values)
+        finite_values = values[finite]
+        stats = {
+            "name": name,
+            "shape": list(values.shape),
+            "numel": values.numel(),
+            "nonfinite": int((~finite).sum().item()),
+        }
+        if finite_values.numel() > 0:
+            stats.update(
+                mean=float(finite_values.mean().item()),
+                std=float(finite_values.std(unbiased=False).item()),
+                min=float(finite_values.min().item()),
+                max=float(finite_values.max().item()),
+                abs_max=float(finite_values.abs().max().item()),
+            )
+        return stats
+
+    def _oracle_k_predictor_audit(self, phase):
+        parameters = [
+            self._oracle_k_parameter_stats(name, parameter)
+            for name, parameter in self.oracle_k_predictor.named_parameters()
+        ]
+        output_weight = self.oracle_k_predictor.network[-1].weight.detach().float()
+        pairwise = []
+        for left in range(output_weight.shape[0]):
+            for right in range(left + 1, output_weight.shape[0]):
+                difference = (output_weight[left] - output_weight[right]).abs().max()
+                pairwise.append(
+                    {
+                        "rows": [left + 1, right + 1],
+                        "max_abs_diff": float(difference.item()),
+                        "cosine": float(
+                            F.cosine_similarity(output_weight[left], output_weight[right], dim=0).item()
+                        ),
+                    }
+                )
+        closest_rows = min(pairwise, key=lambda item: item["max_abs_diff"])
+        row_norms = output_weight.norm(dim=1).cpu().tolist()
+        print(
+            "[oracle-k-predictor-audit] "
+            + json.dumps(
+                {
+                    "phase": phase,
+                    "parameters": parameters,
+                    "output_row_norms": row_norms,
+                    "closest_output_rows": closest_rows,
+                    "exact_duplicate_output_rows": [
+                        item["rows"] for item in pairwise if item["max_abs_diff"] == 0.0
+                    ],
+                },
+                sort_keys=True,
+            )
+        )
+
+    def _reset_oracle_k_predictor(self):
+        initializer_range = float(getattr(self.config.get_text_config(), "initializer_range", 0.02))
+        output_std = float(os.environ.get("COLT_ORACLE_K_PREDICTOR_OUTPUT_STD", "0.001"))
+        seed = int(os.environ.get("COLT_ORACLE_K_PREDICTOR_INIT_SEED", "1234"))
+        parameter = next(self.oracle_k_predictor.parameters())
+        devices = [parameter.device.index] if parameter.is_cuda else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            self.oracle_k_predictor.reset_parameters(initializer_range, output_std)
+
+    def _prepare_oracle_k_predictor(self):
+        if self._oracle_k_predictor_preflight_done or self.oracle_k_predictor is None:
+            return
+
+        initialize = self.training and self._oracle_k_flag("COLT_ORACLE_K_INITIALIZE_PREDICTOR")
+        diagnostics = self._oracle_k_flag("COLT_ORACLE_K_DIAGNOSTICS")
+        parameters = list(self.oracle_k_predictor.parameters())
+        zero_partitioned = any(hasattr(parameter, "ds_id") for parameter in parameters)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        gathered_context = contextlib.nullcontext()
+        if zero_partitioned:
+            import deepspeed
+
+            gathered_context = deepspeed.zero.GatheredParameters(
+                parameters,
+                modifier_rank=0 if initialize else None,
+            )
+
+        with gathered_context:
+            if diagnostics and rank == 0:
+                self._oracle_k_predictor_audit("loaded")
+            if initialize and (zero_partitioned is False or rank == 0):
+                self._reset_oracle_k_predictor()
+            if diagnostics and initialize and rank == 0:
+                self._oracle_k_predictor_audit("reset")
+
+        if initialize and not zero_partitioned and torch.distributed.is_initialized():
+            for parameter in parameters:
+                torch.distributed.broadcast(parameter.data, src=0)
+
+        self._oracle_k_predictor_preflight_done = True
+
+    def _log_oracle_k_first_batch(self, k_logits, k_targets, predicted_k):
+        if self._oracle_k_first_batch_logged:
+            return
+        diagnostics = self._oracle_k_flag("COLT_ORACLE_K_DIAGNOSTICS")
+        strict = self._oracle_k_flag("COLT_ORACLE_K_STRICT_INITIALIZATION")
+        if not diagnostics and not strict:
+            self._oracle_k_first_batch_logged = True
+            return
+
+        local_loss_sum = F.cross_entropy(k_logits.float(), k_targets, reduction="sum").detach()
+        local_count = torch.tensor(k_targets.numel(), dtype=torch.float32, device=k_logits.device)
+        local_abs_max = k_logits.detach().float().abs().max()
+        summary = torch.stack([local_loss_sum, local_count, local_abs_max])
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(summary[:2], op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(summary[2], op=torch.distributed.ReduceOp.MAX)
+        global_loss = summary[0] / summary[1].clamp_min(1)
+
+        gathered_logits = [k_logits.detach().float()]
+        gathered_targets = [k_targets.detach()]
+        gathered_predictions = [predicted_k.detach()]
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            gathered_logits = [torch.empty_like(gathered_logits[0]) for _ in range(world_size)]
+            gathered_targets = [torch.empty_like(gathered_targets[0]) for _ in range(world_size)]
+            gathered_predictions = [torch.empty_like(gathered_predictions[0]) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_logits, k_logits.detach().float())
+            torch.distributed.all_gather(gathered_targets, k_targets.detach())
+            torch.distributed.all_gather(gathered_predictions, predicted_k.detach())
+
+        if _is_colt_rank_zero() and diagnostics:
+            records = []
+            for rank, (rank_logits, rank_targets, rank_predictions) in enumerate(
+                zip(gathered_logits, gathered_targets, gathered_predictions)
+            ):
+                for index in range(rank_targets.numel()):
+                    records.append(
+                        {
+                            "rank": rank,
+                            "sample": index,
+                            "logits": rank_logits[index].cpu().tolist(),
+                            "gt_k": int(rank_targets[index].item()) + 1,
+                            "predicted_k": int(rank_predictions[index].item()),
+                        }
+                    )
+            print(
+                "[oracle-k-initial-batch] "
+                + json.dumps(
+                    {
+                        "global_cross_entropy": float(global_loss.item()),
+                        "global_abs_max_logit": float(summary[2].item()),
+                        "records": records,
+                    },
+                    sort_keys=True,
+                )
+            )
+
+        if strict:
+            loss_value = float(global_loss.item())
+            logit_abs_max = float(summary[2].item())
+            if not (1.0 <= loss_value <= 4.0) or not (logit_abs_max <= 10.0):
+                raise RuntimeError(
+                    "Oracle-K predictor initialization failed: "
+                    f"global CE={loss_value:.6g}, max_abs_logit={logit_abs_max:.6g}"
+                )
+        self._oracle_k_first_batch_logged = True
+
+    def _accumulate_oracle_k_metrics(self, k_logits, k_targets, predicted_k):
+        loss_sum = F.cross_entropy(k_logits.float(), k_targets, reduction="sum").detach()
+        correct = (predicted_k == k_targets + 1).detach().float().sum()
+        count = torch.tensor(k_targets.numel(), dtype=torch.float32, device=k_logits.device)
+        if self._oracle_k_metric_loss_sum is None:
+            self._oracle_k_metric_loss_sum = loss_sum
+            self._oracle_k_metric_correct = correct
+            self._oracle_k_metric_count = count
+        else:
+            self._oracle_k_metric_loss_sum += loss_sum
+            self._oracle_k_metric_correct += correct
+            self._oracle_k_metric_count += count
+
+    def _flush_oracle_k_metrics(self):
+        if self._oracle_k_metric_loss_sum is None:
+            return None
+        totals = torch.stack(
+            [self._oracle_k_metric_loss_sum, self._oracle_k_metric_correct, self._oracle_k_metric_count]
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        self._oracle_k_metric_loss_sum = None
+        self._oracle_k_metric_correct = None
+        self._oracle_k_metric_count = None
+        count = totals[2].clamp_min(1)
+        return totals[0] / count, totals[1] / count, totals[2]
 
     def _resolve_latent_steps_for_inference(self, num_hidden_generations, predicted_k=None):
         if not self.oracle_k_enabled:
@@ -2046,6 +2253,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 )
                 k_loss_total = F.cross_entropy(k_logits.float(), k_targets)
                 k_accuracy = (predicted_k == k_targets + 1).float().mean()
+                self._log_oracle_k_first_batch(k_logits, k_targets, predicted_k)
+                self._accumulate_oracle_k_metrics(k_logits, k_targets, predicted_k)
             else:
                 k_loss_total = hidden_states.new_zeros(())
                 k_accuracy = hidden_states.new_zeros(())
@@ -2370,9 +2579,17 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             prediction_loss_total = prediction_loss_total / max(prediction_steps_num, 1)
             self._colt_forward_microbatch_count += 1
             component_log_interval = _colt_component_log_interval()
-            if (
+            should_log_components = (
                 component_log_interval > 0
                 and self._colt_forward_microbatch_count % component_log_interval == 0
+            )
+            global_k_metrics = None
+            if should_log_components and self.oracle_k_predictor_enabled:
+                # Every rank must participate. This aggregates the full effective
+                # optimizer batch instead of reporting rank 0's final microbatch.
+                global_k_metrics = self._flush_oracle_k_metrics()
+            if (
+                should_log_components
                 and _is_colt_rank_zero()
             ):
                 component_losses = torch.stack(
@@ -2381,8 +2598,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         forward_loss_total.detach().float(),
                         backward_loss_total.detach().float(),
                         prediction_loss_total.detach().float(),
-                        k_loss_total.detach().float(),
-                        k_accuracy.detach().float(),
                     ]
                 ).cpu().tolist()
                 print(f"ce_loss_total : {component_losses[0]}")
@@ -2390,8 +2605,12 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 print(f"backward_loss_total : {component_losses[2]}")
                 print(f"prediction_loss_total : {component_losses[3]}")
                 if self.oracle_k_predictor_enabled:
-                    print(f"k_loss_total : {component_losses[4]}")
-                    print(f"k_accuracy : {component_losses[5]}")
+                    global_k_loss, global_k_accuracy, global_k_samples = (
+                        metric.detach().float().cpu().item() for metric in global_k_metrics
+                    )
+                    print(f"k_loss_total : {global_k_loss}")
+                    print(f"k_accuracy : {global_k_accuracy}")
+                    print(f"k_samples_global : {int(global_k_samples)}")
             loss = (
                 ce_loss_total
                 + self.forward_align_weight * forward_loss_total

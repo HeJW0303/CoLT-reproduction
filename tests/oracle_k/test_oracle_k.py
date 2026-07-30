@@ -478,6 +478,7 @@ class OracleKConditionerTest(unittest.TestCase):
 
     def test_k_predictor_outputs_all_classes_and_receives_gradients(self):
         predictor = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=6)
+        predictor.reset_parameters(initializer_range=0.02, output_std=0.001)
         pooled_hidden = torch.randn(3, 6, requires_grad=True)
 
         logits = predictor(pooled_hidden)
@@ -487,6 +488,39 @@ class OracleKConditionerTest(unittest.TestCase):
         self.assertEqual(logits.shape, (3, 8))
         self.assertGreater(predictor.network[-1].weight.grad.abs().sum().item(), 0)
         self.assertGreater(pooled_hidden.grad.abs().sum().item(), 0)
+
+    def test_k_predictor_reset_is_deterministic_and_well_scaled(self):
+        first = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=64)
+        second = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=64)
+        torch.manual_seed(1234)
+        first.reset_parameters(initializer_range=0.02, output_std=0.001)
+        torch.manual_seed(1234)
+        second.reset_parameters(initializer_range=0.02, output_std=0.001)
+
+        for first_parameter, second_parameter in zip(first.parameters(), second.parameters()):
+            self.assertTrue(torch.equal(first_parameter, second_parameter))
+            self.assertTrue(torch.isfinite(first_parameter).all())
+
+        output_weight = first.network[-1].weight
+        self.assertGreater(output_weight.std().item(), 0.0008)
+        self.assertLess(output_weight.std().item(), 0.0012)
+        self.assertEqual(torch.count_nonzero(first.network[-1].bias).item(), 0)
+        for left in range(8):
+            for right in range(left + 1, 8):
+                self.assertFalse(torch.equal(output_weight[left], output_weight[right]))
+
+        logits = first(torch.randn(16, 64))
+        targets = torch.arange(16) % 8
+        initial_loss = torch.nn.functional.cross_entropy(logits.float(), targets).item()
+        self.assertGreater(initial_loss, 1.5)
+        self.assertLess(initial_loss, 3.0)
+
+    def test_k_predictor_reset_rejects_invalid_scales(self):
+        predictor = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=6)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            predictor.reset_parameters(initializer_range=0.0, output_std=0.001)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            predictor.reset_parameters(initializer_range=0.02, output_std=0.0)
 
     def test_k_predictor_rejects_unpooled_hidden_states(self):
         predictor = modeling_oracle_k.OracleKPredictor(max_k=8, hidden_size=6)

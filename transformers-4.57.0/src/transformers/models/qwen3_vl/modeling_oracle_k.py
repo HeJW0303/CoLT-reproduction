@@ -72,3 +72,17 @@ class OracleKPredictor(nn.Module):
         if pooled_hidden.ndim != 2:
             raise ValueError(f"K predictor expects [batch, hidden], got {tuple(pooled_hidden.shape)}")
         return self.network(pooled_hidden)
+
+    @torch.no_grad()
+    def reset_parameters(self, initializer_range: float = 0.02, output_std: float = 1e-3) -> None:
+        """Initialize the new classification head without producing saturated initial logits."""
+        if initializer_range <= 0 or output_std <= 0:
+            raise ValueError("Oracle-K predictor initialization scales must be positive")
+
+        layer_norm, input_projection, _, output_projection = self.network
+        nn.init.ones_(layer_norm.weight)
+        nn.init.zeros_(layer_norm.bias)
+        nn.init.normal_(input_projection.weight, mean=0.0, std=initializer_range)
+        nn.init.zeros_(input_projection.bias)
+        nn.init.normal_(output_projection.weight, mean=0.0, std=output_std)
+        nn.init.zeros_(output_projection.bias)

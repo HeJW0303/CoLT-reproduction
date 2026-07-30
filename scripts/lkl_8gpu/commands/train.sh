@@ -57,6 +57,11 @@ cmd_train() {
       export COLT_ORACLE_K_PREDICTOR_ENABLED="${COLT_ORACLE_K_PREDICTOR_ENABLED:-1}"
       export COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT="${COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT:-0.2}"
       export COLT_ORACLE_K_DYNAMIC_INFERENCE="${COLT_ORACLE_K_DYNAMIC_INFERENCE:-1}"
+      export COLT_ORACLE_K_INITIALIZE_PREDICTOR="${COLT_ORACLE_K_INITIALIZE_PREDICTOR:-$((1 - resume))}"
+      export COLT_ORACLE_K_STRICT_INITIALIZATION="${COLT_ORACLE_K_STRICT_INITIALIZATION:-$((1 - resume))}"
+      export COLT_ORACLE_K_DIAGNOSTICS="${COLT_ORACLE_K_DIAGNOSTICS:-1}"
+      export COLT_ORACLE_K_PREDICTOR_OUTPUT_STD="${COLT_ORACLE_K_PREDICTOR_OUTPUT_STD:-0.001}"
+      export COLT_ORACLE_K_PREDICTOR_INIT_SEED="${COLT_ORACLE_K_PREDICTOR_INIT_SEED:-1234}"
       export COLT_ORACLE_K_DATASET_NAME="${COLT_ORACLE_K_DATASET_NAME:-onethinker_sft_image_oracle_k}"
       export COLT_ORACLE_K_DATA_FILE="${COLT_ORACLE_K_DATA_FILE:-$DATA_ROOT/colt_sft_image_oracle_k.json}"
       export COLT_ORACLE_K_TOKENIZED_PATH="${COLT_ORACLE_K_TOKENIZED_PATH:-$CACHE_ROOT/colt/onethinker_sft_oracle_k_predictor_tokenized}"
@@ -65,6 +70,15 @@ cmd_train() {
       ;;
     *) die "Unknown training target: $target" ;;
   esac
+
+  if [[ "$target" == oracle-k ]]; then
+    [[ "$COLT_ORACLE_K_INITIALIZE_PREDICTOR" == 0 || "$COLT_ORACLE_K_INITIALIZE_PREDICTOR" == 1 ]] || \
+      die "COLT_ORACLE_K_INITIALIZE_PREDICTOR must be 0 or 1"
+    [[ "$COLT_ORACLE_K_STRICT_INITIALIZATION" == 0 || "$COLT_ORACLE_K_STRICT_INITIALIZATION" == 1 ]] || \
+      die "COLT_ORACLE_K_STRICT_INITIALIZATION must be 0 or 1"
+    [[ "$resume" == 0 || "$COLT_ORACLE_K_INITIALIZE_PREDICTOR" == 0 ]] || \
+      die "A resumed Oracle-K run must not reinitialize the trained K predictor"
+  fi
 
   record_prefix="${COLT_TRAIN_RECORD_PREFIX:-$record_prefix}"
   log_prefix="${COLT_TRAIN_LOG_PREFIX:-$log_prefix}"
@@ -132,6 +146,11 @@ cmd_train() {
     printf 'COLT_ORACLE_K_ENABLED=%s\n' "$COLT_ORACLE_K_ENABLED"
     printf 'COLT_ORACLE_K_PREDICTOR_ENABLED=%s\n' "$COLT_ORACLE_K_PREDICTOR_ENABLED"
     printf 'COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT=%s\n' "${COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT:-0.2}"
+    printf 'COLT_ORACLE_K_INITIALIZE_PREDICTOR=%s\n' "${COLT_ORACLE_K_INITIALIZE_PREDICTOR:-0}"
+    printf 'COLT_ORACLE_K_STRICT_INITIALIZATION=%s\n' "${COLT_ORACLE_K_STRICT_INITIALIZATION:-0}"
+    printf 'COLT_ORACLE_K_DIAGNOSTICS=%s\n' "${COLT_ORACLE_K_DIAGNOSTICS:-0}"
+    printf 'COLT_ORACLE_K_PREDICTOR_OUTPUT_STD=%s\n' "${COLT_ORACLE_K_PREDICTOR_OUTPUT_STD:-0.001}"
+    printf 'COLT_ORACLE_K_PREDICTOR_INIT_SEED=%s\n' "${COLT_ORACLE_K_PREDICTOR_INIT_SEED:-1234}"
   } > "$run_record/environment.txt"
   echo "Training target: $target"
   echo "Training log: $log_file"
