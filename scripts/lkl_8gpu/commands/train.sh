@@ -82,7 +82,7 @@ cmd_train() {
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 WANDB_MODE="${WANDB_MODE:-offline}"
   export WANDB_PROJECT="${WANDB_PROJECT:-CoLT-reproduction}"
 
-  local config_output
+  local config_output deepspeed_config
   config_output="$(python -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["output_dir"])' "$train_config")"
   [[ "$config_output" == "$output_dir" ]] || die \
     "Config output_dir ($config_output) does not match guarded output directory ($output_dir)."
@@ -109,7 +109,10 @@ cmd_train() {
   local log_file="$LOG_ROOT/${log_prefix}_${run_stamp}.log"
   mkdir -p "$run_record"
   cp "$train_config" "$run_record/"
-  cp "$REPO_ROOT/LLaMA-Factory/examples/deepspeed/ds_z3_a100.json" "$run_record/"
+  deepspeed_config="$(python -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["deepspeed"])' "$train_config")"
+  [[ "$deepspeed_config" == /* ]] || deepspeed_config="$REPO_ROOT/$deepspeed_config"
+  [[ -f "$deepspeed_config" ]] || die "Missing DeepSpeed config: $deepspeed_config"
+  cp "$deepspeed_config" "$run_record/"
   cp -R "$COLT_SCRIPT_ROOT" "$run_record/lkl_8gpu"
   cp "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py" "$run_record/"
   [[ ! -f "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py" ]] || \

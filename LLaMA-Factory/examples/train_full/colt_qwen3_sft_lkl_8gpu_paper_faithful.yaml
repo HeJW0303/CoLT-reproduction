@@ -13,7 +13,7 @@ do_train: true
 finetuning_type: full
 freeze_vision_tower: true
 freeze_multi_modal_projector: true
-deepspeed: LLaMA-Factory/examples/deepspeed/ds_z3_a100.json
+deepspeed: LLaMA-Factory/examples/deepspeed/ds_z3_8gpu.json
 
 ### dataset
 dataset: onethinker_sft_image

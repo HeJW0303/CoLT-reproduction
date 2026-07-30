@@ -20,7 +20,7 @@ EVAL_DATA_ROOT="${COLT_EVAL_DATA_ROOT:-$REPO_ROOT/eval/LMUData}"
 PIPELINE_ROOT="${COLT_PIPELINE_ROOT:-$REPO_ROOT/pipeline_runs}"
 PIPELINE_CACHE_ROOT="${COLT_PIPELINE_CACHE_ROOT:-$REPO_ROOT/cache}"
 RUNTIME_ROOT="${COLT_LKL_ROOT:-$PIPELINE_ROOT/runtime}"
-GPU_PROFILE="${COLT_GPU_PROFILE:-a100}"
+GPU_PROFILE="${COLT_GPU_PROFILE:-generic}"
 GPU_CSV="${COLT_PIPELINE_GPUS:-0,1,2,3,4,5,6,7}"
 
 mode=full
@@ -78,7 +78,7 @@ done
 [[ -d "$DECODER_MODEL_DIR" ]] || die "Missing decoder model directory: $DECODER_MODEL_DIR"
 [[ -d "$TRAIN_DATA_DIR" ]] || die "Missing training dataset directory: $TRAIN_DATA_DIR"
 [[ -f "$TRAIN_DATA_DIR/dataset_info.json" ]] || die "Missing dataset registry: $TRAIN_DATA_DIR/dataset_info.json"
-[[ "$GPU_PROFILE" == a100 || "$GPU_PROFILE" == a800 ]] || die "COLT_GPU_PROFILE must be a100 or a800"
+[[ -n "$GPU_PROFILE" ]] || die "COLT_GPU_PROFILE cannot be empty"
 [[ "$GPU_CSV" == "0,1,2,3,4,5,6,7" ]] || die "This pipeline requires all 8 GPUs in order: 0,1,2,3,4,5,6,7"
 
 for model_dir in "$BASE_MODEL_DIR" "$DECODER_MODEL_DIR"; do
@@ -197,7 +197,7 @@ config.update(
     tokenized_path=tokenized_path,
     output_dir=output_dir,
     run_name=run_name,
-    deepspeed=str(Path(repo_root) / "LLaMA-Factory/examples/deepspeed/ds_z3_a100.json"),
+    deepspeed=str(Path(repo_root) / "LLaMA-Factory/examples/deepspeed/ds_z3_8gpu.json"),
 )
 if mode == "smoke":
     config.update(

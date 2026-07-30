@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 cmd_profile() {
-  local profile="${1:-}"
-  [[ "$profile" == "a100" || "$profile" == "a800" ]] || die "Usage: colt.sh profile {a100|a800}"
+  local profile="${1:-generic}"
+  [[ "$profile" =~ ^[a-zA-Z0-9._-]+$ ]] || die "GPU profile label contains invalid characters: $profile"
   export COLT_GPU_PROFILE="$profile"
   runtime_init
   require_workspace_layout
@@ -15,7 +15,7 @@ cmd_profile() {
   local profile_tmp="$PROFILE_FILE.tmp.$$"
   printf '%s\n' "$profile" > "$profile_tmp"
   mv "$profile_tmp" "$PROFILE_FILE"
-  echo "Profile saved: $profile ($COLT_EXPECTED_GPU_NAME) -> $PROFILE_FILE"
+  echo "Profile saved: $profile (${COLT_EXPECTED_GPU_NAME:-any 8-GPU model}) -> $PROFILE_FILE"
   nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 }
 

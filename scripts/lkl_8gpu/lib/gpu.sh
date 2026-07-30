@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 
 validate_gpu_profile() {
-  local -a gpu_names
+  local -a gpu_names=()
   require_command nvidia-smi
-  mapfile -t gpu_names < <(nvidia-smi --query-gpu=name --format=csv,noheader | sed 's/[[:space:]]*$//')
+  local detected_name
+  while IFS= read -r detected_name; do
+    gpu_names+=("$detected_name")
+  done < <(nvidia-smi --query-gpu=name --format=csv,noheader | sed 's/[[:space:]]*$//')
   [[ "${#gpu_names[@]}" -eq 8 ]] || die "Profile expects 8 GPUs; found ${#gpu_names[@]}."
-  local gpu_name
-  for gpu_name in "${gpu_names[@]}"; do
-    [[ "$gpu_name" == *"$COLT_EXPECTED_GPU_NAME"* ]] || die \
-      "Profile $COLT_GPU_PROFILE expects $COLT_EXPECTED_GPU_NAME; found $gpu_name."
-  done
+  if [[ -n "${COLT_EXPECTED_GPU_NAME:-}" ]]; then
+    local gpu_name
+    for gpu_name in "${gpu_names[@]}"; do
+      [[ "$gpu_name" == *"$COLT_EXPECTED_GPU_NAME"* ]] || die \
+        "Profile $COLT_GPU_PROFILE expects $COLT_EXPECTED_GPU_NAME; found $gpu_name."
+    done
+  fi
 }
 
 parse_gpu_csv() {

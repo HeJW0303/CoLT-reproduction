@@ -234,6 +234,7 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             self.assertEqual(oracle_config["dataset"], "onethinker_sft_image_oracle_k")
             self.assertNotEqual(paper_config["output_dir"], oracle_config["output_dir"])
             self.assertTrue(Path(paper_config["deepspeed"]).is_absolute())
+            self.assertTrue(paper_config["deepspeed"].endswith("ds_z3_8gpu.json"))
             self.assertNotIn("--workers", result.stdout)
             self.assertNotIn("--prefetch", result.stdout)
             self.assertIn("eval paper-faithful all8", result.stdout)
@@ -258,6 +259,27 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         self.assertIn('empty_cache="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"', eval_source)
         self.assertNotIn("--workers", pipeline_source.split("evaluate_target()", 1)[1])
         self.assertNotIn("--prefetch", pipeline_source.split("evaluate_target()", 1)[1])
+
+    def test_generic_profile_accepts_any_eight_gpu_models(self) -> None:
+        result = self.run_bash(
+            f'source "{SCRIPT_ROOT}/lib/runtime.sh"; '
+            f'source "{SCRIPT_ROOT}/lib/gpu.sh"; '
+            'COLT_GPU_PROFILE=generic; '
+            'load_gpu_profile; '
+            'nvidia-smi() { '
+            'if [[ "$*" == *"--query-gpu=name"* ]]; then '
+            'printf "NVIDIA H20\\n%.0s" {1..8}; '
+            'else return 1; fi; }; '
+            'validate_gpu_profile; '
+            'printf "%s\\n%s\\n" "$COLT_GPU_PROFILE" "$COLT_DEFAULT_EVAL_GPUS"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["generic", "0,1,2,3,4,5,6,7"])
+
+    def test_pipeline_does_not_require_a_gpu_model_profile(self) -> None:
+        source = PIPELINE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('GPU_PROFILE="${COLT_GPU_PROFILE:-generic}"', source)
+        self.assertNotIn("COLT_GPU_PROFILE must be a100 or a800", source)
 
     def test_non_oracle_training_disables_dynamic_k(self) -> None:
         train_source = (SCRIPT_ROOT / "commands" / "train.sh").read_text(encoding="utf-8")

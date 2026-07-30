@@ -25,7 +25,7 @@ cd /data/nvme0/lkl/CoLT-reproduction
 export http_proxy=http://127.0.0.1:7890
 export https_proxy=http://127.0.0.1:7890
 
-bash scripts/lkl_8gpu/colt.sh profile a100  # A800 改为 a800
+bash scripts/lkl_8gpu/colt.sh profile generic
 bash scripts/lkl_8gpu/colt.sh setup all
 bash scripts/lkl_8gpu/colt.sh verify ready
 bash scripts/lkl_8gpu/colt.sh verify nccl
@@ -134,8 +134,10 @@ bash scripts/run_paper_oracle_pipeline.sh
 ```
 
 换机器时只需修改脚本开头的 Conda 初始化脚本、Conda 环境、模型和数据路径，或通过同名
-`COLT_*` 环境变量覆盖。辅助 decoder 合批固定关闭。评测默认每卡 3 个 worker、开启 CPU
-预取、关闭逐样本 `empty_cache()`，无需显式传 `--workers` 或 `--prefetch`。
+`COLT_*` 环境变量覆盖。GPU 型号无需配置，默认 generic profile 只要求单机可见 8 张卡；
+A100/A800 profile 仅用于需要严格校验型号时主动选择。辅助 decoder 合批固定关闭。评测默认
+每卡 3 个 worker、开启 CPU 预取、关闭逐样本 `empty_cache()`，无需显式传 `--workers`
+或 `--prefetch`。
 
 先检查全部路径并打印命令，或执行完整的 1-step 串行冒烟测试：
 

@@ -47,14 +47,14 @@ load_gpu_profile() {
   if [[ -z "${COLT_GPU_PROFILE:-}" && -f "$PROFILE_FILE" ]]; then
     COLT_GPU_PROFILE="$(tr -d '[:space:]' < "$PROFILE_FILE")"
   fi
-  case "${COLT_GPU_PROFILE:-}" in
-    a100|a800) ;;
-    *)
-      die "GPU profile is not configured. Run: bash scripts/lkl_8gpu/colt.sh profile a100 (or a800)"
-      ;;
-  esac
-  # shellcheck disable=SC1090
-  source "$COLT_SCRIPT_ROOT/profiles/$COLT_GPU_PROFILE.sh"
+  COLT_GPU_PROFILE="${COLT_GPU_PROFILE:-generic}"
+  COLT_EXPECTED_GPU_NAME=""
+  COLT_DEFAULT_EVAL_GPUS="0,1,2,3,4,5,6,7"
+  local profile_script="$COLT_SCRIPT_ROOT/profiles/$COLT_GPU_PROFILE.sh"
+  if [[ -f "$profile_script" ]]; then
+    # shellcheck disable=SC1090
+    source "$profile_script"
+  fi
   export COLT_GPU_PROFILE CONDA_PKGS_DIRS
 }
 

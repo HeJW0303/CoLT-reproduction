@@ -14,10 +14,10 @@ source "$SCRIPT_DIR/commands/eval.sh"
 
 usage() {
   cat <<'EOF'
-CoLT A100/A800 unified launcher
+CoLT single-node 8-GPU unified launcher
 
 Usage:
-  colt.sh profile {a100|a800}
+  colt.sh profile [generic|a100|a800|LABEL]
   colt.sh setup {env|assets|data|eval|all}
   colt.sh verify {ready|nccl|model TARGET [--model-path PATH]}
   colt.sh train {codefaithful|paper-faithful|oracle-k} [--resume] [--batch-aux]
