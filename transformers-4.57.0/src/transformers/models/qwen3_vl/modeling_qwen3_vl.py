@@ -1843,9 +1843,21 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     def _predict_oracle_k(self, hidden_states, attention_mask):
         if self.oracle_k_predictor is None:
             return None
+        if (
+            self.training
+            and self._oracle_k_flag("COLT_ORACLE_K_REQUIRE_PREOPTIMIZER_INIT")
+            and not self._oracle_k_predictor_preflight_done
+        ):
+            raise RuntimeError(
+                "Oracle-K predictor must be initialized after model loading and before optimizer creation"
+            )
         self._prepare_oracle_k_predictor()
         pooled_hidden = self._pool_question_hidden(hidden_states, attention_mask)
         return self.oracle_k_predictor(pooled_hidden)
+
+    def prepare_oracle_k_predictor_for_training(self):
+        """Finalize new-head initialization before ZeRO creates FP32 optimizer master weights."""
+        self._prepare_oracle_k_predictor()
 
     @staticmethod
     def _oracle_k_flag(name, default="0"):

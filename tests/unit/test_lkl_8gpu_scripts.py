@@ -14,6 +14,15 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "lkl_8gpu"
 PIPELINE_SCRIPT = REPO_ROOT / "scripts" / "run_paper_oracle_pipeline.sh"
+SFT_WORKFLOW = (
+    REPO_ROOT
+    / "LLaMA-Factory"
+    / "src"
+    / "llamafactory"
+    / "train"
+    / "sft"
+    / "workflow.py"
+)
 
 
 class Lkl8GpuScriptTests(unittest.TestCase):
@@ -350,6 +359,30 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         oracle_stage = pipeline_source.index("run_stage oracle_train")
         self.assertLess(paper_stage, dynamic_k)
         self.assertLess(dynamic_k, oracle_stage)
+
+    def test_oracle_k_preflight_runs_before_trainer_construction(self) -> None:
+        source = SFT_WORKFLOW.read_text(encoding="utf-8")
+        model_load = source.index("model = load_model(")
+        preflight = source.index("model.prepare_oracle_k_predictor_for_training()")
+        trainer_construction = source.index("trainer = CustomSeq2SeqTrainer(")
+
+        self.assertLess(model_load, preflight)
+        self.assertLess(preflight, trainer_construction)
+        self.assertIn("training_args.do_train", source[model_load:preflight])
+
+    def test_oracle_k_fresh_and_resume_initialization_guards(self) -> None:
+        source = (SCRIPT_ROOT / "commands" / "train.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'COLT_ORACLE_K_INITIALIZE_PREDICTOR:-$((1 - resume))', source
+        )
+        self.assertIn(
+            'COLT_ORACLE_K_REQUIRE_PREOPTIMIZER_INIT:-$((1 - resume))', source
+        )
+        self.assertIn(
+            '[[ "$resume" == 0 || "$COLT_ORACLE_K_INITIALIZE_PREDICTOR" == 0 ]]',
+            source,
+        )
 
 
 if __name__ == "__main__":

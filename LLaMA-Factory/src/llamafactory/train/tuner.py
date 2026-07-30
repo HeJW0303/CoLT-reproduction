@@ -83,6 +83,7 @@ def _training_function(config: dict[str, Any]) -> None:
                 "LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_oracle_k_predictor.yaml",
                 "transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py",
                 "transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py",
+                "LLaMA-Factory/src/llamafactory/train/sft/workflow.py",
                 "scripts/a100/18_train_oracle_k.sh",
                 "scripts/lkl_8gpu/colt.sh",
                 "scripts/lkl_8gpu/commands/train.sh",
