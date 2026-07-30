@@ -12,6 +12,7 @@ EXPECTED_REPO_ROOT="${COLT_EXPECTED_REPO_ROOT:-$LKL_ROOT/CoLT-reproduction}"
 PROJECT_RUNTIME_ROOT="${COLT_RUNTIME_ROOT:-$REPO_ROOT}"
 WORKSPACE_ROOT="$PROJECT_RUNTIME_ROOT"
 MINICONDA_ROOT="${COLT_MINICONDA_ROOT:-$LKL_ROOT/miniconda3}"
+CONDA_INIT_SH="${COLT_CONDA_INIT_SH:-$MINICONDA_ROOT/etc/profile.d/conda.sh}"
 CONDA_ENVS_ROOT="${COLT_CONDA_ENVS_ROOT:-$LKL_ROOT/conda/envs}"
 CONDA_ENV_DIR="${COLT_CONDA_ENV_DIR:-$CONDA_ENVS_ROOT/colt}"
 CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$LKL_ROOT/conda/pkgs}"
@@ -23,8 +24,8 @@ LOG_ROOT="${COLT_LOG_ROOT:-$PROJECT_RUNTIME_ROOT/logs}"
 EVAL_ROOT="${COLT_EVAL_ROOT:-$PROJECT_RUNTIME_ROOT/eval}"
 TMP_ROOT="${COLT_TMP_ROOT:-$PROJECT_RUNTIME_ROOT/tmp}"
 
-BASE_MODEL_DIR="$MODEL_ROOT/Qwen3-VL-8B-Instruct"
-DECODER_MODEL_DIR="$MODEL_ROOT/Qwen3-0.6B"
+BASE_MODEL_DIR="${COLT_BASE_MODEL_DIR:-$MODEL_ROOT/Qwen3-VL-8B-Instruct}"
+DECODER_MODEL_DIR="${COLT_DECODER_MODEL_DIR:-$MODEL_ROOT/Qwen3-0.6B}"
 OFFICIAL_MODEL_DIR_DEFAULT="$MODEL_ROOT/hub/models--hulianyuyy--CoLT-8B/snapshots/8e649ea84e7ae5b6c78b98272a0cd43537fcc66c"
 VLMEVAL_ROOT="$REPO_ROOT/Evaluation/VLMEvalKit"
 
@@ -111,12 +112,11 @@ require_workspace_layout() {
 }
 
 activate_colt_env() {
-  local conda_sh="$MINICONDA_ROOT/etc/profile.d/conda.sh"
-  [[ -f "$conda_sh" ]] || die "Missing Miniconda activation script: $conda_sh"
+  [[ -f "$CONDA_INIT_SH" ]] || die "Missing Conda activation script: $CONDA_INIT_SH"
   [[ -x "$CONDA_ENV_DIR/bin/python" ]] || die \
     "Missing Conda environment $CONDA_ENV_DIR. Run: bash scripts/lkl_8gpu/colt.sh setup env"
   # shellcheck disable=SC1090
-  source "$conda_sh"
+  source "$CONDA_INIT_SH"
   conda activate "$CONDA_ENV_DIR"
 }
 

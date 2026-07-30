@@ -123,3 +123,29 @@ bash scripts/lkl_8gpu/colt.sh verify model official --model-path /absolute/model
 
 吞吐 A/B、预处理 A/B 等诊断入口位于 `tests/integration/lkl_8gpu/`，不作为正式训练或
 评测入口。正式流程不要从该目录启动。
+
+## Paper-faithful + Oracle-K 串行复现
+
+仓库级流水线会依次完成 paper-faithful 训练、完整性校验与 8 数据集评测，再从同一个
+Qwen3-VL 基座独立完成 Oracle-K 训练、完整性校验与评测：
+
+```bash
+bash scripts/run_paper_oracle_pipeline.sh
+```
+
+换机器时只需修改脚本开头的 Conda 初始化脚本、Conda 环境、模型和数据路径，或通过同名
+`COLT_*` 环境变量覆盖。辅助 decoder 合批固定关闭。评测默认每卡 3 个 worker、开启 CPU
+预取、关闭逐样本 `empty_cache()`，无需显式传 `--workers` 或 `--prefetch`。
+
+先检查全部路径并打印命令，或执行完整的 1-step 串行冒烟测试：
+
+```bash
+bash scripts/run_paper_oracle_pipeline.sh --dry-run
+bash scripts/run_paper_oracle_pipeline.sh --smoke
+```
+
+流水线为每次运行创建独立目录并记录阶段完成标记。中断后使用日志开头打印的绝对路径恢复：
+
+```bash
+bash scripts/run_paper_oracle_pipeline.sh --run-dir /absolute/pipeline/run
+```

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "lkl_8gpu"
+PIPELINE_SCRIPT = REPO_ROOT / "scripts" / "run_paper_oracle_pipeline.sh"
 
 
 class Lkl8GpuScriptTests(unittest.TestCase):
@@ -145,6 +151,81 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("baseline does not support", result.stderr)
+
+    def test_pipeline_dry_run_generates_isolated_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conda_env = root / "conda" / "envs" / "colt"
+            conda_bin = conda_env / "bin"
+            conda_bin.mkdir(parents=True)
+            (conda_bin / "python").symlink_to(sys.executable)
+            conda_init = root / "conda" / "etc" / "profile.d" / "conda.sh"
+            conda_init.parent.mkdir(parents=True)
+            conda_init.write_text("# dry-run fixture\n", encoding="utf-8")
+
+            base_model = root / "models" / "Qwen3-VL-8B-Instruct"
+            decoder_model = root / "models" / "Qwen3-0.6B"
+            for model in (base_model, decoder_model):
+                model.mkdir(parents=True)
+                (model / "config.json").write_text("{}\n", encoding="utf-8")
+                (model / "model.safetensors").touch()
+
+            train_data = root / "train_data"
+            train_data.mkdir()
+            paper_data = train_data / "colt_sft_image.json"
+            oracle_data = train_data / "colt_sft_image_oracle_k.json"
+            paper_data.write_text("[]\n", encoding="utf-8")
+            oracle_data.write_text("[]\n", encoding="utf-8")
+            registry = {
+                "onethinker_sft_image": {"file_name": paper_data.name},
+                "onethinker_sft_image_oracle_k": {"file_name": oracle_data.name},
+            }
+            (train_data / "dataset_info.json").write_text(
+                json.dumps(registry), encoding="utf-8"
+            )
+
+            run_dir = root / "pipeline_run"
+            environment = os.environ.copy()
+            environment.update(
+                COLT_CONDA_INIT_SH=str(conda_init),
+                COLT_CONDA_ENV_DIR=str(conda_env),
+                COLT_BASE_MODEL_DIR=str(base_model),
+                COLT_DECODER_MODEL_DIR=str(decoder_model),
+                COLT_DATA_ROOT=str(train_data),
+                COLT_ORACLE_K_DATA_FILE=str(oracle_data),
+                COLT_EVAL_DATA_ROOT=str(root / "eval_data"),
+                COLT_PIPELINE_ROOT=str(root / "pipeline_runs"),
+                COLT_PIPELINE_CACHE_ROOT=str(root / "cache"),
+                COLT_PIPELINE_RUN_DIR=str(run_dir),
+                COLT_LKL_ROOT=str(root / "runtime"),
+            )
+            result = subprocess.run(
+                ["bash", str(PIPELINE_SCRIPT), "--dry-run"],
+                cwd=REPO_ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            paper_config = yaml.safe_load(
+                (run_dir / "configs" / "paper_faithful.yaml").read_text(encoding="utf-8")
+            )
+            oracle_config = yaml.safe_load(
+                (run_dir / "configs" / "oracle_k.yaml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(paper_config["model_name_or_path"], str(base_model))
+            self.assertEqual(oracle_config["model_name_or_path"], str(base_model))
+            self.assertEqual(paper_config["dataset"], "onethinker_sft_image")
+            self.assertEqual(oracle_config["dataset"], "onethinker_sft_image_oracle_k")
+            self.assertNotEqual(paper_config["output_dir"], oracle_config["output_dir"])
+            self.assertTrue(Path(paper_config["deepspeed"]).is_absolute())
+            self.assertNotIn("--workers", result.stdout)
+            self.assertNotIn("--prefetch", result.stdout)
+            self.assertIn("eval paper-faithful all8", result.stdout)
+            self.assertIn("eval oracle-k all8", result.stdout)
 
 
 if __name__ == "__main__":
