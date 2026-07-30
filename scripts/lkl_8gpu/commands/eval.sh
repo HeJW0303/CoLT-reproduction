@@ -132,7 +132,7 @@ cmd_eval() {
   validate_gpu_profile
   gpu_csv="${gpu_csv:-${COLT_EVAL_GPUS:-$COLT_DEFAULT_EVAL_GPUS}}"
   parse_gpu_csv "$gpu_csv"
-  require_selected_gpus_free
+  maybe_check_selected_gpus_free
 
   EVAL_DATA_ROOT="${COLT_EVAL_DATA_ROOT:-$EVAL_ROOT/LMUData}"
   EVAL_OUTPUT_ROOT="${COLT_EVAL_OUTPUT_ROOT:-$EVAL_ROOT/results}"

@@ -133,11 +133,19 @@ Qwen3-VL 基座独立完成 Oracle-K 训练、完整性校验与评测：
 bash scripts/run_paper_oracle_pipeline.sh
 ```
 
-换机器时只需修改脚本开头的 Conda 初始化脚本、Conda 环境、模型和数据路径，或通过同名
-`COLT_*` 环境变量覆盖。GPU 型号无需配置，默认 generic profile 只要求单机可见 8 张卡；
-A100/A800 profile 仅用于需要严格校验型号时主动选择。辅助 decoder 合批固定关闭。评测默认
-每卡 3 个 worker、开启 CPU 预取、关闭逐样本 `empty_cache()`，无需显式传 `--workers`
-或 `--prefetch`。
+换机器时先激活已经准备好的 Python 环境，再运行 pipeline；脚本直接复用当前环境，不需要填写
+Conda 安装目录或环境路径：
+
+```bash
+conda activate YOUR_ENV_NAME
+bash scripts/run_paper_oracle_pipeline.sh
+```
+
+只需修改脚本开头的模型和数据路径，或通过同名 `COLT_*` 环境变量覆盖。GPU 型号无需配置，
+默认 generic profile 不限制型号。GPU 空闲显存检查和严格磁盘余量检查默认关闭；需要共享服务器
+上的严格启动保护时设置 `COLT_STRICT_PREFLIGHT=1`，也可只设置 `COLT_CHECK_GPU_FREE=1`。
+辅助 decoder 合批固定关闭。评测默认每卡 3 个 worker、开启 CPU 预取、关闭逐样本
+`empty_cache()`，无需显式传 `--workers` 或 `--prefetch`。
 
 先检查全部路径并打印命令，或执行完整的 1-step 串行冒烟测试：
 

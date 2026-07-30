@@ -28,7 +28,7 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         )
 
     def test_all_shell_files_parse(self) -> None:
-        shell_files = sorted(SCRIPT_ROOT.rglob("*.sh"))
+        shell_files = sorted(SCRIPT_ROOT.rglob("*.sh")) + [PIPELINE_SCRIPT]
         self.assertTrue(shell_files)
         result = subprocess.run(
             ["bash", "-n", *map(str, shell_files)],
@@ -169,9 +169,6 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             conda_bin = conda_env / "bin"
             conda_bin.mkdir(parents=True)
             (conda_bin / "python").symlink_to(sys.executable)
-            conda_init = root / "conda" / "etc" / "profile.d" / "conda.sh"
-            conda_init.parent.mkdir(parents=True)
-            conda_init.write_text("# dry-run fixture\n", encoding="utf-8")
 
             base_model = root / "models" / "Qwen3-VL-8B-Instruct"
             decoder_model = root / "models" / "Qwen3-0.6B"
@@ -200,8 +197,9 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             run_dir = root / "pipeline_run"
             environment = os.environ.copy()
             environment.update(
-                COLT_CONDA_INIT_SH=str(conda_init),
-                COLT_CONDA_ENV_DIR=str(conda_env),
+                CONDA_PREFIX=str(conda_env),
+                CONDA_DEFAULT_ENV="colt",
+                PATH=f"{conda_bin}{os.pathsep}{environment['PATH']}",
                 COLT_BASE_MODEL_DIR=str(base_model),
                 COLT_DECODER_MODEL_DIR=str(decoder_model),
                 COLT_DATA_ROOT=str(train_data),
@@ -243,6 +241,67 @@ class Lkl8GpuScriptTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn(f"oracle_data={oracle_data.resolve()}", environment_text)
+            self.assertIn(f"python={conda_bin / 'python'}", environment_text)
+            self.assertIn(f"active_environment={conda_env}", environment_text)
+
+    def test_runtime_reuses_the_active_conda_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            conda_env = Path(directory) / "friend_env"
+            conda_bin = conda_env / "bin"
+            conda_bin.mkdir(parents=True)
+            (conda_bin / "python").symlink_to(sys.executable)
+            environment = os.environ.copy()
+            environment.update(
+                CONDA_PREFIX=str(conda_env),
+                CONDA_DEFAULT_ENV="friend_env",
+                PATH=f"{conda_bin}{os.pathsep}/usr/bin:/bin",
+                COLT_CONDA_INIT_SH="/path/that/does/not/exist/conda.sh",
+                COLT_CONDA_ENV_DIR="/path/that/does/not/exist/env",
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{SCRIPT_ROOT}/lib/runtime.sh"; activate_colt_env; command -v python',
+                ],
+                cwd=REPO_ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Using active Conda environment: friend_env", result.stdout)
+        self.assertEqual(result.stdout.splitlines()[-1], str(conda_bin / "python"))
+
+    def test_gpu_idle_check_is_opt_in(self) -> None:
+        result = self.run_bash(
+            f'source "{SCRIPT_ROOT}/lib/runtime.sh"; '
+            f'source "{SCRIPT_ROOT}/lib/gpu.sh"; '
+            'COLT_GPU_IDS=(0 1); '
+            'nvidia-smi() { echo "unexpected nvidia-smi call" >&2; return 99; }; '
+            'maybe_check_selected_gpus_free'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GPU idle-memory check: skipped", result.stdout)
+
+    def test_strict_preflight_enables_gpu_idle_check(self) -> None:
+        result = self.run_bash(
+            f'source "{SCRIPT_ROOT}/lib/runtime.sh"; '
+            f'source "{SCRIPT_ROOT}/lib/gpu.sh"; '
+            'COLT_STRICT_PREFLIGHT=1; COLT_GPU_IDS=(0); '
+            'nvidia-smi() { printf "999\n"; }; '
+            'maybe_check_selected_gpus_free'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Physical GPU 0 is not free", result.stderr)
+
+    def test_pipeline_does_not_require_conda_install_paths(self) -> None:
+        source = PIPELINE_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("COLT_CONDA_INIT_SH", source)
+        self.assertNotIn("COLT_CONDA_ENV_DIR", source)
+        self.assertIn('PYTHON_BIN="${COLT_PYTHON:-$(command -v python || true)}"', source)
 
     def test_pipeline_smoke_uses_short_temp_path_and_single_preprocessor(self) -> None:
         source = PIPELINE_SCRIPT.read_text(encoding="utf-8")

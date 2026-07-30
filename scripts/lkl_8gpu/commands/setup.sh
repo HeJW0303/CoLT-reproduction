@@ -209,7 +209,7 @@ verify_nccl() {
   local gpu_csv="${COLT_TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
   parse_gpu_csv "$gpu_csv"
   [[ "${#COLT_GPU_IDS[@]}" -eq 8 ]] || die "NCCL smoke requires exactly 8 GPU ids: $gpu_csv"
-  require_selected_gpus_free
+  maybe_check_selected_gpus_free
   export CUDA_VISIBLE_DEVICES="$gpu_csv"
   export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
   torchrun --standalone --nproc_per_node=8 "$COLT_SCRIPT_ROOT/tools/nccl_smoke.py"

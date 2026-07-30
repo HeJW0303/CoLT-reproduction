@@ -38,6 +38,13 @@ Training options:
 COLT_BATCH_AUX_DECODERS=1 is equivalent to --batch-aux for paper-faithful
 and oracle-k training.
 
+Runtime:
+  Activate the prepared environment before running commands:
+    conda activate <your-env>
+  The launcher reuses the active environment and does not require its path.
+  GPU idle-memory and strict disk checks are opt-in via
+  COLT_CHECK_GPU_FREE=1 or COLT_STRICT_PREFLIGHT=1.
+
 Dataset groups:
   smoke, chartqa, mmstar, phase1, phase2, phase3, remaining7, all8
 

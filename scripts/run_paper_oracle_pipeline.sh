@@ -7,11 +7,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAUNCHER="$REPO_ROOT/scripts/lkl_8gpu/colt.sh"
 
 # -----------------------------------------------------------------------------
-# Edit these defaults for a new machine, or override them with the same-named
-# environment variables. Both training runs intentionally start from BASE_MODEL.
+# Activate the prepared Python environment before running this script. Edit the
+# model/data defaults for a new machine, or override them with COLT_* variables.
+# Both training runs intentionally start from BASE_MODEL.
 # -----------------------------------------------------------------------------
-CONDA_INIT_SH="${COLT_CONDA_INIT_SH:-/data/nvme0/lkl/miniconda3/etc/profile.d/conda.sh}"
-CONDA_ENV_DIR="${COLT_CONDA_ENV_DIR:-/data/nvme0/lkl/conda/envs/colt}"
 BASE_MODEL_DIR="${COLT_BASE_MODEL_DIR:-/data/nvme0/lkl/models/Qwen3-VL-8B-Instruct}"
 DECODER_MODEL_DIR="${COLT_DECODER_MODEL_DIR:-/data/nvme0/lkl/models/Qwen3-0.6B}"
 TRAIN_DATA_DIR="${COLT_DATA_ROOT:-/data/nvme0/lkl/datasets/CoLT_Train_Dataset}"
@@ -39,6 +38,9 @@ Sequence:
 
 Usage:
   bash scripts/run_paper_oracle_pipeline.sh [--smoke] [--dry-run] [--run-dir PATH]
+
+Prerequisite:
+  conda activate <your-prepared-environment>
 
 Options:
   --smoke         Train one optimizer step on 64 samples and evaluate 8 MMStar rows
@@ -71,22 +73,25 @@ while (( $# > 0 )); do
   esac
 done
 
-[[ -x "$CONDA_ENV_DIR/bin/python" ]] || die "Missing Conda Python: $CONDA_ENV_DIR/bin/python"
-[[ -f "$CONDA_INIT_SH" ]] || die "Missing Conda activation script: $CONDA_INIT_SH"
+[[ -n "${CONDA_PREFIX:-}" || -n "${VIRTUAL_ENV:-}" ]] || die \
+  "No Python environment is active. Run 'conda activate <your-env>' first."
+PYTHON_BIN="${COLT_PYTHON:-$(command -v python || true)}"
+[[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]] || die "The active environment does not provide python."
+"$PYTHON_BIN" -c 'import yaml' >/dev/null 2>&1 || die \
+  "The active environment is missing PyYAML. Activate the prepared CoLT environment."
 [[ -f "$LAUNCHER" ]] || die "Missing unified launcher: $LAUNCHER"
 [[ -d "$BASE_MODEL_DIR" ]] || die "Missing base model directory: $BASE_MODEL_DIR"
 [[ -d "$DECODER_MODEL_DIR" ]] || die "Missing decoder model directory: $DECODER_MODEL_DIR"
 [[ -d "$TRAIN_DATA_DIR" ]] || die "Missing training dataset directory: $TRAIN_DATA_DIR"
 [[ -f "$TRAIN_DATA_DIR/dataset_info.json" ]] || die "Missing dataset registry: $TRAIN_DATA_DIR/dataset_info.json"
 [[ -n "$GPU_PROFILE" ]] || die "COLT_GPU_PROFILE cannot be empty"
-[[ "$GPU_CSV" == "0,1,2,3,4,5,6,7" ]] || die "This pipeline requires all 8 GPUs in order: 0,1,2,3,4,5,6,7"
 
 for model_dir in "$BASE_MODEL_DIR" "$DECODER_MODEL_DIR"; do
   [[ -f "$model_dir/config.json" ]] || die "Missing model config: $model_dir/config.json"
   compgen -G "$model_dir/*.safetensors" >/dev/null || die "No safetensors weights under $model_dir"
 done
 
-ORACLE_DATA_FILE="$("$CONDA_ENV_DIR/bin/python" - \
+ORACLE_DATA_FILE="$("$PYTHON_BIN" - \
   "$TRAIN_DATA_DIR/dataset_info.json" "$ORACLE_DATA_FILE" <<'PY'
 import json
 import sys
@@ -166,7 +171,7 @@ generation_mode="${COLT_PIPELINE_GENERATION:-official}"
 
 create_config() {
   local template="$1" destination="$2" dataset_name="$3" tokenized="$4" output="$5" run_name="$6"
-  "$CONDA_ENV_DIR/bin/python" - \
+  "$PYTHON_BIN" - \
     "$template" "$destination" "$BASE_MODEL_DIR" "$TRAIN_DATA_DIR" "$dataset_name" \
     "$tokenized" "$output" "$run_name" "$mode" "$REPO_ROOT" <<'PY'
 import sys
@@ -229,8 +234,6 @@ create_config \
 
 export COLT_EXPECTED_REPO_ROOT="$REPO_ROOT"
 export COLT_LKL_ROOT="$RUNTIME_ROOT"
-export COLT_CONDA_INIT_SH="$CONDA_INIT_SH"
-export COLT_CONDA_ENV_DIR="$CONDA_ENV_DIR"
 export COLT_BASE_MODEL_DIR="$BASE_MODEL_DIR"
 export COLT_DECODER_MODEL_DIR="$DECODER_MODEL_DIR"
 export COLT_DATA_ROOT="$TRAIN_DATA_DIR"
@@ -246,6 +249,8 @@ export COLT_GPU_PROFILE="$GPU_PROFILE"
 export COLT_TRAIN_GPUS="$GPU_CSV"
 export COLT_EVAL_GPUS="$GPU_CSV"
 export COLT_BATCH_AUX_DECODERS=0
+export COLT_STRICT_PREFLIGHT="${COLT_STRICT_PREFLIGHT:-0}"
+export COLT_CHECK_GPU_FREE="${COLT_CHECK_GPU_FREE:-$COLT_STRICT_PREFLIGHT}"
 export COLT_EXPECTED_GLOBAL_STEP="$expected_steps"
 export COLT_ORACLE_K_DATASET_NAME=onethinker_sft_image_oracle_k
 export COLT_ORACLE_K_DATA_FILE="$ORACLE_DATA_FILE"
@@ -260,8 +265,8 @@ mode=$mode
 repo_root=$REPO_ROOT
 runtime_root=$RUNTIME_ROOT
 tmp_root=$PIPELINE_TMP_ROOT
-conda_env=$CONDA_ENV_DIR
-conda_init=$CONDA_INIT_SH
+python=$PYTHON_BIN
+active_environment=${CONDA_PREFIX:-${VIRTUAL_ENV:-unknown}}
 base_model=$BASE_MODEL_DIR
 decoder_model=$DECODER_MODEL_DIR
 train_data=$TRAIN_DATA_DIR
@@ -291,7 +296,7 @@ run_command() {
 
 model_is_complete() {
   local output="$1"
-  "$CONDA_ENV_DIR/bin/python" - "$output" "$expected_steps" <<'PY' >/dev/null 2>&1
+  "$PYTHON_BIN" - "$output" "$expected_steps" <<'PY' >/dev/null 2>&1
 import json
 import sys
 from pathlib import Path

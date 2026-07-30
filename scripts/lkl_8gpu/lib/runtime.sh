@@ -8,7 +8,7 @@ COLT_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$COLT_SCRIPT_ROOT/../.." && pwd)"
 
 LKL_ROOT="${COLT_LKL_ROOT:-/data/nvme0/lkl}"
-EXPECTED_REPO_ROOT="${COLT_EXPECTED_REPO_ROOT:-$LKL_ROOT/CoLT-reproduction}"
+EXPECTED_REPO_ROOT="${COLT_EXPECTED_REPO_ROOT:-$REPO_ROOT}"
 PROJECT_RUNTIME_ROOT="${COLT_RUNTIME_ROOT:-$REPO_ROOT}"
 WORKSPACE_ROOT="$PROJECT_RUNTIME_ROOT"
 MINICONDA_ROOT="${COLT_MINICONDA_ROOT:-$LKL_ROOT/miniconda3}"
@@ -37,6 +37,15 @@ PROFILE_FILE="${COLT_PROFILE_FILE:-$PROJECT_RUNTIME_ROOT/.colt_gpu_profile}"
 die() {
   echo "ERROR: $*" >&2
   exit 1
+}
+
+warn() {
+  echo "WARNING: $*" >&2
+}
+
+env_flag_enabled() {
+  local value="${1:-0}"
+  [[ "$value" == 1 || "$value" == true || "$value" == yes || "$value" == on ]]
 }
 
 require_command() {
@@ -112,17 +121,44 @@ require_workspace_layout() {
 }
 
 activate_colt_env() {
-  [[ -f "$CONDA_INIT_SH" ]] || die "Missing Conda activation script: $CONDA_INIT_SH"
-  [[ -x "$CONDA_ENV_DIR/bin/python" ]] || die \
-    "Missing Conda environment $CONDA_ENV_DIR. Run: bash scripts/lkl_8gpu/colt.sh setup env"
-  # shellcheck disable=SC1090
-  source "$CONDA_INIT_SH"
-  conda activate "$CONDA_ENV_DIR"
+  local active_python=""
+  if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    active_python="$(command -v python || true)"
+    [[ -n "$active_python" && -x "$active_python" ]] || die \
+      "The active Conda environment does not provide an executable python."
+    echo "Using active Conda environment: ${CONDA_DEFAULT_ENV:-$CONDA_PREFIX} ($active_python)"
+    return
+  fi
+
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    active_python="$(command -v python || true)"
+    [[ -n "$active_python" && -x "$active_python" ]] || die \
+      "The active virtual environment does not provide an executable python."
+    echo "Using active Python environment: $VIRTUAL_ENV ($active_python)"
+    return
+  fi
+
+  if [[ -n "${COLT_CONDA_ENV_DIR:-}" ]]; then
+    [[ -f "$CONDA_INIT_SH" ]] || die "Missing Conda activation script: $CONDA_INIT_SH"
+    [[ -x "$CONDA_ENV_DIR/bin/python" ]] || die "Missing Conda environment: $CONDA_ENV_DIR"
+    # shellcheck disable=SC1090
+    source "$CONDA_INIT_SH"
+    conda activate "$CONDA_ENV_DIR"
+    echo "Activated configured Conda environment: $CONDA_ENV_DIR"
+    return
+  fi
+
+  die "No Python environment is active. Run 'conda activate <your-env>' before launching CoLT."
 }
 
 require_free_gib() {
   local required_gib="$1" free_kb required_kb
   free_kb="$(df -Pk "$LKL_ROOT" | awk 'NR==2 {print $4}')"
   required_kb=$((required_gib * 1024 * 1024))
-  (( free_kb >= required_kb )) || die "Less than ${required_gib} GiB is free under $LKL_ROOT."
+  if (( free_kb < required_kb )); then
+    if env_flag_enabled "${COLT_STRICT_PREFLIGHT:-0}"; then
+      die "Less than ${required_gib} GiB is free under $LKL_ROOT."
+    fi
+    warn "Less than ${required_gib} GiB is free under $LKL_ROOT; continuing because strict preflight is disabled."
+  fi
 }

@@ -7,7 +7,7 @@ validate_gpu_profile() {
   while IFS= read -r detected_name; do
     gpu_names+=("$detected_name")
   done < <(nvidia-smi --query-gpu=name --format=csv,noheader | sed 's/[[:space:]]*$//')
-  [[ "${#gpu_names[@]}" -eq 8 ]] || die "Profile expects 8 GPUs; found ${#gpu_names[@]}."
+  (( ${#gpu_names[@]} > 0 )) || die "No NVIDIA GPUs were detected."
   if [[ -n "${COLT_EXPECTED_GPU_NAME:-}" ]]; then
     local gpu_name
     for gpu_name in "${gpu_names[@]}"; do
@@ -29,7 +29,12 @@ parse_gpu_csv() {
   done
 }
 
-require_selected_gpus_free() {
+maybe_check_selected_gpus_free() {
+  local check_gpu_free="${COLT_CHECK_GPU_FREE:-${COLT_STRICT_PREFLIGHT:-0}}"
+  if ! env_flag_enabled "$check_gpu_free"; then
+    echo "GPU idle-memory check: skipped (set COLT_CHECK_GPU_FREE=1 to enable)"
+    return
+  fi
   local threshold_mib="${COLT_GPU_MAX_USED_MIB:-500}" gpu memory_used
   [[ "$threshold_mib" =~ ^[1-9][0-9]*$ ]] || die "COLT_GPU_MAX_USED_MIB must be a positive integer."
   for gpu in "${COLT_GPU_IDS[@]}"; do

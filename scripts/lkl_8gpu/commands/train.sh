@@ -26,7 +26,7 @@ cmd_train() {
   local gpu_csv="${COLT_TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
   parse_gpu_csv "$gpu_csv"
   [[ "${#COLT_GPU_IDS[@]}" -eq 8 ]] || die "Training requires exactly 8 GPU ids: $gpu_csv"
-  require_selected_gpus_free
+  maybe_check_selected_gpus_free
 
   local default_config default_output record_prefix log_prefix
   case "$target" in
