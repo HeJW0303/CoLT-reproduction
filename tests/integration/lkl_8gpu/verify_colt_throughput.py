@@ -178,6 +178,8 @@ def _run_forward_case(seed: int, batched: bool):
     from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_forward_decoder_steps
 
     decoder, pj_in, pj_out, latents, records, vocab_size = _make_forward_case(seed)
+    projector_calls = []
+    pj_out.register_forward_hook(lambda *_: projector_calls.append(1))
     losses = _run_colt_forward_decoder_steps(
         decoder, pj_out, _causal_loss, records, vocab_size, batched=batched
     )
@@ -186,16 +188,29 @@ def _run_forward_case(seed: int, batched: bool):
     gradients = _collect_named_gradients(
         [("decoder", decoder), ("pj_in", pj_in), ("pj_out", pj_out)], latents
     )
-    return torch.stack([loss.detach() for loss in losses]), total_loss.detach(), gradients, decoder.forward_calls
+    return (
+        torch.stack([loss.detach() for loss in losses]),
+        total_loss.detach(),
+        gradients,
+        decoder.forward_calls,
+        len(projector_calls),
+    )
 
 
 def verify_forward_batch_equivalence() -> None:
-    sequential_losses, sequential_total, sequential_gradients, sequential_calls = _run_forward_case(
-        31, batched=False
+    sequential_losses, sequential_total, sequential_gradients, sequential_calls, sequential_projector_calls = (
+        _run_forward_case(31, batched=False)
     )
-    batched_losses, batched_total, batched_gradients, batched_calls = _run_forward_case(31, batched=True)
+    batched_losses, batched_total, batched_gradients, batched_calls, batched_projector_calls = (
+        _run_forward_case(31, batched=True)
+    )
     if sequential_calls != 3 or batched_calls != 1:
         raise RuntimeError(f"Expected forward decoder calls 3 -> 1, got {sequential_calls} -> {batched_calls}.")
+    if sequential_projector_calls != 3 or batched_projector_calls != 1:
+        raise RuntimeError(
+            "Expected forward projector calls 3 -> 1, got "
+            f"{sequential_projector_calls} -> {batched_projector_calls}."
+        )
     _assert_close("forward per-step losses", batched_losses, sequential_losses)
     _assert_close("forward step-equal total", batched_total, sequential_total)
     for name in sequential_gradients:
@@ -206,21 +221,28 @@ def _run_forward_dummy_case(seed: int, batched: bool):
     from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_forward_decoder_steps
 
     decoder, pj_in, pj_out, latents, records, vocab_size = _make_forward_case(seed)
+    projector_calls = []
+    pj_out.register_forward_hook(lambda *_: projector_calls.append(1))
     records[2]["has_targets"] = False
     records[2]["labels"].fill_(-100)
     losses = _run_colt_forward_decoder_steps(
         decoder, pj_out, _causal_loss, records, vocab_size, batched=batched
     )
     torch.stack(losses).sum().backward()
-    return losses, latents, decoder.forward_calls, decoder.call_shapes
+    return losses, latents, decoder.forward_calls, decoder.call_shapes, len(projector_calls)
 
 
 def verify_dummy_forward_step_has_zero_gradient() -> None:
     for batched, expected_calls in ((False, 3), (True, 1)):
-        losses, latents, calls, call_shapes = _run_forward_dummy_case(41, batched=batched)
+        losses, latents, calls, call_shapes, projector_calls = _run_forward_dummy_case(41, batched=batched)
         if calls != expected_calls:
             raise RuntimeError(
                 f"Dummy forward call count mismatch for batched={batched}: {calls} != {expected_calls}."
+            )
+        if projector_calls != expected_calls:
+            raise RuntimeError(
+                f"Dummy forward projector call count mismatch for batched={batched}: "
+                f"{projector_calls} != {expected_calls}."
             )
         if losses[2].detach().abs().item() != 0.0:
             raise RuntimeError(f"Dummy forward loss was nonzero for batched={batched}.")
@@ -262,6 +284,8 @@ def _run_backward_case(seed: int, batched: bool):
     from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
 
     decoder, pj_back, latents, records = _make_backward_case(seed)
+    projector_calls = []
+    pj_back.register_forward_hook(lambda *_: projector_calls.append(1))
     losses = _run_colt_backward_decoder_steps(
         decoder, pj_back, records, pad_token_id=0, batched=batched
     )
@@ -274,18 +298,34 @@ def _run_backward_case(seed: int, batched: bool):
         gradients,
         decoder.backbone.forward_calls,
         decoder.backbone.grad_enabled_calls,
+        len(projector_calls),
     )
 
 
 def verify_backward_batch_equivalence() -> None:
-    sequential_losses, sequential_total, sequential_gradients, sequential_calls, sequential_grad_enabled = (
-        _run_backward_case(47, batched=False)
-    )
-    batched_losses, batched_total, batched_gradients, batched_calls, batched_grad_enabled = _run_backward_case(
-        47, batched=True
-    )
+    (
+        sequential_losses,
+        sequential_total,
+        sequential_gradients,
+        sequential_calls,
+        sequential_grad_enabled,
+        sequential_projector_calls,
+    ) = _run_backward_case(47, batched=False)
+    (
+        batched_losses,
+        batched_total,
+        batched_gradients,
+        batched_calls,
+        batched_grad_enabled,
+        batched_projector_calls,
+    ) = _run_backward_case(47, batched=True)
     if sequential_calls != 2 or batched_calls != 1:
         raise RuntimeError(f"Expected backward decoder calls 2 -> 1, got {sequential_calls} -> {batched_calls}.")
+    if sequential_projector_calls != 2 or batched_projector_calls != 1:
+        raise RuntimeError(
+            "Expected backward projector calls 2 -> 1, got "
+            f"{sequential_projector_calls} -> {batched_projector_calls}."
+        )
     _assert_close("backward per-step losses", batched_losses, sequential_losses)
     _assert_close("backward step-equal total", batched_total, sequential_total)
     for name in sequential_gradients:
@@ -305,20 +345,27 @@ def _run_backward_dummy_case(seed: int, batched: bool):
     from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
 
     decoder, pj_back, latents, records = _make_backward_case(seed)
+    projector_calls = []
+    pj_back.register_forward_hook(lambda *_: projector_calls.append(1))
     records[1]["active"] = False
     losses = _run_colt_backward_decoder_steps(
         decoder, pj_back, records, pad_token_id=0, batched=batched
     )
     torch.stack(losses).sum().backward()
-    return losses, latents, decoder.backbone.forward_calls
+    return losses, latents, decoder.backbone.forward_calls, len(projector_calls)
 
 
 def verify_dummy_backward_step_has_zero_gradient() -> None:
     for batched, expected_calls in ((False, 2), (True, 1)):
-        losses, latents, calls = _run_backward_dummy_case(53, batched=batched)
+        losses, latents, calls, projector_calls = _run_backward_dummy_case(53, batched=batched)
         if calls != expected_calls:
             raise RuntimeError(
                 f"Dummy backward call count mismatch for batched={batched}: {calls} != {expected_calls}."
+            )
+        if projector_calls != expected_calls:
+            raise RuntimeError(
+                f"Dummy backward projector call count mismatch for batched={batched}: "
+                f"{projector_calls} != {expected_calls}."
             )
         if losses[1].detach().abs().item() != 0.0:
             raise RuntimeError(f"Dummy backward loss was nonzero for batched={batched}.")
@@ -358,6 +405,8 @@ def verify_inactive_long_backward_records_are_excluded() -> None:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
 
     decoder, pj_back, latents, records = _make_backward_case(59)
+    projector_calls = []
+    pj_back.register_forward_hook(lambda *_: projector_calls.append(1))
     records = [records[0]]
     records[0]["active"] = True
     for _ in range(6):
@@ -384,6 +433,8 @@ def verify_inactive_long_backward_records_are_excluded() -> None:
     torch.stack(losses).sum().backward()
     if decoder.backbone.call_shapes != [(2, 3)]:
         raise RuntimeError(f"Inactive long records entered the decoder batch: {decoder.backbone.call_shapes}")
+    if len(projector_calls) != 1:
+        raise RuntimeError(f"Inactive records changed projector call count: {len(projector_calls)}")
     for index, latent in enumerate(latents[2:], start=2):
         if latent.grad is None or latent.grad.abs().sum().item() != 0.0:
             raise RuntimeError(f"Inactive long record {index} changed gradients.")
@@ -393,6 +444,8 @@ def verify_minimal_dummy_for_zero_active_backward_rank() -> None:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
 
     decoder, pj_back, latents, records = _make_backward_case(61)
+    projector_calls = []
+    pj_back.register_forward_hook(lambda *_: projector_calls.append(1))
     for record in records:
         record["active"] = False
     originals = _mock_synchronized_chunk_count(1)
@@ -411,6 +464,8 @@ def verify_minimal_dummy_for_zero_active_backward_rank() -> None:
     torch.stack(losses).sum().backward()
     if decoder.backbone.call_shapes != [(1, 1)]:
         raise RuntimeError(f"Zero-active rank did not use a 1x1 dummy: {decoder.backbone.call_shapes}")
+    if len(projector_calls) != 1:
+        raise RuntimeError(f"Zero-active rank did not issue one projector call: {len(projector_calls)}")
     if any(decoder.backbone.grad_enabled_calls):
         raise RuntimeError("Minimal backward dummy did not run under torch.no_grad().")
     if any(parameter.grad is not None for parameter in decoder.parameters()):
@@ -432,6 +487,8 @@ def verify_adaptive_chunking_and_dummy_fill() -> None:
     torch.manual_seed(67)
     decoder = ToyBackwardDecoder(vocab_size=11, hidden_size=5)
     pj_back = torch.nn.Linear(5, 4, bias=False, dtype=torch.float64)
+    projector_calls = []
+    pj_back.register_forward_hook(lambda *_: projector_calls.append(1))
     records = []
     latents = []
     for _ in range(3):
@@ -468,6 +525,8 @@ def verify_adaptive_chunking_and_dummy_fill() -> None:
         raise RuntimeError(
             f"Adaptive chunks or synchronized dummy calls were incorrect: {decoder.backbone.call_shapes}"
         )
+    if len(projector_calls) != 3:
+        raise RuntimeError(f"Projector calls did not match synchronized chunk count: {len(projector_calls)}")
     for index, latent in enumerate(latents):
         if latent.grad is None or not torch.isfinite(latent.grad).all() or latent.grad.abs().sum().item() == 0.0:
             raise RuntimeError(f"Adaptive chunking lost active latent gradient {index}.")

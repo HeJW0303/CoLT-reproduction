@@ -1666,17 +1666,16 @@ def _run_colt_forward_decoder_steps(
             position_ids=position_ids,
             use_cache=False,
         )
-        step_logits = outputs.logits.split(batch_sizes, dim=0)
+        step_logits = projector(outputs.logits).split(batch_sizes, dim=0)
 
         if chunk_index >= len(chunks):
-            synchronization_loss = synchronization_loss + projector(step_logits[0]).sum() * 0.0
+            synchronization_loss = synchronization_loss + step_logits[0].sum() * 0.0
             continue
         for logits, record in zip(step_logits, chunk):
             original_length = record["inputs_embeds"].shape[1]
-            logits = projector(logits[:, :original_length])
             losses[record_positions[id(record)]] = _compute_colt_forward_cot_loss(
                 loss_function,
-                logits,
+                logits[:, :original_length],
                 record["labels"],
                 vocab_size,
                 has_targets=True,
@@ -1751,23 +1750,30 @@ def _run_colt_backward_decoder_steps(
             [_pad_colt_sequence(record["attention_mask"], max_length) for record in chunk], dim=0
         )
         with torch.no_grad():
-            hidden_steps = run_backbone(input_ids, attention_mask).split(batch_sizes, dim=0)
+            hidden = run_backbone(input_ids, attention_mask)
+        probe_positions = torch.cat([record["probe_positions"] for record in chunk], dim=0)
+        batch_indices = torch.arange(hidden.shape[0], device=hidden.device)
+        cot_last_hidden = hidden[batch_indices, probe_positions].detach()
+        projected_anchors = projector(cot_last_hidden).unsqueeze(1).split(batch_sizes, dim=0)
 
         if chunk_index >= len(chunks):
-            synchronization_loss = synchronization_loss + _compute_colt_backward_alignment_loss(
-                hidden_steps[0],
-                dummy_record["latent_embd"],
-                projector,
-                probe_positions=dummy_record["probe_positions"],
+            dummy_anchor = projected_anchors[0].to(dummy_record["latent_embd"].dtype)
+            synchronization_loss = synchronization_loss + (
+                1
+                - F.cosine_similarity(
+                    dummy_anchor.float(),
+                    dummy_record["latent_embd"].float(),
+                    dim=-1,
+                ).mean()
             ) * 0.0
             continue
-        for hidden, record in zip(hidden_steps, chunk):
-            losses[record_positions[id(record)]] = _compute_colt_backward_alignment_loss(
-                hidden,
-                record["latent_embd"],
-                projector,
-                probe_positions=record["probe_positions"],
-            )
+        for anchor, record in zip(projected_anchors, chunk):
+            anchor = anchor.to(record["latent_embd"].dtype)
+            losses[record_positions[id(record)]] = 1 - F.cosine_similarity(
+                anchor.float(),
+                record["latent_embd"].float(),
+                dim=-1,
+            ).mean()
     losses[0] = losses[0] + synchronization_loss
     return losses
 
