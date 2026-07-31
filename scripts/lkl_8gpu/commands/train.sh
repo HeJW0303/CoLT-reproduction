@@ -91,6 +91,9 @@ cmd_train() {
   [[ "$train_config" == /* && "$output_dir" == /* ]] || die "Training config and output paths must be absolute."
   [[ -f "$train_config" ]] || die "Missing training config: $train_config"
   export COLT_BATCH_AUX_DECODERS="$batch_aux"
+  export COLT_AUX_MAX_BATCH_TOKENS="${COLT_AUX_MAX_BATCH_TOKENS:-4096}"
+  [[ "$COLT_AUX_MAX_BATCH_TOKENS" =~ ^[1-9][0-9]*$ ]] || die \
+    "COLT_AUX_MAX_BATCH_TOKENS must be a positive integer"
   export COLT_COMPONENT_LOG_EVERY="${COLT_COMPONENT_LOG_EVERY:-8}"
   export CUDA_VISIBLE_DEVICES="$gpu_csv" FORCE_TORCHRUN=1 NPROC_PER_NODE=8 NNODES=1 NODE_RANK=0
   export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}" MASTER_PORT="${MASTER_PORT:-29500}"
@@ -146,6 +149,7 @@ cmd_train() {
     printf 'CUDA_VISIBLE_DEVICES=%s\n' "$CUDA_VISIBLE_DEVICES"
     printf 'COLT_PAPER_FAITHFUL=%s\n' "$COLT_PAPER_FAITHFUL"
     printf 'COLT_BATCH_AUX_DECODERS=%s\n' "$COLT_BATCH_AUX_DECODERS"
+    printf 'COLT_AUX_MAX_BATCH_TOKENS=%s\n' "$COLT_AUX_MAX_BATCH_TOKENS"
     printf 'COLT_ORACLE_K_ENABLED=%s\n' "$COLT_ORACLE_K_ENABLED"
     printf 'COLT_ORACLE_K_PREDICTOR_ENABLED=%s\n' "$COLT_ORACLE_K_PREDICTOR_ENABLED"
     printf 'COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT=%s\n' "${COLT_ORACLE_K_PREDICTOR_LOSS_WEIGHT:-0.2}"

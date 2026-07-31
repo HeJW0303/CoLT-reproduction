@@ -360,6 +360,22 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         self.assertLess(paper_stage, dynamic_k)
         self.assertLess(dynamic_k, oracle_stage)
 
+    def test_oracle_k_checkpoint_and_aux_chunk_policy(self) -> None:
+        config_path = (
+            REPO_ROOT
+            / "LLaMA-Factory"
+            / "examples"
+            / "train_full"
+            / "colt_qwen3_sft_lkl_8gpu_oracle_k_predictor.yaml"
+        )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config["save_steps"], 500)
+        self.assertEqual(config["save_total_limit"], 1)
+
+        train_source = (SCRIPT_ROOT / "commands" / "train.sh").read_text(encoding="utf-8")
+        self.assertIn('COLT_AUX_MAX_BATCH_TOKENS="${COLT_AUX_MAX_BATCH_TOKENS:-4096}"', train_source)
+        self.assertIn("COLT_AUX_MAX_BATCH_TOKENS must be a positive integer", train_source)
+
     def test_oracle_k_preflight_runs_before_trainer_construction(self) -> None:
         source = SFT_WORKFLOW.read_text(encoding="utf-8")
         model_load = source.index("model = load_model(")

@@ -20,10 +20,12 @@ class ToyForwardDecoder(torch.nn.Module):
         super().__init__()
         self.projection = torch.nn.Linear(hidden_size, vocab_size, bias=False, dtype=torch.float64)
         self.forward_calls = 0
+        self.call_shapes = []
 
     def forward(self, inputs_embeds, attention_mask, position_ids, use_cache=False):
         del use_cache
         self.forward_calls += 1
+        self.call_shapes.append(tuple(inputs_embeds.shape[:2]))
         masked = inputs_embeds * attention_mask.unsqueeze(-1)
         hidden = torch.cumsum(masked, dim=1) + position_ids.unsqueeze(-1) * 0.01
         return SimpleNamespace(logits=self.projection(hidden))
@@ -34,10 +36,14 @@ class ToyBackwardBackbone(torch.nn.Module):
         super().__init__()
         self.embedding = torch.nn.Embedding(vocab_size, hidden_size, dtype=torch.float64)
         self.forward_calls = 0
+        self.call_shapes = []
+        self.grad_enabled_calls = []
 
     def forward(self, input_ids, attention_mask, use_cache=False):
         del use_cache
         self.forward_calls += 1
+        self.call_shapes.append(tuple(input_ids.shape))
+        self.grad_enabled_calls.append(torch.is_grad_enabled())
         hidden = self.embedding(input_ids) * attention_mask.unsqueeze(-1)
         hidden = torch.cumsum(hidden, dim=1)
         return (hidden,)
@@ -206,18 +212,20 @@ def _run_forward_dummy_case(seed: int, batched: bool):
         decoder, pj_out, _causal_loss, records, vocab_size, batched=batched
     )
     torch.stack(losses).sum().backward()
-    return losses, latents, decoder.forward_calls
+    return losses, latents, decoder.forward_calls, decoder.call_shapes
 
 
 def verify_dummy_forward_step_has_zero_gradient() -> None:
     for batched, expected_calls in ((False, 3), (True, 1)):
-        losses, latents, calls = _run_forward_dummy_case(41, batched=batched)
+        losses, latents, calls, call_shapes = _run_forward_dummy_case(41, batched=batched)
         if calls != expected_calls:
             raise RuntimeError(
                 f"Dummy forward call count mismatch for batched={batched}: {calls} != {expected_calls}."
             )
         if losses[2].detach().abs().item() != 0.0:
             raise RuntimeError(f"Dummy forward loss was nonzero for batched={batched}.")
+        if batched and call_shapes != [(4, 6)]:
+            raise RuntimeError(f"Inactive forward record entered the decoder batch: {call_shapes}")
         dummy_gradient = latents[2].grad
         if dummy_gradient is None or dummy_gradient.abs().sum().item() != 0.0:
             raise RuntimeError(f"Dummy forward step changed gradients for batched={batched}.")
@@ -265,14 +273,17 @@ def _run_backward_case(seed: int, batched: bool):
         total_loss.detach(),
         gradients,
         decoder.backbone.forward_calls,
+        decoder.backbone.grad_enabled_calls,
     )
 
 
 def verify_backward_batch_equivalence() -> None:
-    sequential_losses, sequential_total, sequential_gradients, sequential_calls = _run_backward_case(
-        47, batched=False
+    sequential_losses, sequential_total, sequential_gradients, sequential_calls, sequential_grad_enabled = (
+        _run_backward_case(47, batched=False)
     )
-    batched_losses, batched_total, batched_gradients, batched_calls = _run_backward_case(47, batched=True)
+    batched_losses, batched_total, batched_gradients, batched_calls, batched_grad_enabled = _run_backward_case(
+        47, batched=True
+    )
     if sequential_calls != 2 or batched_calls != 1:
         raise RuntimeError(f"Expected backward decoder calls 2 -> 1, got {sequential_calls} -> {batched_calls}.")
     _assert_close("backward per-step losses", batched_losses, sequential_losses)
@@ -282,6 +293,8 @@ def verify_backward_batch_equivalence() -> None:
     decoder_gradient_names = [name for name in sequential_gradients if name.startswith("decoder.")]
     if any(sequential_gradients[name] is not None for name in decoder_gradient_names):
         raise RuntimeError("Backward alignment leaked gradients into the fixed textual semantic anchor.")
+    if any(sequential_grad_enabled) or any(batched_grad_enabled):
+        raise RuntimeError("Backward decoder backbone did not run under torch.no_grad().")
     for index in range(2):
         gradient = sequential_gradients[f"latent.{index}"]
         if gradient is None or not torch.isfinite(gradient).all() or gradient.abs().sum().item() == 0:
@@ -315,6 +328,149 @@ def verify_dummy_backward_step_has_zero_gradient() -> None:
         active_gradient = latents[0].grad
         if active_gradient is None or active_gradient.abs().sum().item() == 0.0:
             raise RuntimeError(f"Active backward step lost its gradient for batched={batched}.")
+
+
+def _mock_synchronized_chunk_count(global_count: int):
+    distributed = torch.distributed
+    originals = {
+        "is_available": distributed.is_available,
+        "is_initialized": distributed.is_initialized,
+        "all_reduce": distributed.all_reduce,
+    }
+
+    def fake_all_reduce(value, op):
+        if op != distributed.ReduceOp.MAX:
+            raise RuntimeError(f"Chunk synchronization used the wrong reduction: {op}")
+        value.fill_(global_count)
+
+    distributed.is_available = lambda: True
+    distributed.is_initialized = lambda: True
+    distributed.all_reduce = fake_all_reduce
+    return originals
+
+
+def _restore_distributed(originals) -> None:
+    for name, original in originals.items():
+        setattr(torch.distributed, name, original)
+
+
+def verify_inactive_long_backward_records_are_excluded() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
+
+    decoder, pj_back, latents, records = _make_backward_case(59)
+    records = [records[0]]
+    records[0]["active"] = True
+    for _ in range(6):
+        latent = torch.randn(2, 1, 4, dtype=torch.float64, requires_grad=True)
+        latents.append(latent)
+        records.append(
+            {
+                "input_ids": torch.ones((2, 3297), dtype=torch.long),
+                "attention_mask": torch.ones((2, 3297), dtype=torch.long),
+                "probe_positions": torch.full((2,), 3296, dtype=torch.long),
+                "latent_embd": latent,
+                "active": False,
+            }
+        )
+
+    losses = _run_colt_backward_decoder_steps(
+        decoder,
+        pj_back,
+        records,
+        pad_token_id=0,
+        batched=True,
+        max_batch_tokens=4096,
+    )
+    torch.stack(losses).sum().backward()
+    if decoder.backbone.call_shapes != [(2, 3)]:
+        raise RuntimeError(f"Inactive long records entered the decoder batch: {decoder.backbone.call_shapes}")
+    for index, latent in enumerate(latents[2:], start=2):
+        if latent.grad is None or latent.grad.abs().sum().item() != 0.0:
+            raise RuntimeError(f"Inactive long record {index} changed gradients.")
+
+
+def verify_minimal_dummy_for_zero_active_backward_rank() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import _run_colt_backward_decoder_steps
+
+    decoder, pj_back, latents, records = _make_backward_case(61)
+    for record in records:
+        record["active"] = False
+    originals = _mock_synchronized_chunk_count(1)
+    try:
+        losses = _run_colt_backward_decoder_steps(
+            decoder,
+            pj_back,
+            records,
+            pad_token_id=0,
+            batched=True,
+            max_batch_tokens=4096,
+        )
+    finally:
+        _restore_distributed(originals)
+
+    torch.stack(losses).sum().backward()
+    if decoder.backbone.call_shapes != [(1, 1)]:
+        raise RuntimeError(f"Zero-active rank did not use a 1x1 dummy: {decoder.backbone.call_shapes}")
+    if any(decoder.backbone.grad_enabled_calls):
+        raise RuntimeError("Minimal backward dummy did not run under torch.no_grad().")
+    if any(parameter.grad is not None for parameter in decoder.parameters()):
+        raise RuntimeError("Minimal backward dummy created decoder parameter gradients.")
+    for parameter in pj_back.parameters():
+        if parameter.grad is None or parameter.grad.abs().sum().item() != 0.0:
+            raise RuntimeError("Minimal backward dummy did not produce an exact zero projector gradient.")
+    for index, latent in enumerate(latents):
+        if latent.grad is None or latent.grad.abs().sum().item() != 0.0:
+            raise RuntimeError(f"Minimal backward dummy changed latent gradient {index}.")
+
+
+def verify_adaptive_chunking_and_dummy_fill() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        _chunk_colt_records,
+        _run_colt_backward_decoder_steps,
+    )
+
+    torch.manual_seed(67)
+    decoder = ToyBackwardDecoder(vocab_size=11, hidden_size=5)
+    pj_back = torch.nn.Linear(5, 4, bias=False, dtype=torch.float64)
+    records = []
+    latents = []
+    for _ in range(3):
+        latent = torch.randn(1, 1, 4, dtype=torch.float64, requires_grad=True)
+        latents.append(latent)
+        records.append(
+            {
+                "input_ids": torch.ones((1, 2000), dtype=torch.long),
+                "attention_mask": torch.ones((1, 2000), dtype=torch.long),
+                "probe_positions": torch.full((1,), 1999, dtype=torch.long),
+                "latent_embd": latent,
+                "active": True,
+            }
+        )
+    chunks = _chunk_colt_records(records, "input_ids", 4096)
+    if [len(chunk) for chunk in chunks] != [2, 1]:
+        raise RuntimeError(f"Unexpected padded-token chunks: {[len(chunk) for chunk in chunks]}")
+
+    originals = _mock_synchronized_chunk_count(3)
+    try:
+        losses = _run_colt_backward_decoder_steps(
+            decoder,
+            pj_back,
+            records,
+            pad_token_id=0,
+            batched=True,
+            max_batch_tokens=4096,
+        )
+    finally:
+        _restore_distributed(originals)
+    torch.stack(losses).sum().backward()
+    expected_shapes = [(2, 2000), (1, 2000), (1, 1)]
+    if decoder.backbone.call_shapes != expected_shapes:
+        raise RuntimeError(
+            f"Adaptive chunks or synchronized dummy calls were incorrect: {decoder.backbone.call_shapes}"
+        )
+    for index, latent in enumerate(latents):
+        if latent.grad is None or not torch.isfinite(latent.grad).all() or latent.grad.abs().sum().item() == 0.0:
+            raise RuntimeError(f"Adaptive chunking lost active latent gradient {index}.")
 
 
 def verify_oracle_k_global_max_sync() -> None:
@@ -375,6 +531,12 @@ def main() -> None:
     print("T6 OK: Oracle-K distributed synchronization uses the global maximum K.")
     verify_dummy_forward_step_has_zero_gradient()
     print("T7 OK: synchronized dummy forward steps execute but contribute zero loss and gradient.")
+    verify_inactive_long_backward_records_are_excluded()
+    print("T8 OK: inactive 3297-token backward records never enter the real decoder batch.")
+    verify_minimal_dummy_for_zero_active_backward_rank()
+    print("T9 OK: a zero-active rank uses one graph-connected 1x1 backward dummy call.")
+    verify_adaptive_chunking_and_dummy_fill()
+    print("T10 OK: padded-token chunking and cross-rank minimal dummy fill preserve gradients.")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,9 @@ bash scripts/lkl_8gpu/colt.sh train oracle-k --batch-aux
 COLT_BATCH_AUX_DECODERS=1 bash scripts/lkl_8gpu/colt.sh train paper-faithful
 ```
 
+合批调用按 `batch_size x padded_length` 自适应分块，默认每次最多 4096 tokens。
+可通过 `COLT_AUX_MAX_BATCH_TOKENS` 调整；单条超过预算的长样本会独立执行，不截断。
+
 ## 评测
 
 A100 默认使用 0-7，A800 默认使用 4-7；均可通过 `--gpus` 显式覆盖。默认每卡 3 个

@@ -31,7 +31,7 @@ tokenized_path: /data/nvme0/lkl/CoLT-reproduction/cache/colt/onethinker_sft_orac
 ### output
 output_dir: /data/nvme0/lkl/CoLT-reproduction/checkpoints/colt_oracle_k_predictor
 logging_steps: 1
-save_steps: 1000
+save_steps: 500
 save_strategy: steps
 save_only_model: false
 plot_loss: true

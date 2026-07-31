@@ -37,6 +37,8 @@ Training options:
 
 COLT_BATCH_AUX_DECODERS=1 is equivalent to --batch-aux for paper-faithful
 and oracle-k training.
+COLT_AUX_MAX_BATCH_TOKENS sets the auxiliary decoder padded-token budget
+per call when batching is enabled (default: 4096).
 
 Runtime:
   Activate the prepared environment before running commands:

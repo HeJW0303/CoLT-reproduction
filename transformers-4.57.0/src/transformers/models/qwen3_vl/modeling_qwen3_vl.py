@@ -1537,7 +1537,79 @@ def _pad_colt_sequence(tensor, target_length, value=0):
     raise ValueError(f"Expected a rank-2 or rank-3 sequence tensor, got shape {tuple(tensor.shape)}")
 
 
-def _run_colt_forward_decoder_steps(decoder, projector, loss_function, records, vocab_size, batched):
+def _colt_aux_max_batch_tokens():
+    try:
+        return max(int(os.environ.get("COLT_AUX_MAX_BATCH_TOKENS", "4096")), 1)
+    except ValueError:
+        return 4096
+
+
+def _chunk_colt_records(records, tensor_key, max_batch_tokens):
+    """Greedily bound each auxiliary call by batch size times padded length."""
+    chunks = []
+    current_chunk = []
+    current_batch_size = 0
+    current_max_length = 0
+    for record in records:
+        tensor = record[tensor_key]
+        record_batch_size, record_length = tensor.shape[:2]
+        candidate_batch_size = current_batch_size + record_batch_size
+        candidate_max_length = max(current_max_length, record_length)
+        if current_chunk and candidate_batch_size * candidate_max_length > max_batch_tokens:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_batch_size = 0
+            current_max_length = 0
+
+        current_chunk.append(record)
+        current_batch_size += record_batch_size
+        current_max_length = max(current_max_length, record_length)
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def _synchronize_colt_chunk_count(local_chunk_count, device):
+    """Keep ZeRO-3 auxiliary decoder call counts identical on every rank."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return local_chunk_count
+    synchronized_count = torch.tensor(local_chunk_count, dtype=torch.long, device=device)
+    torch.distributed.all_reduce(synchronized_count, op=torch.distributed.ReduceOp.MAX)
+    return int(synchronized_count.item())
+
+
+def _make_minimal_forward_dummy(record):
+    inputs_embeds = record["inputs_embeds"][:1, :1]
+    return {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device),
+        "position_ids": torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device),
+        "labels": torch.full(inputs_embeds.shape[:2], -100, dtype=torch.long, device=inputs_embeds.device),
+        "has_targets": False,
+    }
+
+
+def _make_minimal_backward_dummy(record):
+    input_ids = record["input_ids"][:1, -1:]
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "probe_positions": torch.zeros((1,), dtype=torch.long, device=input_ids.device),
+        "latent_embd": record["latent_embd"][:1],
+        "active": False,
+    }
+
+
+def _run_colt_forward_decoder_steps(
+    decoder,
+    projector,
+    loss_function,
+    records,
+    vocab_size,
+    batched,
+    max_batch_tokens=None,
+):
     """Run latent-to-CoT supervision while preserving equal weighting across latent steps."""
     if not records:
         return []
@@ -1563,38 +1635,53 @@ def _run_colt_forward_decoder_steps(decoder, projector, loss_function, records, 
             )
         return losses
 
-    max_length = max(record["inputs_embeds"].shape[1] for record in records)
-    batch_sizes = [record["inputs_embeds"].shape[0] for record in records]
-    inputs_embeds = torch.cat(
-        [_pad_colt_sequence(record["inputs_embeds"], max_length) for record in records], dim=0
+    active_records = [record for record in records if record["has_targets"]]
+    chunks = _chunk_colt_records(
+        active_records,
+        "inputs_embeds",
+        max_batch_tokens or _colt_aux_max_batch_tokens(),
     )
-    attention_mask = torch.cat(
-        [_pad_colt_sequence(record["attention_mask"], max_length) for record in records], dim=0
-    )
-    position_ids = torch.cat(
-        [_pad_colt_sequence(record["position_ids"], max_length) for record in records], dim=0
-    )
-    outputs = decoder(
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
-    )
-    step_logits = outputs.logits.split(batch_sizes, dim=0)
+    synchronized_chunk_count = _synchronize_colt_chunk_count(len(chunks), records[0]["inputs_embeds"].device)
+    dummy_record = _make_minimal_forward_dummy(records[0])
+    record_positions = {id(record): index for index, record in enumerate(records)}
+    losses = [record["inputs_embeds"][:1, :1].sum() * 0.0 for record in records]
+    synchronization_loss = records[0]["inputs_embeds"][:1, :1].sum() * 0.0
 
-    losses = []
-    for logits, record in zip(step_logits, records):
-        original_length = record["inputs_embeds"].shape[1]
-        logits = projector(logits[:, :original_length])
-        losses.append(
-            _compute_colt_forward_cot_loss(
+    for chunk_index in range(synchronized_chunk_count):
+        chunk = chunks[chunk_index] if chunk_index < len(chunks) else [dummy_record]
+        max_length = max(record["inputs_embeds"].shape[1] for record in chunk)
+        batch_sizes = [record["inputs_embeds"].shape[0] for record in chunk]
+        inputs_embeds = torch.cat(
+            [_pad_colt_sequence(record["inputs_embeds"], max_length) for record in chunk], dim=0
+        )
+        attention_mask = torch.cat(
+            [_pad_colt_sequence(record["attention_mask"], max_length) for record in chunk], dim=0
+        )
+        position_ids = torch.cat(
+            [_pad_colt_sequence(record["position_ids"], max_length) for record in chunk], dim=0
+        )
+        outputs = decoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+        )
+        step_logits = outputs.logits.split(batch_sizes, dim=0)
+
+        if chunk_index >= len(chunks):
+            synchronization_loss = synchronization_loss + projector(step_logits[0]).sum() * 0.0
+            continue
+        for logits, record in zip(step_logits, chunk):
+            original_length = record["inputs_embeds"].shape[1]
+            logits = projector(logits[:, :original_length])
+            losses[record_positions[id(record)]] = _compute_colt_forward_cot_loss(
                 loss_function,
                 logits,
                 record["labels"],
                 vocab_size,
-                has_targets=record["has_targets"],
+                has_targets=True,
             )
-        )
+    losses[0] = losses[0] + synchronization_loss
     return losses
 
 
@@ -1602,7 +1689,14 @@ def _get_colt_decoder_backbone(decoder):
     return decoder.get_decoder() if hasattr(decoder, "get_decoder") else getattr(decoder, "model", None)
 
 
-def _run_colt_backward_decoder_steps(decoder, projector, records, pad_token_id, batched):
+def _run_colt_backward_decoder_steps(
+    decoder,
+    projector,
+    records,
+    pad_token_id,
+    batched,
+    max_batch_tokens=None,
+):
     """Run CoT-to-latent supervision and select each step's original probe position."""
     if not records:
         return []
@@ -1623,7 +1717,8 @@ def _run_colt_backward_decoder_steps(decoder, projector, records, pad_token_id, 
     if not batched:
         losses = []
         for record in records:
-            hidden = run_backbone(record["input_ids"], record["attention_mask"])
+            with torch.no_grad():
+                hidden = run_backbone(record["input_ids"], record["attention_mask"])
             loss = _compute_colt_backward_alignment_loss(
                 hidden,
                 record["latent_embd"],
@@ -1633,25 +1728,47 @@ def _run_colt_backward_decoder_steps(decoder, projector, records, pad_token_id, 
             losses.append(loss if record.get("active", True) else loss * 0.0)
         return losses
 
-    max_length = max(record["input_ids"].shape[1] for record in records)
-    batch_sizes = [record["input_ids"].shape[0] for record in records]
-    input_ids = torch.cat(
-        [_pad_colt_sequence(record["input_ids"], max_length, value=pad_token_id) for record in records], dim=0
+    active_records = [record for record in records if record.get("active", True)]
+    chunks = _chunk_colt_records(
+        active_records,
+        "input_ids",
+        max_batch_tokens or _colt_aux_max_batch_tokens(),
     )
-    attention_mask = torch.cat(
-        [_pad_colt_sequence(record["attention_mask"], max_length) for record in records], dim=0
-    )
-    hidden_steps = run_backbone(input_ids, attention_mask).split(batch_sizes, dim=0)
+    synchronized_chunk_count = _synchronize_colt_chunk_count(len(chunks), records[0]["input_ids"].device)
+    dummy_record = _make_minimal_backward_dummy(records[0])
+    record_positions = {id(record): index for index, record in enumerate(records)}
+    losses = [record["latent_embd"].float().sum() * 0.0 for record in records]
+    synchronization_loss = records[0]["latent_embd"].float().sum() * 0.0
 
-    losses = []
-    for hidden, record in zip(hidden_steps, records):
-        loss = _compute_colt_backward_alignment_loss(
-            hidden,
-            record["latent_embd"],
-            projector,
-            probe_positions=record["probe_positions"],
+    for chunk_index in range(synchronized_chunk_count):
+        chunk = chunks[chunk_index] if chunk_index < len(chunks) else [dummy_record]
+        max_length = max(record["input_ids"].shape[1] for record in chunk)
+        batch_sizes = [record["input_ids"].shape[0] for record in chunk]
+        input_ids = torch.cat(
+            [_pad_colt_sequence(record["input_ids"], max_length, value=pad_token_id) for record in chunk], dim=0
         )
-        losses.append(loss if record.get("active", True) else loss * 0.0)
+        attention_mask = torch.cat(
+            [_pad_colt_sequence(record["attention_mask"], max_length) for record in chunk], dim=0
+        )
+        with torch.no_grad():
+            hidden_steps = run_backbone(input_ids, attention_mask).split(batch_sizes, dim=0)
+
+        if chunk_index >= len(chunks):
+            synchronization_loss = synchronization_loss + _compute_colt_backward_alignment_loss(
+                hidden_steps[0],
+                dummy_record["latent_embd"],
+                projector,
+                probe_positions=dummy_record["probe_positions"],
+            ) * 0.0
+            continue
+        for hidden, record in zip(hidden_steps, chunk):
+            losses[record_positions[id(record)]] = _compute_colt_backward_alignment_loss(
+                hidden,
+                record["latent_embd"],
+                projector,
+                probe_positions=record["probe_positions"],
+            )
+    losses[0] = losses[0] + synchronization_loss
     return losses
 
 
@@ -2492,21 +2609,22 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         if self.batch_aux_decoders:
                             batched_backward_records.append(backward_record)
                         else:
-                            decoder_backbone = _get_colt_decoder_backbone(self.backward_decoder)
-                            if decoder_backbone is not None:
-                                cot_hidden = decoder_backbone(
-                                    input_ids=cot_plus_probe_ids,
-                                    attention_mask=cot_plus_probe_mask,
-                                    use_cache=False,
-                                )[0]
-                            else:
-                                cot_outputs = self.backward_decoder(
-                                    input_ids=cot_plus_probe_ids,
-                                    attention_mask=cot_plus_probe_mask,
-                                    use_cache=False,
-                                    output_hidden_states=True,
-                                )
-                                cot_hidden = cot_outputs.hidden_states[-1]
+                            with torch.no_grad():
+                                decoder_backbone = _get_colt_decoder_backbone(self.backward_decoder)
+                                if decoder_backbone is not None:
+                                    cot_hidden = decoder_backbone(
+                                        input_ids=cot_plus_probe_ids,
+                                        attention_mask=cot_plus_probe_mask,
+                                        use_cache=False,
+                                    )[0]
+                                else:
+                                    cot_outputs = self.backward_decoder(
+                                        input_ids=cot_plus_probe_ids,
+                                        attention_mask=cot_plus_probe_mask,
+                                        use_cache=False,
+                                        output_hidden_states=True,
+                                    )
+                                    cot_hidden = cot_outputs.hidden_states[-1]
                             backward_loss = _compute_colt_backward_alignment_loss(
                                 cot_hidden,
                                 supervised_latent_embd,
