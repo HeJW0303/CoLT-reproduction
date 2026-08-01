@@ -88,6 +88,7 @@ cmd_eval() {
   local prefetch="${VLMEVAL_PREFETCH:-1}" empty_cache="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"
   local backend="${VLMEVAL_DIST_BACKEND:-gloo}" reseed="${COLT_RESEED_PER_SAMPLE:-1}"
   local empty_response_policy="${COLT_EMPTY_RESPONSE_POLICY:-allow}"
+  local log_label="${COLT_EVAL_LOG_LABEL:-$target}"
   local verbose="${EVAL_VERBOSE:-0}" reuse=1
   while (( $# > 0 )); do
     case "$1" in
@@ -107,6 +108,8 @@ cmd_eval() {
   done
 
   case "$target" in codefaithful|paper-faithful|oracle-k|official|baseline) ;; *) die "Unknown target: $target" ;; esac
+  [[ "$log_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die \
+    "COLT_EVAL_LOG_LABEL must contain only letters, digits, dot, underscore, or hyphen"
   case "$generation" in ""|official|respect-args) ;; respect_args) generation=respect-args ;; *) die "Generation must be official or respect-args" ;; esac
   if [[ "$target" == baseline ]]; then
     [[ -z "$generation" || "$generation" == respect-args ]] || die \
@@ -211,8 +214,8 @@ cmd_eval() {
   profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
   work_dir="$EVAL_OUTPUT_ROOT/$target/$group/$profile"
   eval_id="$(printf '%s_%s' "$target" "$profile" | tr '[:lower:]-' '[:upper:]_')"
-  log_dir="$EVAL_LOG_ROOT/$target"
-  log_file="$log_dir/${target}_${group}_${generation_label}_${run_id}.log"
+  log_dir="$EVAL_LOG_ROOT/$log_label"
+  log_file="$log_dir/${log_label}_${group}_${generation_label}_${run_id}.log"
   mkdir -p "$work_dir" "$log_dir"
   exec > >(tee -a "$log_file") 2>&1
 

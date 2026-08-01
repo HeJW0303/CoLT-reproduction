@@ -136,6 +136,23 @@ Qwen3-VL 基座独立完成 Oracle-K 训练、完整性校验与评测：
 bash scripts/run_paper_oracle_pipeline.sh
 ```
 
+只重训当前 B1-only paper-faithful 并执行可比的 all8 评测时，使用 v2 流水线：
+
+```bash
+conda activate YOUR_ENV_NAME
+bash scripts/run_paper_faithful_v2.sh
+```
+
+该脚本会先把旧 paper-faithful checkpoint、训练记录、评测日志和结果归档为 v1。评测日志
+分别写入 `logs/eval/paper-faithful-v1` 和 `logs/eval/paper-faithful-v2`；新 v2
+使用辅助 decoder 合批训练，保存间隔为 500 step，训练完成后验证 checkpoint，再使用
+8 GPU、每卡 3 worker、greedy + 8192 和 prevent-empty 评测全部八个数据集。若 v2 训练
+被中断且存在完整 Trainer checkpoint，可运行：
+
+```bash
+bash scripts/run_paper_faithful_v2.sh --resume
+```
+
 换机器时先激活已经准备好的 Python 环境，再运行 pipeline；脚本直接复用当前环境，不需要填写
 Conda 安装目录或环境路径：
 

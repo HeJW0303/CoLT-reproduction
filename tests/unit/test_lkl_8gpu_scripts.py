@@ -117,6 +117,38 @@ class Lkl8GpuScriptTests(unittest.TestCase):
             ["sampling_max256", "greedy_max8192", "greedy_max8192_prevent-empty"],
         )
 
+    def test_eval_log_label_only_changes_log_path(self) -> None:
+        source = (SCRIPT_ROOT / "commands" / "eval.sh").read_text(encoding="utf-8")
+        self.assertIn('log_label="${COLT_EVAL_LOG_LABEL:-$target}"', source)
+        self.assertIn('log_dir="$EVAL_LOG_ROOT/$log_label"', source)
+        self.assertIn(
+            'log_file="$log_dir/${log_label}_${group}_${generation_label}_${run_id}.log"',
+            source,
+        )
+        self.assertIn('work_dir="$EVAL_OUTPUT_ROOT/$target/$group/$profile"', source)
+        self.assertIn('eval_id="$(printf \'%s_%s\' "$target" "$profile"', source)
+
+    def test_eval_rejects_unsafe_log_label_before_runtime_init(self) -> None:
+        environment = os.environ.copy()
+        environment["COLT_EVAL_LOG_LABEL"] = "../outside"
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT_ROOT / "colt.sh"),
+                "eval",
+                "paper-faithful",
+                "chartqa",
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("COLT_EVAL_LOG_LABEL must contain only", result.stderr)
+
     def test_tracked_root_contains_only_unified_shell_entry(self) -> None:
         pathspec = f":(glob){SCRIPT_ROOT.relative_to(REPO_ROOT)}/*.sh"
         result = subprocess.run(
