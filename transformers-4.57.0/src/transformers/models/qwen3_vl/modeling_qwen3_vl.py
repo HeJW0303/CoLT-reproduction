@@ -2580,7 +2580,17 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             < backward_ref_lens.unsqueeze(1)
                         ).long()
                         has_backward_targets = any(length > 0 for length in backward_ref_lens_cpu)
-                        if not self.oracle_k_enabled and not has_backward_targets:
+                        # In batched mode every rank must contribute a record to the
+                        # synchronized auxiliary call graph.  A rank with no local
+                        # backward target contributes an inactive record; the helper
+                        # filters it out of real batches and replaces it with a 1x1
+                        # dummy when another rank has active chunks.  Keep the
+                        # historical early-continue for the sequential path.
+                        if (
+                            not self.oracle_k_enabled
+                            and not has_backward_targets
+                            and not self.batch_aux_decoders
+                        ):
                             continue
                         backward_active = active_step and has_backward_targets
                         # Encode CoT step, then force one extra "probe" step.

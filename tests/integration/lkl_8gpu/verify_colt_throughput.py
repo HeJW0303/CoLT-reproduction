@@ -575,6 +575,18 @@ def verify_hot_path_has_no_tensor_conditions_or_tensor_prints() -> None:
         raise RuntimeError(f"Hot-path CUDA synchronization patterns remain: {present}")
 
 
+def verify_empty_backward_rank_keeps_batch_record() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+
+    source = inspect.getsource(Qwen3VLForConditionalGeneration.forward)
+    expected_guard = "and not self.batch_aux_decoders"
+    if expected_guard not in source:
+        raise RuntimeError(
+            "The sequential-only backward early-continue guard is missing; "
+            "a batch rank with no local target could skip the ZeRO-3 call graph."
+        )
+
+
 def main() -> None:
     verify_decoder_check_runs_once()
     print("T1 OK: each decoder embedding is checked/reloaded at most once.")
@@ -584,6 +596,8 @@ def main() -> None:
     print("T3 OK: Bx2 backward losses and latent/pj_back gradients match; textual anchors stay detached.")
     verify_hot_path_has_no_tensor_conditions_or_tensor_prints()
     print("T4 OK: training forward has no known per-step tensor conditions or per-microbatch tensor prints.")
+    verify_empty_backward_rank_keeps_batch_record()
+    print("T5a OK: batch ranks retain inactive backward records for synchronized dummy calls.")
     verify_dummy_backward_step_has_zero_gradient()
     print("T5 OK: synchronized dummy backward steps execute but contribute zero loss and gradient.")
     verify_oracle_k_global_max_sync()
