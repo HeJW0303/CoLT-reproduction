@@ -14,6 +14,13 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "lkl_8gpu"
 PIPELINE_SCRIPT = REPO_ROOT / "scripts" / "run_paper_oracle_pipeline.sh"
+TRANSITION_EVAL_SCRIPT = (
+    REPO_ROOT
+    / "tests"
+    / "integration"
+    / "lkl_8gpu"
+    / "20_eval_transition_consistency_4checkpoints.sh"
+)
 SFT_WORKFLOW = (
     REPO_ROOT
     / "LLaMA-Factory"
@@ -37,7 +44,7 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         )
 
     def test_all_shell_files_parse(self) -> None:
-        shell_files = sorted(SCRIPT_ROOT.rglob("*.sh")) + [PIPELINE_SCRIPT]
+        shell_files = sorted(SCRIPT_ROOT.rglob("*.sh")) + [PIPELINE_SCRIPT, TRANSITION_EVAL_SCRIPT]
         self.assertTrue(shell_files)
         result = subprocess.run(
             ["bash", "-n", *map(str, shell_files)],
@@ -148,6 +155,51 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("COLT_EVAL_LOG_LABEL must contain only", result.stderr)
+
+    def test_eval_rejects_unknown_latent_transition_before_runtime_init(self) -> None:
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT_ROOT / "colt.sh"),
+                "eval",
+                "paper-faithful",
+                "chartqa",
+                "--latent-transition",
+                "unknown",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Latent transition must be official or training-consistent", result.stderr)
+
+    def test_transition_mode_is_fingerprinted_and_forces_runtime_overlay(self) -> None:
+        source = (SCRIPT_ROOT / "commands" / "eval.sh").read_text(encoding="utf-8")
+        self.assertIn('--setting "latent_transition=$latent_transition"', source)
+        self.assertIn('_lt${latent_transition//-/_}_seed', source)
+        self.assertIn('"$latent_transition" != official', source)
+        self.assertIn('export COLT_INFERENCE_LATENT_TRANSITION="$latent_transition"', source)
+
+        model_source = (
+            REPO_ROOT
+            / "transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("initialize_colt_inference_latent(", model_source)
+        self.assertIn("advance_colt_inference_latent(", model_source)
+
+    def test_four_checkpoint_transition_script_is_explicit_and_restartable(self) -> None:
+        source = TRANSITION_EVAL_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("colt_codefaithful", source)
+        self.assertIn("colt_paper_faithful_v1", source)
+        self.assertIn("colt_paper_faithful_v2", source)
+        self.assertIn("colt_oracle_k_predictor_batch_285190c", source)
+        self.assertEqual(source.count("--latent-transition training-consistent"), 1)
+        self.assertNotIn("--no-reuse", source)
+        self.assertIn("unset COLT_INFERENCE_K", source)
+        self.assertLess(source.index("Preflighting all checkpoints"), source.index("Evaluating $label"))
 
     def test_tracked_root_contains_only_unified_shell_entry(self) -> None:
         pathspec = f":(glob){SCRIPT_ROOT.relative_to(REPO_ROOT)}/*.sh"

@@ -82,6 +82,11 @@ bash scripts/lkl_8gpu/colt.sh eval official chartqa --gpus 4,5,6,7 --generation 
 # 本地 checkpoint，真正采用 greedy + 8192
 bash scripts/lkl_8gpu/colt.sh eval codefaithful chartqa --generation respect-args
 
+# 诊断官方 train/eval latent transition 不一致
+bash scripts/lkl_8gpu/colt.sh eval codefaithful chartqa \
+  --generation respect-args \
+  --latent-transition training-consistent
+
 # Qwen3-VL textual-CoT baseline
 bash scripts/lkl_8gpu/colt.sh eval baseline all8 --gpus 0,1,2,3,4,5,6,7
 ```
@@ -106,6 +111,11 @@ logs/eval/codefaithful/codefaithful_chartqa_greedy_max8192_YYYYMMDD_HHMMSS.log
 `--generation official` 对应 `sampling_max256`，`--generation respect-args` 对应
 `greedy_max8192`。
 
+`--latent-transition official` 保留官方推理行为：循环前与循环内均使用 `prj(H)`。
+`--latent-transition training-consistent` 与既有 checkpoint 的训练递推保持一致：初始问题
+hidden 不投影，每个 latent step 使用 `H + alpha * prj(H)`。默认仍为 `official`，确保旧结果
+可复现；transition 模式会进入日志、结果目录和 fingerprint，禁止复用另一模式的预测。
+
 模型在尚未生成可见文本时可能直接输出 EOS。严格复现默认保留该行为并将空响应计为错误；
 诊断性评测可显式阻止“空文本前的 EOS”，且该设置会进入日志名、结果目录和 fingerprint：
 
@@ -126,6 +136,16 @@ bash scripts/lkl_8gpu/colt.sh verify model official --model-path /absolute/model
 
 吞吐 A/B、预处理 A/B 等诊断入口位于 `tests/integration/lkl_8gpu/`，不作为正式训练或
 评测入口。正式流程不要从该目录启动。
+
+对 code-faithful、paper-faithful v1/v2、Oracle-K 四个既有 checkpoint 串行执行
+train/eval transition 一致性诊断：
+
+```bash
+bash tests/integration/lkl_8gpu/20_eval_transition_consistency_4checkpoints.sh --group all8
+```
+
+脚本在开始首个评测前验证全部 checkpoint，统一使用 8 GPU、每卡 3 worker、greedy +
+8192、prevent-empty 和 training-consistent transition。重跑时 fingerprint 允许安全复用已完成结果。
 
 ## Paper-faithful + Oracle-K 串行复现
 

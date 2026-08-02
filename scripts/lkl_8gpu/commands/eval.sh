@@ -85,6 +85,7 @@ cmd_eval() {
 
   local cli_model_path="" gpu_csv="" workers="${VLMEVAL_WORKERS_PER_GPU:-3}"
   local generation="${COLT_GENERATION_MODE:-}"
+  local latent_transition="${COLT_INFERENCE_LATENT_TRANSITION:-official}"
   local prefetch="${VLMEVAL_PREFETCH:-1}" empty_cache="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"
   local backend="${VLMEVAL_DIST_BACKEND:-gloo}" reseed="${COLT_RESEED_PER_SAMPLE:-1}"
   local empty_response_policy="${COLT_EMPTY_RESPONSE_POLICY:-allow}"
@@ -96,6 +97,7 @@ cmd_eval() {
       --gpus) [[ $# -ge 2 ]] || die "--gpus requires a value"; gpu_csv="$2"; shift 2 ;;
       --workers) [[ $# -ge 2 ]] || die "--workers requires a value"; workers="$2"; shift 2 ;;
       --generation) [[ $# -ge 2 ]] || die "--generation requires a value"; generation="$2"; shift 2 ;;
+      --latent-transition) [[ $# -ge 2 ]] || die "--latent-transition requires a value"; latent_transition="$2"; shift 2 ;;
       --prefetch) [[ $# -ge 2 ]] || die "--prefetch requires a value"; prefetch="$2"; shift 2 ;;
       --empty-cache-every) [[ $# -ge 2 ]] || die "--empty-cache-every requires a value"; empty_cache="$2"; shift 2 ;;
       --dist-backend) [[ $# -ge 2 ]] || die "--dist-backend requires a value"; backend="$2"; shift 2 ;;
@@ -111,6 +113,8 @@ cmd_eval() {
   [[ "$log_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die \
     "COLT_EVAL_LOG_LABEL must contain only letters, digits, dot, underscore, or hyphen"
   case "$generation" in ""|official|respect-args) ;; respect_args) generation=respect-args ;; *) die "Generation must be official or respect-args" ;; esac
+  case "$latent_transition" in official|training-consistent) ;; *) die \
+    "Latent transition must be official or training-consistent" ;; esac
   if [[ "$target" == baseline ]]; then
     [[ -z "$generation" || "$generation" == respect-args ]] || die \
       "baseline only supports greedy + 8192; omit --generation or use --generation respect-args"
@@ -127,6 +131,12 @@ cmd_eval() {
     "--empty-response-policy must be allow or prevent"
   if [[ "$target" == baseline && "$empty_response_policy" != allow ]]; then
     die "baseline does not support --empty-response-policy prevent"
+  fi
+  if [[ "$target" == baseline && "$latent_transition" != official ]]; then
+    die "baseline does not use latent reasoning and only supports --latent-transition official"
+  fi
+  if [[ -z "${COLT_EVAL_LOG_LABEL:-}" && "$latent_transition" != official ]]; then
+    log_label="${target}-${latent_transition}"
   fi
 
   runtime_init
@@ -160,6 +170,7 @@ cmd_eval() {
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
   export PYTHONUNBUFFERED=1 VLMEVAL_FAIL_ON_ERROR=1 VLMEVAL_ATOMIC_WRITES=1
   export COLT_DECODER_MODEL_PATH="$DECODER_MODEL_DIR"
+  export COLT_INFERENCE_LATENT_TRANSITION="$latent_transition"
   if [[ "$empty_response_policy" == prevent ]]; then
     export COLT_PREVENT_EMPTY_RESPONSE=1
   else
@@ -185,8 +196,8 @@ cmd_eval() {
     export COLT_RESPECT_GENERATION_ARGS=1
   else
     unset COLT_DISABLE_LATENT_REASONING
-    if [[ "$generation" == respect-args || "$empty_response_policy" == prevent ]]; then
-      local overlay_variant="${generation//-/_}_${empty_response_policy}"
+    if [[ "$generation" == respect-args || "$empty_response_policy" == prevent || "$latent_transition" != official ]]; then
+      local overlay_variant="${generation//-/_}_${empty_response_policy}_lt_${latent_transition//-/_}"
       create_generation_overlay "$source_model_path" "$run_id" "$overlay_variant"
       runtime_model_path="$EVAL_RUNTIME_MODEL_PATH"
     fi
@@ -207,11 +218,12 @@ cmd_eval() {
   fingerprint="$(python "$COLT_SCRIPT_ROOT/tools/eval_fingerprint.py" \
     --repo-root "$REPO_ROOT" --model-dir "$source_model_path" \
     --setting "target=$target" --setting "group=$group" --setting "generation=$generation" \
+    --setting "latent_transition=$latent_transition" \
     --setting "seed=${COLT_EVAL_SEED:-1234}" --setting "workers=$workers" \
     --setting "prefetch=$prefetch" --setting "empty_cache=$empty_cache" \
     --setting "backend=$backend" --setting "reseed=$reseed" \
     --setting "empty_response_policy=$empty_response_policy")"
-  profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
+  profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_lt${latent_transition//-/_}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
   work_dir="$EVAL_OUTPUT_ROOT/$target/$group/$profile"
   eval_id="$(printf '%s_%s' "$target" "$profile" | tr '[:lower:]-' '[:upper:]_')"
   log_dir="$EVAL_LOG_ROOT/$log_label"
@@ -236,6 +248,11 @@ cmd_eval() {
   echo "Workers per GPU: $workers; total workers: $nproc"
   echo "Prefetch: $prefetch; empty_cache every N: $empty_cache; backend: $backend"
   echo "Empty response policy: $empty_response_policy"
+  if [[ "$latent_transition" == training-consistent ]]; then
+    echo "Inference latent transition: training-consistent (initial=identity, recurrent=hidden+alpha*prj(hidden))"
+  else
+    echo "Inference latent transition: official (initial=prj(hidden), recurrent=prj(hidden))"
+  fi
   echo "requested_do_sample=False"
   echo "effective_do_sample=$effective_sample"
   echo "requested_max_new_tokens=8192"

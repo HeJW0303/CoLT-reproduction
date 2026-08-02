@@ -55,6 +55,7 @@ Evaluation options:
   --gpus CSV                  Physical GPUs, e.g. 4,5,6,7
   --workers N                 Model replicas per GPU (default: 3)
   --generation MODE           official or respect-args
+  --latent-transition MODE    official or training-consistent
   --prefetch {0|1}            CPU image preprocessing prefetch
   --empty-cache-every N       0 disables per-sample empty_cache
   --dist-backend {gloo|nccl}

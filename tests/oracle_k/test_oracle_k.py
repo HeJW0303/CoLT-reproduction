@@ -118,6 +118,30 @@ class OracleKFormatTest(unittest.TestCase):
 
 
 class OracleKSettingsTest(unittest.TestCase):
+    def test_inference_latent_transition_defaults_to_official(self):
+        self.assertEqual(oracle_k.resolve_colt_inference_latent_transition({}), "official")
+
+    def test_training_consistent_transition_matches_training_arithmetic(self):
+        projector = lambda value: value * 10
+        mode = oracle_k.resolve_colt_inference_latent_transition(
+            {"COLT_INFERENCE_LATENT_TRANSITION": "training-consistent"}
+        )
+
+        self.assertEqual(oracle_k.initialize_colt_inference_latent(3, projector, mode), 3)
+        self.assertEqual(oracle_k.advance_colt_inference_latent(3, projector, 0.1, mode), 6)
+
+    def test_official_transition_preserves_projection_only_behavior(self):
+        projector = lambda value: value * 10
+
+        self.assertEqual(oracle_k.initialize_colt_inference_latent(3, projector, "official"), 30)
+        self.assertEqual(oracle_k.advance_colt_inference_latent(3, projector, 0.1, "official"), 30)
+
+    def test_inference_latent_transition_rejects_unknown_mode(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            oracle_k.resolve_colt_inference_latent_transition(
+                {"COLT_INFERENCE_LATENT_TRANSITION": "residual-ish"}
+            )
+
     def test_disabled_default_does_not_modify_baseline_config(self):
         config = DummyConfig()
         settings = oracle_k.resolve_oracle_k_settings(config, environ={})

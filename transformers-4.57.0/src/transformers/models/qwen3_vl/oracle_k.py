@@ -7,6 +7,12 @@ from typing import Mapping, Optional
 THOUGHT_SEGMENTS_OPEN = "<thought_segments>"
 THOUGHT_SEGMENTS_CLOSE = "</thought_segments>"
 CONTINUE_THINK = "<continue_think>"
+COLT_INFERENCE_TRANSITION_OFFICIAL = "official"
+COLT_INFERENCE_TRANSITION_TRAINING_CONSISTENT = "training-consistent"
+COLT_INFERENCE_TRANSITIONS = {
+    COLT_INFERENCE_TRANSITION_OFFICIAL,
+    COLT_INFERENCE_TRANSITION_TRAINING_CONSISTENT,
+}
 
 
 class OracleKFormatError(ValueError):
@@ -38,6 +44,35 @@ class OracleKTrainingStep:
     active: bool
     forward_index: int
     backward_index: Optional[int]
+
+
+def resolve_colt_inference_latent_transition(environ: Optional[Mapping[str, str]] = None) -> str:
+    environ = os.environ if environ is None else environ
+    mode = environ.get("COLT_INFERENCE_LATENT_TRANSITION", COLT_INFERENCE_TRANSITION_OFFICIAL)
+    mode = mode.strip().lower()
+    if mode not in COLT_INFERENCE_TRANSITIONS:
+        choices = ", ".join(sorted(COLT_INFERENCE_TRANSITIONS))
+        raise ValueError(f"COLT_INFERENCE_LATENT_TRANSITION must be one of {choices}, got {mode!r}")
+    return mode
+
+
+def initialize_colt_inference_latent(hidden_states, projector, mode: str):
+    """Match the historical inference pre-loop transform or the training initial state."""
+    if mode == COLT_INFERENCE_TRANSITION_OFFICIAL:
+        return projector(hidden_states)
+    if mode == COLT_INFERENCE_TRANSITION_TRAINING_CONSISTENT:
+        return hidden_states
+    raise ValueError(f"Unsupported CoLT inference latent transition: {mode!r}")
+
+
+def advance_colt_inference_latent(hidden_states, projector, alpha, mode: str):
+    """Advance one latent step without changing the historical mode's arithmetic."""
+    projected = projector(hidden_states)
+    if mode == COLT_INFERENCE_TRANSITION_OFFICIAL:
+        return projected
+    if mode == COLT_INFERENCE_TRANSITION_TRAINING_CONSISTENT:
+        return hidden_states + alpha * projected
+    raise ValueError(f"Unsupported CoLT inference latent transition: {mode!r}")
 
 
 def build_oracle_k_training_plan(local_k: int, synchronized_k: int) -> tuple[OracleKTrainingStep, ...]:

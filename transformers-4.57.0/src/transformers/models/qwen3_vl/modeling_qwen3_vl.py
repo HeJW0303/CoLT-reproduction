@@ -46,8 +46,11 @@ from ...utils.generic import check_model_inputs
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from .modeling_oracle_k import OracleKBudgetConditioner, OracleKPredictor, pool_last_valid_hidden
 from .oracle_k import (
+    advance_colt_inference_latent,
     build_oracle_k_training_plan,
+    initialize_colt_inference_latent,
     parse_oracle_k_cot,
+    resolve_colt_inference_latent_transition,
     resolve_forced_inference_k,
     resolve_oracle_k_settings,
     select_oracle_k_inference_steps,
@@ -1822,6 +1825,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.paper_faithful = _is_colt_paper_faithful_enabled()
         self.batch_aux_decoders = self.paper_faithful and _is_colt_aux_batching_enabled()
         self._colt_forward_microbatch_count = 0
+        self.inference_latent_transition = resolve_colt_inference_latent_transition()
         oracle_k_settings = resolve_oracle_k_settings(config)
         self.oracle_k_enabled = oracle_k_settings.enabled
         self.oracle_k_max = oracle_k_settings.max_k
@@ -2826,8 +2830,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
         past_key_values = outputs.past_key_values
         hidden_states = outputs[0]
-        latent_embd = hidden_states[:, -1:, :]
-        latent_embd = self.prj(latent_embd)
+        latent_embd = initialize_colt_inference_latent(
+            hidden_states[:, -1:, :],
+            self.prj,
+            self.inference_latent_transition,
+        )
         k_logits = self._predict_oracle_k(hidden_states, attention_mask)
         predicted_k = torch.argmax(k_logits, dim=-1) + 1 if k_logits is not None else None
         latent_steps = self._resolve_latent_steps_for_inference(num_hidden_generations, predicted_k=predicted_k)
@@ -2851,7 +2858,12 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
             past_key_values = step_outputs.past_key_values
-            latent_embd = self.prj(step_outputs[0][:, -1:, :])
+            latent_embd = advance_colt_inference_latent(
+                step_outputs[0][:, -1:, :],
+                self.prj,
+                self.alpha,
+                self.inference_latent_transition,
+            )
             outputs = step_outputs
 
         logits = self.lm_head(latent_embd)
@@ -3035,6 +3047,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             requested_max_new_tokens,
             max_new_tokens,
             prevent_empty_response,
+            self.inference_latent_transition,
         )
         if generation_config_signature != getattr(self, "_last_logged_generation_config", None):
             print(
@@ -3044,7 +3057,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 f"requested_max_new_tokens={requested_max_new_tokens} "
                 f"effective_max_new_tokens={max_new_tokens} "
                 f"prevent_empty_response={prevent_empty_response} "
-                f"respect_generation_args={respect_generation_args}",
+                f"respect_generation_args={respect_generation_args} "
+                f"inference_latent_transition={self.inference_latent_transition}",
                 flush=True,
             )
             self._last_logged_generation_config = generation_config_signature
