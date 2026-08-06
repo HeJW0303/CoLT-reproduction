@@ -163,15 +163,19 @@ conda activate YOUR_ENV_NAME
 bash scripts/run_paper_faithful_v2.sh
 ```
 
-该脚本会先把旧 paper-faithful checkpoint、训练记录、评测日志和结果归档为 v1。评测日志
-分别写入 `logs/eval/paper-faithful-v1` 和 `logs/eval/paper-faithful-v2`；新 v2
-使用辅助 decoder 合批训练，保存间隔为 500 step，训练完成后验证 checkpoint，再使用
-8 GPU、每卡 3 worker、greedy + 8192 和 prevent-empty 评测全部八个数据集。若 v2 训练
-被中断且存在完整 Trainer checkpoint，可运行：
+该脚本不依赖 v1。首次使用时只需修改脚本顶部配置块中的基座模型、辅助 decoder、训练
+数据集、训练输出、评测模型和评测数据路径。`EVAL_DATASET_GROUP` 可以设为 `all8`、已有
+数据集组，或 `ChartQA_TEST`、`TextVQA_VAL` 等单个数据集。v2 使用辅助 decoder 合批
+训练，保存间隔为 500 step；训练完成后验证 checkpoint，再使用 greedy + 8192 和
+prevent-empty 进行评测。若训练被中断且输出目录中存在 Trainer checkpoint，可运行：
 
 ```bash
 bash scripts/run_paper_faithful_v2.sh --resume
 ```
+
+只评测已有模型时，在顶部配置块中设置 `RUN_TRAIN=0`、`RUN_EVAL=1` 和
+`EVAL_MODEL_PATH`。脚本本身不检查 GPU 是否空闲；训练仍使用当前 paper-faithful 的
+8-GPU launcher，GPU 编号由 `TRAIN_GPUS` 和 `EVAL_GPUS` 指定。
 
 换机器时先激活已经准备好的 Python 环境，再运行 pipeline；脚本直接复用当前环境，不需要填写
 Conda 安装目录或环境路径：
