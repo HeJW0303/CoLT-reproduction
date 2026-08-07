@@ -46,6 +46,12 @@ class OracleKTrainingStep:
     backward_index: Optional[int]
 
 
+@dataclass(frozen=True)
+class OracleKInferencePlan:
+    transition_steps: int
+    conditioning_k: int
+
+
 def resolve_colt_inference_latent_transition(environ: Optional[Mapping[str, str]] = None) -> str:
     environ = os.environ if environ is None else environ
     mode = environ.get("COLT_INFERENCE_LATENT_TRANSITION", COLT_INFERENCE_TRANSITION_OFFICIAL)
@@ -281,6 +287,22 @@ def resolve_forced_inference_k(max_k: int, environ: Optional[Mapping[str, str]] 
     return forced_k
 
 
+def resolve_forced_inference_transition_steps(
+    max_k: int,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[int]:
+    environ = os.environ if environ is None else environ
+    value = environ.get("COLT_INFERENCE_TRANSITION_STEPS")
+    if value is None or value.strip() == "":
+        return None
+    forced_steps = int(value)
+    if not 1 <= forced_steps <= max_k:
+        raise ValueError(
+            f"COLT_INFERENCE_TRANSITION_STEPS must be in [1, {max_k}], got {forced_steps}"
+        )
+    return forced_steps
+
+
 def select_oracle_k_inference_steps(
     max_k: int,
     default_k: int,
@@ -302,3 +324,54 @@ def select_oracle_k_inference_steps(
     if not 1 <= latent_steps <= max_k:
         raise ValueError(f"Oracle-K inference steps must be in [1, {max_k}], got {latent_steps}")
     return latent_steps
+
+
+def select_oracle_k_inference_plan(
+    max_k: int,
+    default_k: int,
+    num_hidden_generations: int = 0,
+    forced_k: Optional[int] = None,
+    forced_transition_steps: Optional[int] = None,
+    predicted_k: Optional[int] = None,
+    dynamic_inference: bool = False,
+) -> OracleKInferencePlan:
+    if forced_transition_steps is None:
+        latent_steps = select_oracle_k_inference_steps(
+            max_k=max_k,
+            default_k=default_k,
+            num_hidden_generations=num_hidden_generations,
+            forced_k=forced_k,
+            predicted_k=predicted_k,
+            dynamic_inference=dynamic_inference,
+        )
+        return OracleKInferencePlan(
+            transition_steps=latent_steps,
+            conditioning_k=latent_steps,
+        )
+
+    if num_hidden_generations > 0:
+        raise ValueError(
+            "COLT_INFERENCE_TRANSITION_STEPS cannot be combined with num_hidden_generations"
+        )
+    if forced_k is not None:
+        raise ValueError(
+            "COLT_INFERENCE_TRANSITION_STEPS cannot be combined with COLT_INFERENCE_K"
+        )
+    if not 1 <= forced_transition_steps <= max_k:
+        raise ValueError(f"Forced transition steps must be in [1, {max_k}], got {forced_transition_steps}")
+    if predicted_k is None:
+        raise ValueError("Decoupled transition-step inference requires one predicted semantic K value")
+    if not 1 <= predicted_k <= max_k:
+        raise ValueError(f"Predicted semantic K must be in [1, {max_k}], got {predicted_k}")
+    return OracleKInferencePlan(
+        transition_steps=forced_transition_steps,
+        conditioning_k=predicted_k,
+    )
+
+
+def select_oracle_k_conditioning_step(transition_step: int, conditioning_k: int) -> int:
+    if transition_step < 1:
+        raise ValueError(f"Transition step must be at least 1, got {transition_step}")
+    if conditioning_k < 1:
+        raise ValueError(f"Conditioning K must be at least 1, got {conditioning_k}")
+    return min(transition_step, conditioning_k)

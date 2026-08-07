@@ -1,0 +1,20 @@
+{
+  "MathVista_MINI": {
+    "model": "deepseek-v4-flash",
+    "wire_api": "chat_completions",
+    "reasoning_effort": "low",
+    "thinking": "disabled"
+  },
+  "MathVerse_MINI": {
+    "model": "deepseek-v4-flash",
+    "wire_api": "chat_completions",
+    "reasoning_effort": "low",
+    "thinking": "disabled"
+  },
+  "MMVet": {
+    "model": "deepseek-v4-flash",
+    "wire_api": "chat_completions",
+    "reasoning_effort": "low",
+    "thinking": "disabled"
+  }
+}

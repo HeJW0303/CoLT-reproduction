@@ -48,7 +48,7 @@ Runtime:
   COLT_CHECK_GPU_FREE=1 or COLT_STRICT_PREFLIGHT=1.
 
 Dataset groups:
-  smoke, chartqa, mmstar, phase1, phase2, phase3, remaining7, all8
+  smoke, chartqa, chart-text, mmstar, phase1, phase2, phase3, remaining7, all8
 
 Evaluation options:
   --model-path PATH           Explicit model path (highest priority)

@@ -256,6 +256,20 @@ class OracleKDistributedTrainingPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be in"):
             oracle_k.resolve_forced_inference_k(8, {"COLT_INFERENCE_K": "9"})
 
+    def test_forced_transition_steps_validation(self):
+        self.assertEqual(
+            oracle_k.resolve_forced_inference_transition_steps(
+                8,
+                {"COLT_INFERENCE_TRANSITION_STEPS": "5"},
+            ),
+            5,
+        )
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            oracle_k.resolve_forced_inference_transition_steps(
+                8,
+                {"COLT_INFERENCE_TRANSITION_STEPS": "9"},
+            )
+
     def test_inference_k_priority(self):
         select = oracle_k.select_oracle_k_inference_steps
         self.assertEqual(
@@ -282,6 +296,61 @@ class OracleKDistributedTrainingPlanTest(unittest.TestCase):
     def test_dynamic_inference_requires_prediction(self):
         with self.assertRaisesRegex(ValueError, "requires one predicted K"):
             oracle_k.select_oracle_k_inference_steps(8, 3, dynamic_inference=True)
+
+    def test_default_inference_plan_preserves_coupled_k_behavior(self):
+        plan = oracle_k.select_oracle_k_inference_plan(
+            8,
+            3,
+            forced_k=5,
+            predicted_k=2,
+            dynamic_inference=True,
+        )
+
+        self.assertEqual(plan.transition_steps, 5)
+        self.assertEqual(plan.conditioning_k, 5)
+
+    def test_decoupled_inference_plan_uses_predicted_k_for_conditioning(self):
+        plan = oracle_k.select_oracle_k_inference_plan(
+            8,
+            3,
+            forced_transition_steps=5,
+            predicted_k=2,
+            dynamic_inference=True,
+        )
+
+        self.assertEqual(plan.transition_steps, 5)
+        self.assertEqual(plan.conditioning_k, 2)
+        self.assertEqual(
+            [
+                oracle_k.select_oracle_k_conditioning_step(step, plan.conditioning_k)
+                for step in range(1, plan.transition_steps + 1)
+            ],
+            [1, 2, 2, 2, 2],
+        )
+
+    def test_decoupled_inference_rejects_ambiguous_or_missing_controls(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined with num_hidden_generations"):
+            oracle_k.select_oracle_k_inference_plan(
+                8,
+                3,
+                num_hidden_generations=4,
+                forced_transition_steps=5,
+                predicted_k=2,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot be combined with COLT_INFERENCE_K"):
+            oracle_k.select_oracle_k_inference_plan(
+                8,
+                3,
+                forced_k=4,
+                forced_transition_steps=5,
+                predicted_k=2,
+            )
+        with self.assertRaisesRegex(ValueError, "requires one predicted semantic K"):
+            oracle_k.select_oracle_k_inference_plan(
+                8,
+                3,
+                forced_transition_steps=5,
+            )
 
 
 class TeacherSegmentationTest(unittest.TestCase):

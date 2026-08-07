@@ -1,8 +1,30 @@
+import re
+
 from ...smp import *
 from ...utils import can_infer
 
 
 FAIL_MSG = 'Failed to obtain answer via API.'
+
+
+_BARE_BINARY_SCORE = re.compile(r'^\s*([01])\s*$')
+_LABELLED_BINARY_SCORE = re.compile(
+    r'^\s*(?:final\s+)?judg(?:e)?ment\s*(?::|is)?\s*([01])\s*[.!]*\s*$',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_mathverse_score_response(response):
+    """Return a binary MathVerse judgement, or None for an ambiguous response."""
+    text = str(response)
+    bare_match = _BARE_BINARY_SCORE.fullmatch(text)
+    if bare_match:
+        return int(bare_match.group(1))
+
+    labelled_scores = [int(match.group(1)) for match in _LABELLED_BINARY_SCORE.finditer(text)]
+    if labelled_scores and len(set(labelled_scores)) == 1:
+        return labelled_scores[0]
+    return None
 
 
 def get_gpt4_extract_ICE():
@@ -153,11 +175,12 @@ def MathVerse_auxeval_score(model, line):
         prediction = line['prediction']
         res = model.generate(prompt, temperature=i * 0.5)
 
-        if FAIL_MSG in res or res.strip() not in ['0', '1']:
+        score = parse_mathverse_score_response(res)
+        if FAIL_MSG in res or score is None:
             log += f'Try {i}: output is {prediction}, res is {res}, failed to parse.\n'
         else:
             log += 'Succeed'
-            return dict(log_score=log, score=int(res) == 1)
+            return dict(log_score=log, score=score == 1)
     log += 'All 5 retries failed.\n'
     return dict(log_score=log, score=False)
 

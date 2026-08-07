@@ -7,6 +7,10 @@ APIBASES = {
     'OFFICIAL': 'https://api.openai.com/v1/chat/completions',
 }
 
+RESPONSES_APIBASES = {
+    'OFFICIAL': 'https://api.openai.com/v1/responses',
+}
+
 
 def GPT_context_window(model):
     length_map = {
@@ -46,6 +50,9 @@ class OpenAIWrapper(BaseAPI):
                  img_size: int = -1,
                  img_detail: str = 'low',
                  use_azure: bool = False,
+                 wire_api: str = 'chat_completions',
+                 reasoning_effort: str = None,
+                 responses_max_output_tokens: int = None,
                  **kwargs):
 
         self.model = model
@@ -54,6 +61,15 @@ class OpenAIWrapper(BaseAPI):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.use_azure = use_azure
+        if wire_api not in ['chat_completions', 'responses']:
+            raise ValueError(f'Unsupported OpenAI wire API: {wire_api}')
+        if use_azure and wire_api != 'chat_completions':
+            raise ValueError('Responses API is not supported by the Azure adapter.')
+        if responses_max_output_tokens is not None and responses_max_output_tokens <= 0:
+            raise ValueError('responses_max_output_tokens must be a positive integer.')
+        self.wire_api = wire_api
+        self.reasoning_effort = reasoning_effort
+        self.responses_max_output_tokens = responses_max_output_tokens
 
         if 'step' in model:
             env_key = os.environ.get('STEPAI_API_KEY', '')
@@ -146,8 +162,9 @@ class OpenAIWrapper(BaseAPI):
 
             assert api_base is not None
 
-            if api_base in APIBASES:
-                self.api_base = APIBASES[api_base]
+            api_bases = RESPONSES_APIBASES if self.wire_api == 'responses' else APIBASES
+            if api_base in api_bases:
+                self.api_base = api_bases[api_base]
             elif api_base.startswith('http'):
                 self.api_base = api_base
             else:
@@ -157,7 +174,7 @@ class OpenAIWrapper(BaseAPI):
                 self.api_base = os.environ.get('BOYUE_API_BASE')
                 self.key = os.environ.get('BOYUE_API_KEY')
 
-        self.logger.info(f'Using API Base: {self.api_base}; API Key: {self.key}')
+        self.logger.info(f'Using API Base: {self.api_base}; API Key: [REDACTED]')
 
     # inputs can be a lvl-2 nested list: [content1, content2, content3, ...]
     # content can be a string or a list of image & text
@@ -195,6 +212,45 @@ class OpenAIWrapper(BaseAPI):
             input_msgs.append(dict(role='user', content=self.prepare_itlist(inputs)))
         return input_msgs
 
+    @staticmethod
+    def prepare_responses_inputs(input_msgs):
+        responses_input = []
+        for message in input_msgs:
+            content = []
+            for item in message['content']:
+                if item['type'] == 'text':
+                    content.append(dict(type='input_text', text=item['text']))
+                elif item['type'] == 'image_url':
+                    image = item['image_url']
+                    content.append(dict(
+                        type='input_image',
+                        image_url=image['url'],
+                        detail=image['detail'],
+                    ))
+                else:
+                    raise ValueError(f'Unsupported Responses input type: {item["type"]}')
+            responses_input.append(dict(role=message['role'], content=content))
+        return responses_input
+
+    @staticmethod
+    def parse_responses_text(resp_struct):
+        output_text = resp_struct.get('output_text')
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        text_parts = []
+        for output_item in resp_struct.get('output', []):
+            if output_item.get('type') != 'message':
+                continue
+            for content_item in output_item.get('content', []):
+                if content_item.get('type') == 'output_text':
+                    text = content_item.get('text')
+                    if isinstance(text, str):
+                        text_parts.append(text)
+        if not text_parts:
+            raise ValueError('Responses payload contains no output_text content.')
+        return ''.join(text_parts).strip()
+
     def generate_inner(self, inputs, **kwargs) -> str:
         input_msgs = self.prepare_inputs(inputs)
         temperature = kwargs.pop('temperature', self.temperature)
@@ -210,23 +266,36 @@ class OpenAIWrapper(BaseAPI):
         if hasattr(self, 'baidu_appid'):
             headers['appid'] = self.baidu_appid
 
-        payload = dict(
-            model=self.model,
-            messages=input_msgs,
-            n=1,
-            temperature=temperature,
-            **kwargs)
-
-        if self.is_max_completion_tokens:
-            payload['max_completion_tokens'] = max_tokens
-            payload.pop('temperature')
+        if self.wire_api == 'responses':
+            kwargs.pop('n', None)
+            payload = dict(
+                model=self.model,
+                input=self.prepare_responses_inputs(input_msgs),
+                max_output_tokens=self.responses_max_output_tokens or max_tokens,
+                **kwargs,
+            )
+            if self.reasoning_effort is not None:
+                payload['reasoning'] = {'effort': self.reasoning_effort}
         else:
-            payload['max_tokens'] = max_tokens
+            payload = dict(
+                model=self.model,
+                messages=input_msgs,
+                n=1,
+                temperature=temperature,
+                **kwargs)
 
-        if 'gemini' in self.model:
-            payload.pop('max_tokens')
-            payload.pop('n')
-            payload['reasoning_effort'] = 'high'
+            if self.is_max_completion_tokens:
+                payload['max_completion_tokens'] = max_tokens
+                payload.pop('temperature')
+            else:
+                payload['max_tokens'] = max_tokens
+
+            if 'gemini' in self.model:
+                payload.pop('max_tokens')
+                payload.pop('n')
+                payload['reasoning_effort'] = 'high'
+            elif 'deepseek' in self.model.lower() and self.reasoning_effort is not None:
+                payload['reasoning_effort'] = self.reasoning_effort
 
         response = requests.post(
             self.api_base,
@@ -236,7 +305,10 @@ class OpenAIWrapper(BaseAPI):
         answer = self.fail_msg
         try:
             resp_struct = json.loads(response.text)
-            answer = resp_struct['choices'][0]['message']['content'].strip()
+            if self.wire_api == 'responses':
+                answer = self.parse_responses_text(resp_struct)
+            else:
+                answer = resp_struct['choices'][0]['message']['content'].strip()
         except Exception as err:
             if self.verbose:
                 self.logger.error(f'{type(err)}: {err}')

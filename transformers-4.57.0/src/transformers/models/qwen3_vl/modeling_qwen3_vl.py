@@ -46,14 +46,17 @@ from ...utils.generic import check_model_inputs
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from .modeling_oracle_k import OracleKBudgetConditioner, OracleKPredictor, pool_last_valid_hidden
 from .oracle_k import (
+    OracleKInferencePlan,
     advance_colt_inference_latent,
     build_oracle_k_training_plan,
     initialize_colt_inference_latent,
     parse_oracle_k_cot,
     resolve_colt_inference_latent_transition,
     resolve_forced_inference_k,
+    resolve_forced_inference_transition_steps,
     resolve_oracle_k_settings,
-    select_oracle_k_inference_steps,
+    select_oracle_k_conditioning_step,
+    select_oracle_k_inference_plan,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.cuda.amp import autocast
@@ -1835,6 +1838,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.oracle_k_dynamic_inference = oracle_k_settings.dynamic_inference
         self.last_oracle_k_prediction = None
         self.last_oracle_k_used = None
+        self.last_oracle_k_conditioning = None
         self._oracle_k_predictor_preflight_done = False
         self._oracle_k_first_batch_logged = False
         self._oracle_k_metric_loss_sum = None
@@ -2185,15 +2189,25 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         count = totals[2].clamp_min(1)
         return totals[0] / count, totals[1] / count, totals[2]
 
-    def _resolve_latent_steps_for_inference(self, num_hidden_generations, predicted_k=None):
+    def _resolve_oracle_k_inference_plan(self, num_hidden_generations, predicted_k=None):
         if not self.oracle_k_enabled:
-            return num_hidden_generations if num_hidden_generations > 0 else self.num_latent
+            latent_steps = num_hidden_generations if num_hidden_generations > 0 else self.num_latent
+            return OracleKInferencePlan(
+                transition_steps=latent_steps,
+                conditioning_k=latent_steps,
+            )
 
         forced_k = None
+        forced_transition_steps = resolve_forced_inference_transition_steps(self.oracle_k_max)
         if num_hidden_generations <= 0:
             forced_k = resolve_forced_inference_k(self.oracle_k_max)
         predicted_k_value = None
         if predicted_k is not None:
+            if predicted_k.numel() != 1 and forced_transition_steps is not None:
+                raise ValueError(
+                    "Decoupled transition-step inference currently requires batch size 1; "
+                    f"received {predicted_k.numel()} predicted K values"
+                )
             if (
                 predicted_k.numel() != 1
                 and self.oracle_k_dynamic_inference
@@ -2206,14 +2220,21 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 )
             if predicted_k.numel() == 1:
                 predicted_k_value = int(predicted_k.reshape(-1)[0].item())
-        return select_oracle_k_inference_steps(
+        return select_oracle_k_inference_plan(
             max_k=self.oracle_k_max,
             default_k=self.num_latent,
             num_hidden_generations=num_hidden_generations,
             forced_k=forced_k,
+            forced_transition_steps=forced_transition_steps,
             predicted_k=predicted_k_value,
             dynamic_inference=self.oracle_k_dynamic_inference,
         )
+
+    def _resolve_latent_steps_for_inference(self, num_hidden_generations, predicted_k=None):
+        return self._resolve_oracle_k_inference_plan(
+            num_hidden_generations,
+            predicted_k=predicted_k,
+        ).transition_steps
         
 
     def get_input_embeddings(self):
@@ -2837,10 +2858,14 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         )
         k_logits = self._predict_oracle_k(hidden_states, attention_mask)
         predicted_k = torch.argmax(k_logits, dim=-1) + 1 if k_logits is not None else None
-        latent_steps = self._resolve_latent_steps_for_inference(num_hidden_generations, predicted_k=predicted_k)
+        inference_plan = self._resolve_oracle_k_inference_plan(
+            num_hidden_generations,
+            predicted_k=predicted_k,
+        )
         self.last_oracle_k_prediction = predicted_k.detach().cpu() if predicted_k is not None else None
-        self.last_oracle_k_used = latent_steps
-        for i in range(latent_steps):
+        self.last_oracle_k_used = inference_plan.transition_steps
+        self.last_oracle_k_conditioning = inference_plan.conditioning_k
+        for i in range(inference_plan.transition_steps):
             past_seen_tokens = past_key_values.get_seq_length()
             step_cache_position = torch.arange(
                 past_seen_tokens,
@@ -2848,7 +2873,15 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 device=latent_embd.device,
             )
             step_attention_mask = torch.ones((latent_embd.shape[0], 1), dtype=torch.long, device=latent_embd.device)
-            latent_step_input = self._condition_latent_with_oracle_k(latent_embd, latent_steps, i + 1)
+            conditioning_step = select_oracle_k_conditioning_step(
+                i + 1,
+                inference_plan.conditioning_k,
+            )
+            latent_step_input = self._condition_latent_with_oracle_k(
+                latent_embd,
+                inference_plan.conditioning_k,
+                conditioning_step,
+            )
             step_outputs = self.model(
                 inputs_embeds=latent_step_input,
                 past_key_values=past_key_values,

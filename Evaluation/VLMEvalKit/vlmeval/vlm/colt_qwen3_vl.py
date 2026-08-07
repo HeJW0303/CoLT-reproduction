@@ -284,8 +284,13 @@ class Qwen3VLChat(BaseModel):
             predicted_k = getattr(self.model, "last_oracle_k_prediction", None)
             used_k = getattr(self.model, "last_oracle_k_used", None)
             if predicted_k is not None:
+                plan_suffix = ""
+                if os.environ.get("COLT_LOG_ORACLE_K_PLAN", "0") == "1":
+                    conditioning_k = getattr(self.model, "last_oracle_k_conditioning", None)
+                    plan_suffix = f" conditioning_k={conditioning_k}"
                 print(
-                    f"[CoLT Oracle-K] predicted_k={predicted_k.reshape(-1).tolist()} used_k={used_k}",
+                    f"[CoLT Oracle-K] predicted_k={predicted_k.reshape(-1).tolist()} "
+                    f"used_k={used_k}{plan_suffix}",
                     flush=True,
                 )
         return generated_ids[:, inputs.input_ids.shape[1] :]

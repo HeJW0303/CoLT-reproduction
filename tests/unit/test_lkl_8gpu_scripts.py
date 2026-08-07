@@ -21,6 +21,20 @@ TRANSITION_EVAL_SCRIPT = (
     / "lkl_8gpu"
     / "20_eval_transition_consistency_4checkpoints.sh"
 )
+ORACLE_K_SWEEP_SCRIPT = (
+    REPO_ROOT
+    / "tests"
+    / "integration"
+    / "lkl_8gpu"
+    / "21_eval_oracle_k_sweep_chart_text.sh"
+)
+DECOUPLED_STEP_SWEEP_SCRIPT = (
+    REPO_ROOT
+    / "tests"
+    / "integration"
+    / "lkl_8gpu"
+    / "22_eval_decoupled_steps_chart_text.sh"
+)
 SFT_WORKFLOW = (
     REPO_ROOT
     / "LLaMA-Factory"
@@ -44,7 +58,12 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         )
 
     def test_all_shell_files_parse(self) -> None:
-        shell_files = sorted(SCRIPT_ROOT.rglob("*.sh")) + [PIPELINE_SCRIPT, TRANSITION_EVAL_SCRIPT]
+        shell_files = sorted(SCRIPT_ROOT.rglob("*.sh")) + [
+            PIPELINE_SCRIPT,
+            TRANSITION_EVAL_SCRIPT,
+            ORACLE_K_SWEEP_SCRIPT,
+            DECOUPLED_STEP_SWEEP_SCRIPT,
+        ]
         self.assertTrue(shell_files)
         result = subprocess.run(
             ["bash", "-n", *map(str, shell_files)],
@@ -79,6 +98,175 @@ class Lkl8GpuScriptTests(unittest.TestCase):
         self.assertEqual(len(set(datasets)), 8)
         self.assertIn("ChartQA_TEST", datasets)
         self.assertIn("MMStar", datasets)
+
+    def test_chart_text_dataset_group_contains_only_target_tasks(self) -> None:
+        result = self.run_bash(
+            f'source "{SCRIPT_ROOT}/lib/datasets.sh"; dataset_group chart-text'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["ChartQA_TEST", "TextVQA_VAL"])
+
+    def test_oracle_k_sweep_dry_run_is_isolated_and_eval_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "oracle-k-checkpoint"
+            checkpoint.mkdir()
+            conda_env = root / "conda-env"
+            (conda_env / "bin").mkdir(parents=True)
+            (conda_env / "bin" / "python").symlink_to(sys.executable)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ORACLE_K_SWEEP_SCRIPT),
+                    "--k-values",
+                    "1,4,8",
+                    "--model-path",
+                    str(checkpoint),
+                    "--conda-env",
+                    str(conda_env),
+                    "--output-root",
+                    str(root / "results"),
+                    "--log-root",
+                    str(root / "logs"),
+                    "--dry-run",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("COLT_INFERENCE_K="), 3)
+        for k in (1, 4, 8):
+            self.assertIn(f"COLT_INFERENCE_K={k}", result.stdout)
+            self.assertIn(f"results/k{k}", result.stdout)
+            self.assertIn(f"logs/k{k}", result.stdout)
+            self.assertIn(f"COLT_EVAL_LOG_LABEL=oracle-k-fixed-k{k}", result.stdout)
+        self.assertIn("COLT_LOG_PREDICTED_K=1", result.stdout)
+        self.assertIn("eval oracle-k chart-text", result.stdout)
+        self.assertIn("--generation respect-args", result.stdout)
+        self.assertIn("--latent-transition official", result.stdout)
+        self.assertIn("--empty-response-policy prevent", result.stdout)
+        self.assertNotIn(" train ", result.stdout)
+        self.assertNotIn("--no-reuse", result.stdout)
+
+    def test_oracle_k_sweep_rejects_out_of_range_k(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "oracle-k-checkpoint"
+            checkpoint.mkdir()
+            conda_env = Path(directory) / "conda-env"
+            (conda_env / "bin").mkdir(parents=True)
+            (conda_env / "bin" / "python").symlink_to(sys.executable)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ORACLE_K_SWEEP_SCRIPT),
+                    "--k-values",
+                    "0,9",
+                    "--model-path",
+                    str(checkpoint),
+                    "--conda-env",
+                    str(conda_env),
+                    "--dry-run",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Each K must be an integer in [1, 8]", result.stderr)
+
+    def test_decoupled_step_sweep_dry_run_is_isolated_and_eval_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "oracle-k-checkpoint"
+            checkpoint.mkdir()
+            conda_env = root / "conda-env"
+            (conda_env / "bin").mkdir(parents=True)
+            (conda_env / "bin" / "python").symlink_to(sys.executable)
+            environment = os.environ.copy()
+            environment["COLT_INFERENCE_K"] = "7"
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(DECOUPLED_STEP_SWEEP_SCRIPT),
+                    "--step-values",
+                    "1,3,8",
+                    "--model-path",
+                    str(checkpoint),
+                    "--conda-env",
+                    str(conda_env),
+                    "--output-root",
+                    str(root / "results"),
+                    "--log-root",
+                    str(root / "logs"),
+                    "--dry-run",
+                ],
+                cwd=REPO_ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("COLT_INFERENCE_TRANSITION_STEPS="), 3)
+        for steps in (1, 3, 8):
+            self.assertIn(f"COLT_INFERENCE_TRANSITION_STEPS={steps}", result.stdout)
+            self.assertIn(f"results/s{steps}", result.stdout)
+            self.assertIn(f"logs/s{steps}", result.stdout)
+            self.assertIn(
+                f"COLT_EVAL_LOG_LABEL=oracle-k-predicted-budget-s{steps}",
+                result.stdout,
+            )
+        self.assertNotIn("COLT_INFERENCE_K=", result.stdout)
+        self.assertIn("COLT_LOG_PREDICTED_K=1", result.stdout)
+        self.assertIn("COLT_LOG_ORACLE_K_PLAN=1", result.stdout)
+        self.assertIn("COLT_EVAL_SEED=1234", result.stdout)
+        self.assertIn("COLT_EVAL_JUDGE=exact_matching", result.stdout)
+        self.assertIn("COLT_EVAL_RESULT_KIND=standard", result.stdout)
+        self.assertIn("eval oracle-k chart-text", result.stdout)
+        self.assertIn("--generation respect-args", result.stdout)
+        self.assertIn("--latent-transition official", result.stdout)
+        self.assertIn("--empty-response-policy prevent", result.stdout)
+        self.assertNotIn(" train ", result.stdout)
+        self.assertNotIn("--no-reuse", result.stdout)
+
+    def test_decoupled_step_sweep_rejects_out_of_range_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "oracle-k-checkpoint"
+            checkpoint.mkdir()
+            conda_env = root / "conda-env"
+            (conda_env / "bin").mkdir(parents=True)
+            (conda_env / "bin" / "python").symlink_to(sys.executable)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(DECOUPLED_STEP_SWEEP_SCRIPT),
+                    "--step-values",
+                    "0,9",
+                    "--model-path",
+                    str(checkpoint),
+                    "--conda-env",
+                    str(conda_env),
+                    "--dry-run",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("transition-step count must be an integer in [1, 8]", result.stderr)
 
     def test_cli_model_path_overrides_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

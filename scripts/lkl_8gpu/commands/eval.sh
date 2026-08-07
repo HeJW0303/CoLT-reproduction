@@ -90,6 +90,12 @@ cmd_eval() {
   local backend="${VLMEVAL_DIST_BACKEND:-gloo}" reseed="${COLT_RESEED_PER_SAMPLE:-1}"
   local empty_response_policy="${COLT_EMPTY_RESPONSE_POLICY:-allow}"
   local log_label="${COLT_EVAL_LOG_LABEL:-$target}"
+  local judge="${COLT_EVAL_JUDGE:-exact_matching}"
+  local judge_args="${COLT_EVAL_JUDGE_ARGS:-}"
+  local judge_nproc="${COLT_EVAL_JUDGE_NPROC:-4}"
+  local judge_retry="${COLT_EVAL_JUDGE_RETRY:-3}"
+  local judge_profile="${COLT_EVAL_JUDGE_PROFILE:-$judge}"
+  local result_kind="${COLT_EVAL_RESULT_KIND:-standard}"
   local verbose="${EVAL_VERBOSE:-0}" reuse=1
   while (( $# > 0 )); do
     case "$1" in
@@ -129,6 +135,17 @@ cmd_eval() {
   [[ "$reseed" == 0 || "$reseed" == 1 ]] || die "--reseed-per-sample must be 0 or 1"
   [[ "$empty_response_policy" == allow || "$empty_response_policy" == prevent ]] || die \
     "--empty-response-policy must be allow or prevent"
+  [[ "$judge" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die \
+    "COLT_EVAL_JUDGE contains unsupported characters"
+  [[ "$judge_profile" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die \
+    "COLT_EVAL_JUDGE_PROFILE contains unsupported characters"
+  [[ "$judge_nproc" =~ ^[1-9][0-9]*$ ]] || die "COLT_EVAL_JUDGE_NPROC must be a positive integer"
+  [[ "$judge_retry" =~ ^[1-9][0-9]*$ ]] || die "COLT_EVAL_JUDGE_RETRY must be a positive integer"
+  case "$result_kind" in standard|external-judge) ;; *) die \
+    "COLT_EVAL_RESULT_KIND must be standard or external-judge" ;; esac
+  if [[ "$result_kind" == external-judge && "$judge" == exact_matching ]]; then
+    die "External-judge results require a non-exact judge"
+  fi
   if [[ "$target" == baseline && "$empty_response_policy" != allow ]]; then
     die "baseline does not support --empty-response-policy prevent"
   fi
@@ -155,7 +172,16 @@ cmd_eval() {
   verify_eval_model "$target"
 
   local -a datasets
-  mapfile -t datasets < <(dataset_group "$group")
+  if [[ "$result_kind" == external-judge && -n "${COLT_EVAL_DATASETS:-}" ]]; then
+    IFS=',' read -r -a datasets <<< "$COLT_EVAL_DATASETS"
+    local configured_dataset
+    for configured_dataset in "${datasets[@]}"; do
+      dataset_group "$configured_dataset" >/dev/null || die \
+        "Unknown dataset in COLT_EVAL_DATASETS: $configured_dataset"
+    done
+  else
+    mapfile -t datasets < <(dataset_group "$group")
+  fi
   (( ${#datasets[@]} > 0 )) || die "Unknown dataset group: $group"
   if [[ "$group" == smoke ]]; then
     download_dataset MMStar
@@ -213,17 +239,34 @@ cmd_eval() {
   python "$COLT_SCRIPT_ROOT/tools/verify_eval_env.py" --repo-root "$REPO_ROOT" --adapter "$adapter_mode"
 
   local nproc=$(( ${#COLT_GPU_IDS[@]} * workers )) fingerprint profile eval_id work_dir log_dir log_file
+  local dataset_fingerprint oracle_k_forced_k oracle_k_forced_transition_steps
+  dataset_fingerprint="$(IFS=,; echo "${datasets[*]}")"
+  oracle_k_forced_k=""
+  oracle_k_forced_transition_steps=""
+  if [[ "$target" == oracle-k ]]; then
+    oracle_k_forced_k="${COLT_INFERENCE_K:-}"
+    oracle_k_forced_transition_steps="${COLT_INFERENCE_TRANSITION_STEPS:-}"
+  fi
   local generation_label
   generation_label="$(generation_log_label "$generation" "$empty_response_policy")"
   fingerprint="$(python "$COLT_SCRIPT_ROOT/tools/eval_fingerprint.py" \
     --repo-root "$REPO_ROOT" --model-dir "$source_model_path" \
-    --setting "target=$target" --setting "group=$group" --setting "generation=$generation" \
+    --setting "target=$target" --setting "group=$group" --setting "datasets=$dataset_fingerprint" \
+    --setting "generation=$generation" \
     --setting "latent_transition=$latent_transition" \
     --setting "seed=${COLT_EVAL_SEED:-1234}" --setting "workers=$workers" \
     --setting "prefetch=$prefetch" --setting "empty_cache=$empty_cache" \
     --setting "backend=$backend" --setting "reseed=$reseed" \
-    --setting "empty_response_policy=$empty_response_policy")"
+    --setting "empty_response_policy=$empty_response_policy" \
+    --setting "oracle_k_forced_k=${oracle_k_forced_k:-auto}" \
+    --setting "oracle_k_forced_transition_steps=${oracle_k_forced_transition_steps:-auto}" \
+    --setting "judge=$judge" --setting "judge_args=$judge_args" \
+    --setting "judge_nproc=$judge_nproc" --setting "judge_retry=$judge_retry" \
+    --setting "result_kind=$result_kind")"
   profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_lt${latent_transition//-/_}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
+  if [[ "$result_kind" == external-judge ]]; then
+    profile="${profile}_judge_${judge_profile}"
+  fi
   work_dir="$EVAL_OUTPUT_ROOT/$target/$group/$profile"
   eval_id="$(printf '%s_%s' "$target" "$profile" | tr '[:lower:]-' '[:upper:]_')"
   log_dir="$EVAL_LOG_ROOT/$log_label"
@@ -257,7 +300,17 @@ cmd_eval() {
   echo "effective_do_sample=$effective_sample"
   echo "requested_max_new_tokens=8192"
   echo "effective_max_new_tokens=$effective_tokens"
+  if [[ "$target" == oracle-k ]]; then
+    if [[ -n "$oracle_k_forced_k" ]]; then
+      echo "Oracle-K inference control: forced K=$oracle_k_forced_k"
+    elif [[ -n "$oracle_k_forced_transition_steps" ]]; then
+      echo "Oracle-K inference control: forced transition steps=$oracle_k_forced_transition_steps"
+    else
+      echo "Oracle-K inference control: checkpoint default/dynamic policy"
+    fi
+  fi
   echo "Fingerprint: $fingerprint"
+  echo "Judge: $judge; API workers: $judge_nproc; retries: $judge_retry"
   echo "Results: $work_dir"
   echo "Log: $log_file"
 
@@ -265,13 +318,47 @@ cmd_eval() {
   local -a args=(
     --standalone --nnodes=1 --nproc_per_node="$nproc" --max_restarts=0
     run.py --data "${datasets[@]}" --model "$model_name" --work-dir "$work_dir"
-    --mode all --judge exact_matching
+    --judge "$judge" --api-nproc "$judge_nproc" --retry "$judge_retry"
   )
+  [[ -z "$judge_args" ]] || args+=(--judge-args "$judge_args")
   (( reuse == 0 )) || args+=(--reuse)
   (( verbose == 0 )) || args+=(--verbose)
-  torchrun "${args[@]}"
 
-  if [[ "$group" == smoke ]]; then
+  if [[ "$result_kind" == external-judge ]]; then
+    echo "External judge mode: distributed inference followed by single-process judge evaluation."
+    torchrun "${args[@]}" --mode infer
+
+    local judge_result_dir="$work_dir/$model_name/$eval_id"
+    python "$COLT_SCRIPT_ROOT/external_judge/prepare_judge_resume.py" \
+      --result-dir "$judge_result_dir" --model-name "$model_name" --judge-model "$judge" \
+      "${datasets[@]}"
+
+    echo "External judge mode: starting single-process judge evaluation."
+    local -a single_process_args=(
+      --data "${datasets[@]}" --model "$model_name" --work-dir "$work_dir"
+      --mode eval --judge "$judge" --api-nproc "$judge_nproc" --retry "$judge_retry"
+    )
+    [[ -z "$judge_args" ]] || single_process_args+=(--judge-args "$judge_args")
+    (( reuse == 0 )) || single_process_args+=(--reuse)
+    (( verbose == 0 )) || single_process_args+=(--verbose)
+    env -u WORLD_SIZE -u RANK -u LOCAL_RANK -u LOCAL_WORLD_SIZE \
+      VLMEVAL_WORKERS_PER_GPU=1 \
+      python run.py "${single_process_args[@]}"
+  else
+    torchrun "${args[@]}" --mode all
+  fi
+
+  if [[ "$result_kind" == external-judge ]]; then
+    local -a validation_args=(
+      --work-dir "$work_dir" --model-name "$model_name" --eval-id "$eval_id"
+      --data-root "$EVAL_DATA_ROOT" --judge-model "$judge"
+    )
+    if [[ "$empty_response_policy" == allow ]]; then
+      validation_args+=(--allow-empty-predictions)
+    fi
+    validation_args+=("${datasets[@]}")
+    python "$COLT_SCRIPT_ROOT/external_judge/validate_results.py" "${validation_args[@]}"
+  elif [[ "$group" == smoke ]]; then
     python "$COLT_SCRIPT_ROOT/tools/validate_smoke.py" "$work_dir" "$model_name" "$eval_id"
   else
     python "$COLT_SCRIPT_ROOT/tools/validate_eval_suite.py" \
