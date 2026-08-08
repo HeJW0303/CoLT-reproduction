@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/lib/model.sh"
 source "$SCRIPT_DIR/commands/setup.sh"
 source "$SCRIPT_DIR/commands/train.sh"
 source "$SCRIPT_DIR/commands/eval.sh"
+source "$SCRIPT_DIR/commands/rl.sh"
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,7 @@ Usage:
   colt.sh setup {env|assets|data|eval|all}
   colt.sh verify {ready|nccl|model TARGET [--model-path PATH]}
   colt.sh train {codefaithful|paper-faithful|oracle-k} [--resume] [--batch-aux]
+  colt.sh rl {prepare-data|audit|train} [options]
   colt.sh download {all8|remaining7|phase1|phase2|phase3|DATASET...}
   colt.sh eval TARGET GROUP [options]
 
@@ -39,6 +41,18 @@ COLT_BATCH_AUX_DECODERS=1 is equivalent to --batch-aux for paper-faithful
 and oracle-k training.
 COLT_AUX_MAX_BATCH_TOKENS sets the auxiliary decoder padded-token budget
 per call when batching is enabled (default: 4096).
+
+EasyR1 integration:
+  rl prepare-data             Build the fixed image-only OneThinker RL manifest
+  rl audit                    Audit source, checkpoint, and RL dataset contracts
+  rl train                    Run the guarded CoLT Transformers outcome-GRPO path
+  --easyr1-root PATH          Vendored EasyR1 (default: REPO_ROOT/EasyR1)
+  --model-path PATH           fixed-v2 checkpoint to audit
+  --train-file PATH           OneThinker RL JSON/JSONL file to audit
+  --allow-incomplete          Report known blockers without returning a failure status
+  --check-runtime             Also audit packages in the selected Python environment
+  --json                      Emit a machine-readable audit report
+  rl train --dry-run          Validate inputs and print the exact training command
 
 Runtime:
   Activate the prepared environment before running commands:
@@ -77,6 +91,7 @@ case "$command_name" in
   setup) cmd_setup "$@" ;;
   verify) cmd_verify "$@" ;;
   train) cmd_train "$@" ;;
+  rl) cmd_rl "$@" ;;
   download) cmd_download "$@" ;;
   eval) cmd_eval "$@" ;;
   *) usage >&2; die "Unknown command: $command_name" ;;

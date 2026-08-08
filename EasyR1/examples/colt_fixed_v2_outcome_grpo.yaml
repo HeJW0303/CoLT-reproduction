@@ -1,0 +1,96 @@
+data:
+  train_files: ""
+  val_files: ""
+  prompt_key: problem
+  answer_key: answer
+  image_key: images
+  video_key: videos
+  image_dir: null
+  reasoning_mode: latent
+  max_prompt_length: 4096
+  max_response_length: 512
+  rollout_batch_size: 16
+  mini_rollout_batch_size: null
+  val_batch_size: 16
+  format_prompt: null
+  override_chat_template: null
+  shuffle: true
+  seed: 1
+  min_pixels: 3136
+  max_pixels: 1048576
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 8
+
+algorithm:
+  adv_estimator: grpo
+  disable_kl: true
+  use_kl_loss: false
+  online_filtering: false
+
+worker:
+  actor:
+    global_batch_size: 16
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 1
+    max_grad_norm: 1.0
+    padding_free: false
+    dynamic_batching: true
+    ulysses_size: 1
+    use_torch_compile: false
+    model:
+      model_path: ""
+      enable_gradient_checkpointing: false
+      trust_remote_code: false
+      freeze_vision_tower: false
+    optim:
+      lr: 2.0e-6
+      weight_decay: 1.0e-2
+      strategy: adamw_bf16
+      lr_warmup_ratio: 0.0
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+      torch_dtype: bf16
+    offload:
+      offload_params: false
+      offload_optimizer: false
+
+  rollout:
+    name: colt_transformers
+    num_hidden_generations: 3
+    n: 4
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    tensor_parallel_size: 1
+    disable_tqdm: true
+    val_override_config:
+      temperature: 0.0
+      n: 1
+
+  reward:
+    reward_type: batch
+    reward_function: ""
+    reward_function_kwargs:
+      format_weight: 0.1
+
+trainer:
+  total_epochs: 1
+  max_steps: null
+  project_name: colt_easyr1
+  experiment_name: fixed_v2_outcome_grpo
+  logger: ["console"]
+  nnodes: 1
+  n_gpus_per_node: 8
+  max_try_make_batch: 20
+  val_freq: -1
+  val_before_train: false
+  val_only: false
+  val_generations_to_log: 0
+  save_freq: 100
+  save_limit: 3
+  save_model_only: false
+  save_checkpoint_path: checkpoints/colt_easyr1/fixed_v2_outcome_grpo
+  load_checkpoint_path: null
+  find_last_checkpoint: true

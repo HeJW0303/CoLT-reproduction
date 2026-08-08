@@ -61,6 +61,80 @@ from .oracle_k import (
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.cuda.amp import autocast
 
+
+def _extend_colt_cached_attention_mask(
+    prompt_attention_mask: Optional[torch.Tensor],
+    *,
+    past_seen_tokens: int,
+    current_length: int,
+    batch_size: int,
+    device: torch.device,
+    current_attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the 2D mask required by a cached CoLT decoding step.
+
+    Transformers expects a cached decoding mask to span both the existing KV
+    cache and the current query tokens.  CoLT adds latent tokens to that cache,
+    so retaining only a one-token mask makes left-padded prompt positions
+    attendable again after prefill.
+    """
+    if past_seen_tokens < 0:
+        raise ValueError(f"past_seen_tokens must be non-negative, received {past_seen_tokens}.")
+    if current_length <= 0:
+        raise ValueError(f"current_length must be positive, received {current_length}.")
+
+    if prompt_attention_mask is not None:
+        if prompt_attention_mask.ndim != 2:
+            raise ValueError(
+                "CoLT cached decoding requires a rank-2 prompt attention_mask; "
+                f"received shape {tuple(prompt_attention_mask.shape)}."
+            )
+        if prompt_attention_mask.shape[0] != batch_size:
+            raise ValueError(
+                "CoLT cached decoding prompt attention_mask batch size does not match inputs: "
+                f"mask={prompt_attention_mask.shape[0]}, inputs={batch_size}."
+            )
+        prompt_attention_mask = prompt_attention_mask.to(device=device)
+        cached_latent_length = past_seen_tokens - prompt_attention_mask.shape[1]
+        if cached_latent_length < 0:
+            raise ValueError(
+                "CoLT cache is shorter than the prompt attention_mask: "
+                f"cache={past_seen_tokens}, prompt={prompt_attention_mask.shape[1]}."
+            )
+        mask_dtype = prompt_attention_mask.dtype
+        cached_prefix_mask = prompt_attention_mask
+    else:
+        cached_latent_length = past_seen_tokens
+        mask_dtype = torch.long
+        cached_prefix_mask = torch.empty((batch_size, 0), dtype=mask_dtype, device=device)
+
+    if current_attention_mask is None:
+        current_attention_mask = torch.ones(
+            (batch_size, current_length),
+            dtype=mask_dtype,
+            device=device,
+        )
+    else:
+        if current_attention_mask.ndim != 2:
+            raise ValueError(
+                "CoLT cached decoding requires a rank-2 current attention_mask; "
+                f"received shape {tuple(current_attention_mask.shape)}."
+            )
+        if current_attention_mask.shape != (batch_size, current_length):
+            raise ValueError(
+                "CoLT cached decoding current attention_mask shape does not match inputs: "
+                f"mask={tuple(current_attention_mask.shape)}, expected={(batch_size, current_length)}."
+            )
+        current_attention_mask = current_attention_mask.to(device=device, dtype=mask_dtype)
+
+    cached_latent_mask = torch.ones(
+        (batch_size, cached_latent_length),
+        dtype=mask_dtype,
+        device=device,
+    )
+    return torch.cat((cached_prefix_mask, cached_latent_mask, current_attention_mask), dim=1)
+
+
 class Qwen3VLVisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1792,6 +1866,10 @@ def _is_colt_aux_batching_enabled():
     return os.environ.get("COLT_BATCH_AUX_DECODERS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_colt_rl_mode_enabled():
+    return os.environ.get("COLT_RL_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_colt_rank_zero():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
@@ -1817,6 +1895,9 @@ def _colt_component_log_interval():
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
+    _keys_to_ignore_on_load_unexpected = [
+        r"^(decoder|backward_decoder|pj_in|pj_out|pj_back)\."
+    ]
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False
     config: Qwen3VLConfig
@@ -1826,6 +1907,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.paper_faithful = _is_colt_paper_faithful_enabled()
+        self.colt_rl_mode = _is_colt_rl_mode_enabled()
         self.batch_aux_decoders = self.paper_faithful and _is_colt_aux_batching_enabled()
         self._colt_forward_microbatch_count = 0
         self.inference_latent_transition = resolve_colt_inference_latent_transition()
@@ -1861,7 +1943,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.decoder = None
         self.backward_decoder = None
         self._decoder_name_or_path = os.environ.get("COLT_DECODER_MODEL_PATH", "Qwen/Qwen3-0.6B")
-        if self.training:
+        if self.training and not self.colt_rl_mode:
             self.decoder = AutoModelForCausalLM.from_pretrained(
                 self._decoder_name_or_path,
                 torch_dtype=config.text_config.dtype,
@@ -1922,10 +2004,17 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         )
         # Latent hidden states after LayerNorm typically have std~1, while token embeddings are much smaller.
         # Without scaling, fp16/bf16 attention can overflow and produce NaNs in early decoder layers.
-        self.latent_to_decoder_scale = nn.Parameter(torch.tensor(0.02, dtype=torch.float32))
-        self.alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        # FSDP cannot flatten zero-dimensional Parameters. Keep these as
+        # one-element vectors; multiplication retains scalar broadcasting.
+        self.latent_to_decoder_scale = nn.Parameter(torch.tensor([0.02], dtype=torch.float32))
+        self.alpha = nn.Parameter(torch.tensor([0.1], dtype=torch.float32))
 
-        tokenizer = AutoTokenizer.from_pretrained(self._decoder_name_or_path)
+        tokenizer_source = self._decoder_name_or_path
+        if self.colt_rl_mode:
+            tokenizer_source = os.environ.get("COLT_RL_TOKENIZER_PATH", getattr(config, "_name_or_path", ""))
+            if not tokenizer_source:
+                raise ValueError("COLT_RL_MODE requires COLT_RL_TOKENIZER_PATH or config._name_or_path")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
         self.think_token_id = tokenizer.encode("<think>", add_special_tokens=False)[0]
         self.end_think_token_id = tokenizer.encode("</think>", add_special_tokens=False)[0]
         self.answer_token_id = tokenizer.encode("answer", add_special_tokens=False)[0]
@@ -1941,6 +2030,32 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if self.training and self.decoder is not None:
             self.decoder.gradient_checkpointing_enable()
         self.tokenizer = tokenizer
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Load pre-FSDP CoLT checkpoints that stored scalar parameters."""
+        for parameter_name in ("latent_to_decoder_scale", "alpha"):
+            checkpoint_key = prefix + parameter_name
+            checkpoint_value = state_dict.get(checkpoint_key)
+            if checkpoint_value is not None and checkpoint_value.ndim == 0:
+                state_dict[checkpoint_key] = checkpoint_value.reshape(1)
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _parse_oracle_k_steps(self, cot_ids):
         cot_text = self.tokenizer.decode(
@@ -2283,6 +2398,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         num_hidden_generations: int = 0,  # The num of generate latent states
         hidden_generation_mode: bool = False,  # enable latent model or not
+        colt_rl_response_length: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -2300,6 +2416,22 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         """
         k_logits = None
         predicted_k = None
+        if self.latent_reasoning_mode and colt_rl_response_length is not None:
+            if labels is not None:
+                raise ValueError("CoLT RL response scoring accepts response tokens through input_ids, not labels.")
+            kwargs.pop("use_cache", None)
+            return self._forward_latent_response(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                response_length=colt_rl_response_length,
+                num_hidden_generations=num_hidden_generations,
+                **kwargs,
+            )
         if self.latent_reasoning_mode:
             # Prepare the inputs of each process
             # seperate the question, cot procedure and answer of each sample
@@ -2824,6 +2956,84 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             predicted_k=predicted_k,
         )
 
+    def _forward_latent_response(
+        self,
+        input_ids: torch.LongTensor,
+        response_length: int,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        num_hidden_generations: int = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Qwen3VLCausalLMOutputWithPast:
+        if input_ids is None or input_ids.ndim != 2:
+            raise ValueError("CoLT RL response scoring requires rank-2 input_ids.")
+        if not isinstance(response_length, int) or response_length <= 0 or response_length >= input_ids.shape[1]:
+            raise ValueError(
+                "colt_rl_response_length must be a positive integer smaller than the full sequence length; "
+                f"received {response_length!r} for sequence length {input_ids.shape[1]}."
+            )
+
+        prompt_length = input_ids.shape[1] - response_length
+        prompt_input_ids = input_ids[:, :prompt_length]
+        response_ids = input_ids[:, prompt_length:]
+        prompt_attention_mask = attention_mask[:, :prompt_length] if attention_mask is not None else None
+        response_attention_mask = attention_mask[:, prompt_length:] if attention_mask is not None else None
+        prompt_position_ids = position_ids[..., :prompt_length] if position_ids is not None else None
+        latent_outputs = self._forward_latent_reasoning(
+            input_ids=prompt_input_ids,
+            attention_mask=prompt_attention_mask,
+            position_ids=prompt_position_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            num_hidden_generations=num_hidden_generations,
+            **kwargs,
+        )
+
+        latent_embd = latent_outputs.hidden_states[0]
+        teacher_inputs = [latent_embd]
+        if response_length > 1:
+            teacher_inputs.append(self.model.get_input_embeddings()(response_ids[:, :-1]))
+        answer_embeds = torch.cat(teacher_inputs, dim=1)
+        past_seen_tokens = latent_outputs.past_key_values.get_seq_length()
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + response_length,
+            device=input_ids.device,
+        )
+        answer_attention_mask = _extend_colt_cached_attention_mask(
+            prompt_attention_mask,
+            past_seen_tokens=past_seen_tokens,
+            current_length=response_length,
+            batch_size=input_ids.shape[0],
+            device=input_ids.device,
+            current_attention_mask=response_attention_mask,
+        )
+        outputs = self.model(
+            inputs_embeds=answer_embeds,
+            past_key_values=latent_outputs.past_key_values,
+            cache_position=cache_position,
+            attention_mask=answer_attention_mask,
+            position_ids=None,
+            use_cache=True,
+            **kwargs,
+        )
+        logits = self.lm_head(outputs[0])
+        return Qwen3VLCausalLMOutputWithPast(
+            loss=None,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            rope_deltas=outputs.rope_deltas,
+            k_logits=latent_outputs.k_logits,
+            predicted_k=latent_outputs.predicted_k,
+        )
+
     def _forward_latent_reasoning(
         self,
         input_ids: torch.LongTensor,
@@ -2836,6 +3046,19 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         num_hidden_generations: int = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3VLCausalLMOutputWithPast:
+        if position_ids is not None:
+            if position_ids.ndim == 2:
+                max_position_ids = position_ids.max(dim=-1, keepdim=True).values
+            elif position_ids.ndim == 3:
+                max_position_ids = position_ids.max(dim=0).values.max(dim=-1, keepdim=True).values
+            else:
+                raise ValueError(
+                    "CoLT latent reasoning expects rank-2 or rank-3 position_ids; "
+                    f"received shape {tuple(position_ids.shape)}."
+                )
+            prompt_sequence_length = attention_mask.shape[-1] if attention_mask is not None else input_ids.shape[-1]
+            self.model.rope_deltas = max_position_ids + 1 - prompt_sequence_length
+
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2872,7 +3095,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 past_seen_tokens + 1,
                 device=latent_embd.device,
             )
-            step_attention_mask = torch.ones((latent_embd.shape[0], 1), dtype=torch.long, device=latent_embd.device)
+            step_attention_mask = _extend_colt_cached_attention_mask(
+                attention_mask,
+                past_seen_tokens=past_seen_tokens,
+                current_length=1,
+                batch_size=latent_embd.shape[0],
+                device=latent_embd.device,
+            )
             conditioning_step = select_oracle_k_conditioning_step(
                 i + 1,
                 inference_plan.conditioning_k,
@@ -2925,10 +3154,14 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         do_sample: bool = False,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        top_p: float = 1.0,
         eos_token_id: Optional[int] = None,
         prevent_empty_response: bool = False,
+        return_token_log_probs: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.LongTensor:
+    ) -> Union[torch.LongTensor, tuple[torch.LongTensor, torch.FloatTensor]]:
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], received {top_p}.")
         latent_outputs = self._forward_latent_reasoning(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -2944,6 +3177,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         past_key_values = latent_outputs.past_key_values
         latent_embd = latent_outputs.hidden_states[0]
         generated_tokens = []
+        generated_token_log_probs = []
         eos_id = self.eos_token_id if eos_token_id is None else eos_token_id
         next_input_ids = None
         visible_text_generated = [False] * input_ids.shape[0]
@@ -2956,6 +3190,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     min_topk = topk_values[:, -1].unsqueeze(-1)
                     sample_logits = sample_logits.masked_fill(sample_logits < min_topk, float("-inf"))
                 probs = torch.softmax(sample_logits, dim=-1)
+                if top_p < 1.0:
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    remove_mask = cumulative_probs - sorted_probs >= top_p
+                    sorted_probs = sorted_probs.masked_fill(remove_mask, 0.0)
+                    probs = torch.zeros_like(probs).scatter(-1, sorted_indices, sorted_probs)
+                    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(probs.dtype).tiny)
                 return torch.multinomial(probs, num_samples=1)
             return torch.argmax(logits, dim=-1, keepdim=True)
 
@@ -2966,7 +3207,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 past_seen_tokens + 1,
                 device=input_ids.device,
             )
-            step_attention_mask = torch.ones((input_ids.shape[0], 1), dtype=torch.long, device=input_ids.device)
+            step_attention_mask = _extend_colt_cached_attention_mask(
+                attention_mask,
+                past_seen_tokens=past_seen_tokens,
+                current_length=1,
+                batch_size=input_ids.shape[0],
+                device=input_ids.device,
+            )
 
             if next_input_ids is None:
                 step_outputs = self.model(
@@ -3013,6 +3260,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     )
 
             generated_tokens.append(next_token)
+            policy_logits = next_token_logits / max(temperature, 1e-5)
+            generated_token_log_probs.append(
+                torch.log_softmax(policy_logits.float(), dim=-1).gather(dim=-1, index=next_token)
+            )
             next_input_ids = next_token
             if prevent_empty_response and not all(visible_text_generated):
                 generated_so_far = torch.cat(generated_tokens, dim=1).detach().cpu().tolist()
@@ -3029,9 +3280,17 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 break
 
         if len(generated_tokens) == 0:
+            if return_token_log_probs:
+                empty_log_probs = torch.empty(
+                    (input_ids.shape[0], 0), dtype=torch.float32, device=input_ids.device
+                )
+                return input_ids, empty_log_probs
             return input_ids
         new_tokens = torch.cat(generated_tokens, dim=1)
-        return torch.cat([input_ids, new_tokens], dim=1)
+        sequences = torch.cat([input_ids, new_tokens], dim=1)
+        if return_token_log_probs:
+            return sequences, torch.cat(generated_token_log_probs, dim=1)
+        return sequences
 
     @torch.no_grad()
     def generate(self, *args, **kwargs):
@@ -3071,6 +3330,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             do_sample = True
         temperature = kwargs.pop("temperature", 0.6)
         top_k = kwargs.pop("top_k", 20)
+        top_p = kwargs.pop("top_p", 1.0)
         eos_token_id = kwargs.pop("eos_token_id", None)
         prevent_empty_response = kwargs.pop("prevent_empty_response", False)
 
@@ -3109,6 +3369,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             do_sample=do_sample,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
             eos_token_id=eos_token_id,
             prevent_empty_response=prevent_empty_response,
             **kwargs,

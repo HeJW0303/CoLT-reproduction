@@ -132,6 +132,102 @@ bash scripts/lkl_8gpu/colt.sh verify model codefaithful
 bash scripts/lkl_8gpu/colt.sh verify model official --model-path /absolute/model/path
 ```
 
+## EasyR1 + CoLT RL
+
+当前分支将 OneThinker 固定提交中的完整 `EasyR1/` vendoring 到仓库根目录，默认不再依赖
+`/data/nvme0/lkl/OneThinker/EasyR1`。来源提交记录在 `EasyR1/UPSTREAM.md`。CoLT 专用路径使用
+Transformers rollout，直接调用 `latent_reasoning_generate`，并在 actor 侧按相同 latent state
+重算 response log-prob；它不会进入 SFT 的可见 `<think>` 解析路径。
+
+先从已下载的官方 `onethinker_rl_train.json` 固定生成图像子集。该步骤只保留
+`data_type == image` 的原始记录，并逐项验证图片在本地媒体根目录存在；不做去重、重采样或
+字段改写。输出 manifest 固定为 `189,645` 条，若数量或任何媒体路径不符合预期则拒绝写入：
+
+```bash
+bash scripts/lkl_8gpu/colt.sh rl prepare-data
+```
+
+默认输入和输出分别为：
+
+```text
+/data/nvme0/lkl/datasets/onethinker_rl_train.json
+/data/nvme0/lkl/datasets/onethinker_rl_train_image.json
+/data/nvme0/lkl/datasets/CoLT_Train_Dataset
+```
+
+manifest 已存在时不会覆盖；确认需要重建时显式追加 `--overwrite`。随后做只读契约审计：
+
+```bash
+bash scripts/lkl_8gpu/colt.sh rl audit --allow-incomplete
+```
+
+默认检查：
+
+- EasyR1 是否包含可选择的 `colt_transformers` rollout 和 FSDP 权重同步；
+- actor 是否具备 CoLT latent-conditioned response log-prob 路径；
+- latent prompt 是否只要求最终 `<answer>`，不要求可见 `<think>`；
+- reward 是否只写入最后一个 response token；
+- checkpoint 是否包含 `alpha` 与 `prj.*` 等 CoLT latent 权重；
+- RL JSON/JSONL 是否包含 `problem`、`answer`、`data_type`、`problem_type` 和 `problem_id`。
+  dataset 会在移除 `problem` 前自动生成 `problem_reserved_text`，不要求源数据重复保存问题文本。
+
+`--allow-incomplete` 只改变退出码，不会把失败项标成通过。去掉该参数后，只要存在 blocker，
+命令就以退出码 2 失败。可通过 `--json` 获取机器可读报告，并可用 `--easyr1-root`、
+`--model-path`、`--train-file` 覆盖本机路径。
+
+加上 `--check-runtime` 会同时审计所选 Python 环境的运行依赖：
+
+```bash
+bash scripts/lkl_8gpu/colt.sh rl audit \
+  --python /absolute/conda/env/bin/python \
+  --check-runtime --allow-incomplete
+```
+
+CoLT backend 不需要 vLLM。若要准备独立环境，使用专用依赖文件，并避免 EasyR1 原始
+`requirements.txt` 自动拉入 vLLM：
+
+```bash
+python -m pip install -r EasyR1/requirements-colt.txt
+python -m pip install -e EasyR1 --no-deps
+```
+
+冻结参数的一致性脚本会比较 rollout 模型以 latent teacher-forcing 计算的 old log-prob 与 actor
+重算值；同时单独报告逐 token 在线解码值，便于观察 BF16 增量解码与合批打分的数值差异。
+文本和图像路径都可以直接检查：
+
+```bash
+PYTHONPATH="$PWD/transformers-4.57.0/src:$PWD/EasyR1:$PWD" \
+python scripts/lkl_8gpu/easyr1/check_logprob_parity.py \
+  --model-path /absolute/fixed-v2-checkpoint
+
+PYTHONPATH="$PWD/transformers-4.57.0/src:$PWD/EasyR1:$PWD" \
+python scripts/lkl_8gpu/easyr1/check_logprob_parity.py \
+  --model-path /absolute/fixed-v2-checkpoint \
+  --image /absolute/example.png --prompt "Describe the image."
+
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTHONPATH="$PWD/EasyR1:$PWD/transformers-4.57.0/src:$PWD" \
+python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  scripts/lkl_8gpu/easyr1/check_fsdp_transformers_sync.py
+```
+
+一致性门禁也在每个训练 step 的第一次 old log-prob 重算后执行；有效 response token 的最大
+绝对误差超过 `0.05` 会立即终止。训练入口会先执行严格源码、checkpoint、数据与运行依赖检查：
+
+```bash
+bash scripts/lkl_8gpu/colt.sh rl train \
+  --python /absolute/conda/env/bin/python \
+  --model-path /absolute/fixed-v2-checkpoint \
+  --train-file /data/nvme0/lkl/datasets/onethinker_rl_train_image.json \
+  --image-dir /data/nvme0/lkl/datasets/CoLT_Train_Dataset \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --dry-run
+```
+
+去掉 `--dry-run` 后执行 outcome-GRPO。默认配置为
+`EasyR1/examples/colt_fixed_v2_outcome_grpo.yaml`，默认 EasyR1 路径为 `$REPO_ROOT/EasyR1`；
+路径均可用命令行参数或 `COLT_RL_*` 环境变量覆盖。
+
 ## 实验脚本
 
 吞吐 A/B、预处理 A/B 等诊断入口位于 `tests/integration/lkl_8gpu/`，不作为正式训练或

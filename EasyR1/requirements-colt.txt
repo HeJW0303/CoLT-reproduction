@@ -1,0 +1,22 @@
+# CoLT Transformers rollout runtime. Install EasyR1 itself with --no-deps so
+# the vLLM-only dependency set in requirements.txt is not pulled in.
+accelerate
+codetiming
+datasets
+einops
+flash-attn>=2.4.3
+math-verify
+mathruler
+numpy
+omegaconf
+pandas
+pillow
+pylatexenc
+pyarrow>=15.0.0
+qwen-vl-utils
+ray[default]
+requests
+rouge-score
+tensordict
+torchdata
+transformers>=4.54.0,<=4.57.0
