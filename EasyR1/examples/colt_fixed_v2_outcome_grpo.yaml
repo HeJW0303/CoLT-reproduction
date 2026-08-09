@@ -65,6 +65,7 @@ worker:
     temperature: 1.0
     top_p: 1.0
     top_k: -1
+    generation_batch_size: 4
     tensor_parallel_size: 1
     disable_tqdm: true
     val_override_config:

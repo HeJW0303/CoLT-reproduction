@@ -142,7 +142,7 @@ class CoLTTransformersRollout(BaseRollout):
         return {key: torch.cat(values, dim=0) for key, values in batched_values.items()}
 
     @torch.no_grad()
-    def _generate_one(
+    def _generate_batch(
         self,
         prompt_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
@@ -150,15 +150,23 @@ class CoLTTransformersRollout(BaseRollout):
         multi_modal_data: Optional[dict[str, Any]],
         meta_info: dict[str, Any],
         eos_token_id: int,
-    ) -> list[int]:
-        prompt_ids = prompt_ids.unsqueeze(0).to(torch.cuda.current_device())
-        prompt_attention_mask = prompt_attention_mask.unsqueeze(0).to(torch.cuda.current_device())
+        batch_size: int,
+    ) -> list[list[int]]:
+        if batch_size <= 0:
+            raise ValueError(f"CoLT generation batch_size must be positive, received {batch_size}.")
+
+        device = torch.cuda.current_device()
+        prompt_ids = prompt_ids.unsqueeze(0).expand(batch_size, -1).contiguous().to(device)
+        prompt_attention_mask = (
+            prompt_attention_mask.unsqueeze(0).expand(batch_size, -1).contiguous().to(device)
+        )
         if prompt_position_ids.ndim == 2 and prompt_position_ids.shape[0] == 4:
-            prompt_position_ids = prompt_position_ids.unsqueeze(1)
+            prompt_position_ids = (
+                prompt_position_ids.unsqueeze(1).expand(-1, batch_size, -1).contiguous().to(device)
+            )
         else:
-            prompt_position_ids = prompt_position_ids.unsqueeze(0)
-        prompt_position_ids = prompt_position_ids.to(torch.cuda.current_device())
-        model_inputs = self._prepare_multimodal_inputs(multi_modal_data, meta_info)
+            prompt_position_ids = prompt_position_ids.unsqueeze(0).expand(batch_size, -1).contiguous().to(device)
+        model_inputs = self._prepare_batched_multimodal_inputs([multi_modal_data] * batch_size, meta_info)
         temperature = float(self.sampling_params["temperature"])
         generated = self.inference_model.latent_reasoning_generate(
             input_ids=prompt_ids,
@@ -174,7 +182,26 @@ class CoLTTransformersRollout(BaseRollout):
             **model_inputs,
         )
         response_ids = generated[:, prompt_ids.shape[1] :]
-        return response_ids[0].detach().cpu().tolist()
+        return response_ids.detach().cpu().tolist()
+
+    def _generate_one(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        prompt_position_ids: torch.Tensor,
+        multi_modal_data: Optional[dict[str, Any]],
+        meta_info: dict[str, Any],
+        eos_token_id: int,
+    ) -> list[int]:
+        return self._generate_batch(
+            prompt_ids,
+            prompt_attention_mask,
+            prompt_position_ids,
+            multi_modal_data,
+            meta_info,
+            eos_token_id,
+            batch_size=1,
+        )[0]
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -196,18 +223,21 @@ class CoLTTransformersRollout(BaseRollout):
                 prompt_attention_mask = attention_mask[row]
                 prompt_position_ids = position_ids[row]
                 multi_modal_data = None if batch_multi_modal_data is None else batch_multi_modal_data[row]
-                for _ in range(n):
-                    generated_ids = self._generate_one(
+                generation_batch_size = min(int(self.config.generation_batch_size), n)
+                for start in range(0, n, generation_batch_size):
+                    current_batch_size = min(generation_batch_size, n - start)
+                    generated_batch = self._generate_batch(
                         prompt_ids,
                         prompt_attention_mask,
                         prompt_position_ids,
                         multi_modal_data,
                         prompts.meta_info,
                         generation_eos,
+                        batch_size=current_batch_size,
                     )
-                    response_ids.append(generated_ids)
+                    response_ids.extend(generated_batch)
                     if batch_multi_modal_data is not None:
-                        repeated_multi_modal_data.append(multi_modal_data)
+                        repeated_multi_modal_data.extend([multi_modal_data] * current_batch_size)
 
         response_ids = VF.pad_2d_list_to_length(
             response_ids,

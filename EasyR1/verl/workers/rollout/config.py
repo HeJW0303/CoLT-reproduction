@@ -27,6 +27,7 @@ class RolloutConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1
+    generation_batch_size: int = 1
     seed: int = 1
     limit_images: int = 0
     dtype: str = "bf16"
@@ -50,6 +51,8 @@ class RolloutConfig:
             raise ValueError(f"Unsupported rollout backend: {self.name}")
         if self.num_hidden_generations < 0:
             raise ValueError("num_hidden_generations must be non-negative.")
+        if self.generation_batch_size <= 0:
+            raise ValueError("generation_batch_size must be positive.")
         if self.name == "colt_transformers":
             if self.tensor_parallel_size != 1:
                 raise ValueError("colt_transformers rollout currently requires tensor_parallel_size=1.")
