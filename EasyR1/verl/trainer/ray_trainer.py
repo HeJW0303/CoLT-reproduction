@@ -457,9 +457,32 @@ class RayPPOTrainer:
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_ref_wg.world_size
-        global_partition_lst = get_seqlen_balanced_partitions(
-            global_seqlen_lst, k_partitions=world_size, equal_size=True
-        )
+        if self.config.worker.rollout.name == "colt_transformers":
+            uid_to_indices = defaultdict(list)
+            for sample_index, uid in enumerate(batch.non_tensor_batch["uid"]):
+                uid_to_indices[uid].append(sample_index)
+            expected_group_size = self.config.worker.rollout.n
+            invalid_groups = {
+                uid: len(indices) for uid, indices in uid_to_indices.items() if len(indices) != expected_group_size
+            }
+            if invalid_groups:
+                raise RuntimeError(
+                    "CoLT group-preserving balance requires exactly rollout.n responses per uid; "
+                    f"invalid_groups={invalid_groups}."
+                )
+            grouped_indices = list(uid_to_indices.values())
+            grouped_lengths = [sum(global_seqlen_lst[index] for index in indices) for indices in grouped_indices]
+            group_partitions = get_seqlen_balanced_partitions(
+                grouped_lengths, k_partitions=world_size, equal_size=True
+            )
+            global_partition_lst = [
+                [sample_index for group_index in partition for sample_index in grouped_indices[group_index]]
+                for partition in group_partitions
+            ]
+        else:
+            global_partition_lst = get_seqlen_balanced_partitions(
+                global_seqlen_lst, k_partitions=world_size, equal_size=True
+            )
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)

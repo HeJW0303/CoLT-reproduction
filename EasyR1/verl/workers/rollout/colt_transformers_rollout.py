@@ -370,49 +370,63 @@ class CoLTTransformersRollout(BaseRollout):
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_mask = VF.get_response_mask(response_ids, eos_token_id=eos_ids, dtype=attention_mask.dtype)
         attention_mask = torch.cat([attention_mask, response_mask], dim=-1)
-        # CoLT teacher-forced scoring remains batch-1 because the actor parity
-        # contract requires the same batch shape. Crop only right-padded
-        # response positions; invalid positions are restored as zero log-probs.
+        # Preserve each GRPO prompt group and compute its latent prefix once.
+        # Actor experience/update use the same uid-grouped batch shape.
         scoring_device = torch.cuda.current_device()
-        rollout_log_prob_rows = []
-        for row in range(sequence_ids.shape[0]):
-            effective_response_length = max(int(response_mask[row].sum().item()), 1)
-            row_model_inputs = (
-                self._prepare_multimodal_inputs(repeated_multi_modal_data[row], prompts.meta_info)
+        rollout_log_prob_groups = []
+        for group_start in range(0, sequence_ids.shape[0], n):
+            group_end = min(group_start + n, sequence_ids.shape[0])
+            if group_end - group_start != n:
+                raise RuntimeError("CoLT rollout scoring received an incomplete GRPO response group.")
+            effective_response_length = max(
+                int(response_mask[group_start:group_end].sum(dim=-1).max().item()),
+                1,
+            )
+            group_model_inputs = (
+                self._prepare_multimodal_inputs(repeated_multi_modal_data[group_start], prompts.meta_info)
                 if repeated_multi_modal_data
                 else {}
             )
             if position_ids.ndim == 3:
-                row_position_ids = position_ids[row : row + 1, ..., : input_ids.shape[1] + effective_response_length]
+                group_position_ids = position_ids[
+                    group_start:group_end, ..., : input_ids.shape[1] + effective_response_length
+                ]
             else:
-                row_position_ids = position_ids[row : row + 1, : input_ids.shape[1] + effective_response_length]
-            row_input_ids, row_attention_mask, row_position_ids = _trim_left_prompt_padding(
-                input_ids=sequence_ids[row : row + 1, : input_ids.shape[1] + effective_response_length],
-                attention_mask=attention_mask[row : row + 1, : input_ids.shape[1] + effective_response_length],
-                position_ids=row_position_ids,
+                group_position_ids = position_ids[
+                    group_start:group_end, : input_ids.shape[1] + effective_response_length
+                ]
+            group_input_ids, group_attention_mask, group_position_ids = _trim_left_prompt_padding(
+                input_ids=sequence_ids[group_start:group_end, : input_ids.shape[1] + effective_response_length],
+                attention_mask=attention_mask[
+                    group_start:group_end, : input_ids.shape[1] + effective_response_length
+                ],
+                position_ids=group_position_ids,
                 response_length=effective_response_length,
             )
-            if row_position_ids.ndim == 3:
-                row_position_ids = row_position_ids.transpose(0, 1)
+            if group_position_ids.ndim == 3:
+                group_position_ids = group_position_ids.transpose(0, 1)
             scoring_output = self.inference_model(
-                input_ids=row_input_ids.to(scoring_device),
-                attention_mask=row_attention_mask.to(scoring_device),
-                position_ids=row_position_ids.to(scoring_device),
+                input_ids=group_input_ids.to(scoring_device),
+                attention_mask=group_attention_mask.to(scoring_device),
+                position_ids=group_position_ids.to(scoring_device),
                 colt_rl_response_length=effective_response_length,
                 num_hidden_generations=self.config.num_hidden_generations,
-                **row_model_inputs,
+                colt_shared_prompt_prefix=n > 1,
+                **group_model_inputs,
             )
             policy_logits = scoring_output.logits.float() / max(float(self.sampling_params["temperature"]), 1e-5)
-            row_log_probs = torch.log_softmax(policy_logits, dim=-1).gather(
+            group_log_probs = torch.log_softmax(policy_logits, dim=-1).gather(
                 dim=-1,
-                index=response_ids[row : row + 1, :effective_response_length].to(scoring_device).unsqueeze(-1),
+                index=response_ids[group_start:group_end, :effective_response_length]
+                .to(scoring_device)
+                .unsqueeze(-1),
             ).squeeze(-1)
             if effective_response_length < response_length:
-                row_log_probs = torch.nn.functional.pad(
-                    row_log_probs, (0, response_length - effective_response_length)
+                group_log_probs = torch.nn.functional.pad(
+                    group_log_probs, (0, response_length - effective_response_length)
                 )
-            rollout_log_prob_rows.append(row_log_probs.to(input_ids.device))
-        rollout_log_probs = torch.cat(rollout_log_prob_rows, dim=0)
+            rollout_log_prob_groups.append(group_log_probs.to(input_ids.device))
+        rollout_log_probs = torch.cat(rollout_log_prob_groups, dim=0)
         batch = TensorDict(
             {
                 "prompts": input_ids,

@@ -114,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional second text prompt. Exercises actor recomputation with unequal prompt lengths.",
     )
     parser.add_argument(
+        "--repeat-prompt",
+        type=int,
+        default=1,
+        help="Repeat one text prompt to exercise shared-prefix GRPO response batching.",
+    )
+    parser.add_argument(
         "--left-pad-tokens",
         type=int,
         default=0,
@@ -121,7 +127,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--num-hidden-generations", type=int, default=3)
+    parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("flash_attention_2", "sdpa", "eager"),
+        default="flash_attention_2",
+        help="Attention backend used by both rollout and teacher-forced parity paths.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+        help="Model precision for isolating low-precision batch-shape drift.",
+    )
     parser.add_argument("--tolerance", type=float, default=5e-2)
     return parser.parse_args()
 
@@ -131,7 +150,12 @@ def main() -> int:
     model_path = args.model_path.resolve()
     if not (model_path / "config.json").is_file():
         raise FileNotFoundError(f"Invalid model checkpoint: {model_path}")
-    if args.max_new_tokens <= 0 or args.num_hidden_generations < 0 or args.left_pad_tokens < 0:
+    if (
+        args.max_new_tokens <= 0
+        or args.num_hidden_generations < 0
+        or args.left_pad_tokens < 0
+        or args.repeat_prompt <= 0
+    ):
         raise ValueError("max-new-tokens must be positive and num-hidden-generations must be non-negative.")
     if args.tolerance <= 0:
         raise ValueError("tolerance must be positive.")
@@ -143,10 +167,11 @@ def main() -> int:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
+    model_dtype = getattr(torch, args.dtype)
     model = AutoModelForImageTextToText.from_pretrained(
         model_path,
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        dtype=model_dtype,
+        attn_implementation=args.attn_implementation,
         low_cpu_mem_usage=True,
     ).to(args.device)
     model.requires_grad_(False)
@@ -158,6 +183,10 @@ def main() -> int:
 
     if args.image is not None and args.batch_secondary_prompt is not None:
         raise ValueError("Multimodal parity currently supports one prompt; omit --batch-secondary-prompt.")
+    if args.batch_secondary_prompt is not None and args.repeat_prompt != 1:
+        raise ValueError("Use either --batch-secondary-prompt or --repeat-prompt, not both.")
+    if args.image is not None and args.repeat_prompt != 1:
+        raise ValueError("Repeated-prompt parity currently supports text prompts only.")
 
     image = None
     if args.image is not None:
@@ -172,10 +201,15 @@ def main() -> int:
         image_path = None
         message_content = args.prompt
 
-    if args.batch_secondary_prompt is not None:
+    if args.batch_secondary_prompt is not None or args.repeat_prompt > 1:
+        prompts = (
+            [args.prompt, args.batch_secondary_prompt]
+            if args.batch_secondary_prompt is not None
+            else [args.prompt] * args.repeat_prompt
+        )
         model_inputs = build_text_batch_inputs(
             processor,
-            [args.prompt, args.batch_secondary_prompt],
+            prompts,
             args.left_pad_tokens,
         )
     else:
@@ -219,7 +253,7 @@ def main() -> int:
             position_ids=rollout_prompt_position_ids,
             num_hidden_generations=args.num_hidden_generations,
             max_new_tokens=args.max_new_tokens,
-            do_sample=False,
+            do_sample=args.do_sample,
             temperature=1.0,
             top_p=1.0,
             top_k=-1,
@@ -280,25 +314,73 @@ def main() -> int:
         dim=-1,
         index=response_ids.unsqueeze(-1),
     ).squeeze(-1)
+    rowwise_recomputed_log_probs = []
+    for row in range(actor_sequences.shape[0]):
+        row_position_ids = full_position_ids[:, row : row + 1, :]
+        row_scoring_output = model(
+            input_ids=actor_sequences[row : row + 1],
+            attention_mask=full_attention_mask[row : row + 1],
+            position_ids=row_position_ids,
+            colt_rl_response_length=response_ids.shape[1],
+            num_hidden_generations=args.num_hidden_generations,
+            **multimodal_inputs,
+        )
+        row_log_probs = torch.log_softmax(row_scoring_output.logits.float(), dim=-1).gather(
+            dim=-1,
+            index=response_ids[row : row + 1].unsqueeze(-1),
+        ).squeeze(-1)
+        rowwise_recomputed_log_probs.append(row_log_probs)
+    rowwise_recomputed_log_probs = torch.cat(rowwise_recomputed_log_probs, dim=0)
     valid_response_mask = response_mask.bool()
+    shared_prefix_max_abs_diff = None
+    if args.repeat_prompt > 1:
+        shared_prefix_output = model(
+            input_ids=actor_sequences,
+            attention_mask=full_attention_mask,
+            position_ids=full_position_ids,
+            colt_rl_response_length=response_ids.shape[1],
+            num_hidden_generations=args.num_hidden_generations,
+            colt_shared_prompt_prefix=True,
+        )
+        shared_prefix_log_probs = torch.log_softmax(shared_prefix_output.logits.float(), dim=-1).gather(
+            dim=-1,
+            index=response_ids.unsqueeze(-1),
+        ).squeeze(-1)
+        shared_prefix_max_abs_diff = float(
+            torch.max(torch.abs(shared_prefix_log_probs - rowwise_recomputed_log_probs)[valid_response_mask]).item()
+        )
     rollout_scoring_max_abs_diff = float(
         torch.max(torch.abs(online_generation_log_probs - rollout_log_probs)[valid_response_mask]).item()
     )
     max_abs_diff = float(torch.max(torch.abs(rollout_log_probs - recomputed_log_probs)[valid_response_mask]).item())
+    batch_shape_max_abs_diff = float(
+        torch.max(torch.abs(recomputed_log_probs - rowwise_recomputed_log_probs)[valid_response_mask]).item()
+    )
+    teacher_forcing_passed = max(max_abs_diff, batch_shape_max_abs_diff) <= args.tolerance
+    if shared_prefix_max_abs_diff is not None:
+        teacher_forcing_passed = shared_prefix_max_abs_diff <= args.tolerance
+    online_generation_passed = rollout_scoring_max_abs_diff <= args.tolerance
     result = {
         "model_path": str(model_path),
         "image": str(image_path) if image_path is not None else None,
         "batch_size": input_ids.shape[0],
         "left_pad_tokens": args.left_pad_tokens,
+        "attn_implementation": args.attn_implementation,
+        "dtype": args.dtype,
         "response_token_ids": response_ids.detach().cpu().tolist(),
         "response_text": [processor.tokenizer.decode(row, skip_special_tokens=True) for row in response_ids],
         "online_generation_log_probs": online_generation_log_probs.detach().cpu().tolist(),
         "rollout_log_probs": rollout_log_probs.detach().cpu().tolist(),
         "recomputed_log_probs": recomputed_log_probs.detach().cpu().tolist(),
+        "rowwise_recomputed_log_probs": rowwise_recomputed_log_probs.detach().cpu().tolist(),
         "rollout_scoring_max_abs_diff": rollout_scoring_max_abs_diff,
         "max_abs_diff": max_abs_diff,
+        "batch_shape_max_abs_diff": batch_shape_max_abs_diff,
+        "shared_prefix_max_abs_diff": shared_prefix_max_abs_diff,
         "tolerance": args.tolerance,
-        "passed": max_abs_diff <= args.tolerance,
+        "teacher_forcing_passed": teacher_forcing_passed,
+        "online_generation_passed": online_generation_passed,
+        "passed": teacher_forcing_passed,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["passed"] else 2

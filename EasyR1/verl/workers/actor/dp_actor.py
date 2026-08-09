@@ -135,6 +135,13 @@ class DataParallelPPOActor(BasePPOActor):
         position_ids = micro_batch["position_ids"]
         responses = micro_batch["responses"]
         response_mask = micro_batch["response_mask"]
+        uids = micro_batch.get("uid")
+        shared_prompt_prefix = (
+            self.config.colt_latent_reasoning
+            and input_ids.shape[0] > 1
+            and uids is not None
+            and all(uid == uids[0] for uid in uids)
+        )
         input_ids, attention_mask, position_ids, responses, original_response_length = _trim_right_response_padding(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -155,7 +162,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         multi_modal_inputs = defaultdict(list)
         if "multi_modal_inputs" in micro_batch:
-            multi_modal_inputs = batch_collate(micro_batch["multi_modal_inputs"])
+            multimodal_batch = (
+                micro_batch["multi_modal_inputs"][:1]
+                if shared_prompt_prefix
+                else micro_batch["multi_modal_inputs"]
+            )
+            multi_modal_inputs = batch_collate(multimodal_batch)
             multi_modal_inputs = {key: torch.cat(value, dim=0) for key, value in multi_modal_inputs.items()}
         else:
             multi_modal_inputs = {}
@@ -222,6 +234,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **multi_modal_inputs,
                     colt_rl_response_length=response_length,
                     num_hidden_generations=self.config.colt_num_hidden_generations,
+                    colt_shared_prompt_prefix=shared_prompt_prefix,
                 )
                 logits: torch.Tensor = output.logits
                 if logits.shape[:2] != responses.shape:
@@ -284,7 +297,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
-        non_tensor_select_keys = ["multi_modal_inputs"]
+        non_tensor_select_keys = ["multi_modal_inputs", "uid"]
 
         data = data.select(select_keys, non_tensor_select_keys)
         if self.config.dynamic_batching:
@@ -315,7 +328,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
-        non_tensor_select_keys = ["multi_modal_inputs"]
+        non_tensor_select_keys = ["multi_modal_inputs", "uid"]
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347

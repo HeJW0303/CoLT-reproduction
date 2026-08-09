@@ -30,8 +30,8 @@ algorithm:
 worker:
   actor:
     global_batch_size: 16
-    micro_batch_size_per_device_for_update: 1
-    micro_batch_size_per_device_for_experience: 1
+    micro_batch_size_per_device_for_update: 4
+    micro_batch_size_per_device_for_experience: 4
     max_grad_norm: 1.0
     padding_free: false
     dynamic_batching: false

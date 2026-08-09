@@ -2538,6 +2538,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         hidden_generation_mode: bool = False,  # enable latent model or not
         colt_rl_response_length: Optional[int] = None,
         colt_cached_latent_outputs: Optional[Qwen3VLCausalLMOutputWithPast] = None,
+        colt_shared_prompt_prefix: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -2570,6 +2571,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 response_length=colt_rl_response_length,
                 num_hidden_generations=num_hidden_generations,
                 latent_outputs=colt_cached_latent_outputs,
+                shared_prompt_prefix=colt_shared_prompt_prefix,
                 **kwargs,
             )
         if self.latent_reasoning_mode:
@@ -2672,7 +2674,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             )
 
             hidden_states = outputs[0]
-            latent_embd = hidden_states[:, -1:, :]
+            latent_embd = self._pool_question_hidden(hidden_states, attention_mask_question).unsqueeze(1)
             current_seq_len = outputs.past_key_values.get_seq_length()
             if self.oracle_k_predictor_enabled:
                 k_logits = self._predict_oracle_k(hidden_states, attention_mask_question)
@@ -3108,6 +3110,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         video_grid_thw: Optional[torch.LongTensor] = None,
         num_hidden_generations: int = 0,
         latent_outputs: Optional[Qwen3VLCausalLMOutputWithPast] = None,
+        shared_prompt_prefix: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3VLCausalLMOutputWithPast:
         if input_ids is None or input_ids.ndim != 2:
@@ -3125,10 +3128,32 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         response_attention_mask = attention_mask[:, prompt_length:] if attention_mask is not None else None
         prompt_position_ids = position_ids[..., :prompt_length] if position_ids is not None else None
         if latent_outputs is None:
+            latent_input_ids = prompt_input_ids
+            latent_attention_mask = prompt_attention_mask
+            latent_position_ids = prompt_position_ids
+            if shared_prompt_prefix:
+                if input_ids.shape[0] <= 1:
+                    raise ValueError(
+                        "CoLT shared-prefix scoring requires a response group with batch size greater than one."
+                    )
+                if not torch.all(prompt_input_ids == prompt_input_ids[:1]):
+                    raise ValueError("CoLT shared-prefix scoring requires identical prompt token ids within the group.")
+                if prompt_attention_mask is not None and not torch.all(
+                    prompt_attention_mask == prompt_attention_mask[:1]
+                ):
+                    raise ValueError("CoLT shared-prefix scoring requires identical prompt masks within the group.")
+                latent_input_ids = prompt_input_ids[:1]
+                latent_attention_mask = prompt_attention_mask[:1] if prompt_attention_mask is not None else None
+                if prompt_position_ids is not None:
+                    latent_position_ids = (
+                        prompt_position_ids[:, :1]
+                        if prompt_position_ids.ndim == 3
+                        else prompt_position_ids[:1]
+                    )
             latent_outputs = self._forward_latent_reasoning(
-                input_ids=prompt_input_ids,
-                attention_mask=prompt_attention_mask,
-                position_ids=prompt_position_ids,
+                input_ids=latent_input_ids,
+                attention_mask=latent_attention_mask,
+                position_ids=latent_position_ids,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
@@ -3136,6 +3161,19 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 num_hidden_generations=num_hidden_generations,
                 **kwargs,
             )
+            if shared_prompt_prefix:
+                group_size = input_ids.shape[0]
+                latent_outputs.hidden_states = tuple(
+                    hidden_state.repeat_interleave(group_size, dim=0)
+                    if isinstance(hidden_state, torch.Tensor)
+                    else hidden_state
+                    for hidden_state in latent_outputs.hidden_states
+                )
+                latent_outputs.past_key_values.batch_repeat_interleave(group_size)
+                if latent_outputs.k_logits is not None:
+                    latent_outputs.k_logits = latent_outputs.k_logits.repeat_interleave(group_size, dim=0)
+                if latent_outputs.predicted_k is not None:
+                    latent_outputs.predicted_k = latent_outputs.predicted_k.repeat_interleave(group_size, dim=0)
 
         latent_embd = latent_outputs.hidden_states[0]
         teacher_inputs = [latent_embd]
@@ -3217,7 +3255,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         past_key_values = outputs.past_key_values
         hidden_states = outputs[0]
         latent_embd = initialize_colt_inference_latent(
-            hidden_states[:, -1:, :],
+            self._pool_question_hidden(hidden_states, attention_mask).unsqueeze(1),
             self.prj,
             self.inference_latent_transition,
         )

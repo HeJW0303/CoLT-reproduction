@@ -6,6 +6,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -25,6 +26,9 @@ class FakeCache:
 
     def get_seq_length(self) -> int:
         return self.length
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        del repeats
 
 
 class FakeBackboneOutput:
@@ -76,15 +80,42 @@ class FakeCoLT:
         self.initial_latent = torch.tensor([[[0.0, 0.0, 0.0, 10.0, 0.0]]], requires_grad=True)
         self.eos_token_id = 4
         self.tokenizer = SimpleNamespace(all_special_ids=[], decode=lambda *args, **kwargs: "visible")
+        self.latent_batch_sizes = []
 
     def _forward_latent_reasoning(self, input_ids, **kwargs):
         del kwargs
+        self.latent_batch_sizes.append(input_ids.shape[0])
         return SimpleNamespace(
             hidden_states=(self.initial_latent,),
             past_key_values=FakeCache(input_ids.shape[1] + 3),
             k_logits=None,
             predicted_k=None,
         )
+
+
+class FakeLatentPrefixCoLT:
+    _forward_latent_reasoning = Qwen3VLForConditionalGeneration._forward_latent_reasoning
+    _pool_question_hidden = Qwen3VLForConditionalGeneration._pool_question_hidden
+    _resolve_oracle_k_inference_plan = Qwen3VLForConditionalGeneration._resolve_oracle_k_inference_plan
+
+    def __init__(self):
+        self.embedding = torch.nn.Embedding(8, 3)
+        with torch.no_grad():
+            self.embedding.weight.copy_(torch.arange(24, dtype=torch.float32).view(8, 3))
+        self.model = FakeBackbone(self.embedding)
+        self.config = SimpleNamespace(text_config=SimpleNamespace())
+        self.prj = torch.nn.Identity()
+        self.lm_head = torch.nn.Identity()
+        self.inference_latent_transition = "official"
+        self.oracle_k_enabled = False
+        self.num_latent = 0
+        self.last_oracle_k_prediction = None
+        self.last_oracle_k_used = None
+        self.last_oracle_k_conditioning = None
+
+    def _predict_oracle_k(self, hidden_states, attention_mask):
+        del hidden_states, attention_mask
+        return None
 
 
 def load_colt_reward_module():
@@ -110,6 +141,22 @@ def load_colt_reward_module():
 
 
 class CoLTEasyR1ContractTests(unittest.TestCase):
+    def test_latent_prefix_uses_last_valid_token_for_mixed_padding(self) -> None:
+        model = FakeLatentPrefixCoLT()
+        input_ids = torch.tensor([[1, 2, 0, 0], [0, 0, 3, 4]])
+        attention_mask = torch.tensor([[1, 1, 0, 0], [0, 0, 1, 1]])
+        with patch(
+            "transformers.models.qwen3_vl.modeling_qwen3_vl.DynamicCache",
+            side_effect=lambda config: FakeCache(0),
+        ):
+            outputs = model._forward_latent_reasoning(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                num_hidden_generations=0,
+            )
+        expected = model.embedding(torch.tensor([2, 4])).unsqueeze(1)
+        torch.testing.assert_close(outputs.hidden_states[0], expected)
+
     def test_cached_attention_mask_preserves_prompt_padding(self) -> None:
         prompt_mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.long)
         actual = _extend_colt_cached_attention_mask(
@@ -183,6 +230,29 @@ class CoLTEasyR1ContractTests(unittest.TestCase):
             full_ids = torch.tensor([[4, 4, 3, 2, 1]])
             output = model._forward_latent_response(input_ids=full_ids, response_length=3)
             output.logits.sum().backward()
+        self.assertIsNotNone(model.initial_latent.grad)
+        self.assertGreater(float(model.initial_latent.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(model.embedding.weight.grad)
+
+    def test_shared_prefix_scores_response_group_with_one_latent_prefill(self) -> None:
+        with torch.enable_grad():
+            model = FakeCoLT()
+            full_ids = torch.tensor(
+                [
+                    [4, 4, 3, 2, 1],
+                    [4, 4, 2, 1, 3],
+                    [4, 4, 1, 3, 2],
+                    [4, 4, 3, 1, 2],
+                ]
+            )
+            output = model._forward_latent_response(
+                input_ids=full_ids,
+                response_length=3,
+                shared_prompt_prefix=True,
+            )
+            output.logits.sum().backward()
+        self.assertEqual(model.latent_batch_sizes, [1])
+        self.assertEqual(output.logits.shape[:2], (4, 3))
         self.assertIsNotNone(model.initial_latent.grad)
         self.assertGreater(float(model.initial_latent.grad.abs().sum()), 0.0)
         self.assertIsNotNone(model.embedding.weight.grad)
