@@ -34,7 +34,7 @@ worker:
     micro_batch_size_per_device_for_experience: 1
     max_grad_norm: 1.0
     padding_free: false
-    dynamic_batching: true
+    dynamic_batching: false
     ulysses_size: 1
     use_torch_compile: false
     model:
@@ -51,7 +51,9 @@ worker:
       enable_full_shard: true
       enable_cpu_offload: false
       enable_rank0_init: true
+      use_orig_params: true
       torch_dtype: bf16
+      mp_buffer_dtype: bf16
     offload:
       offload_params: false
       offload_optimizer: false

@@ -232,22 +232,36 @@ class CoLTTransformersRollout(BaseRollout):
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_mask = VF.get_response_mask(response_ids, eos_token_id=eos_ids, dtype=attention_mask.dtype)
         attention_mask = torch.cat([attention_mask, response_mask], dim=-1)
-        batched_model_inputs = self._prepare_batched_multimodal_inputs(repeated_multi_modal_data, prompts.meta_info)
+        # Qwen3-VL latent scoring is not batch-shape invariant under the
+        # FlashAttention path: a batch-16 forward can produce different
+        # logits from the same sample scored as batch-1. Actor recomputation
+        # currently uses batch-1 experience micro-batches, so score each
+        # rollout sample with the same shape before storing its log-probs.
         scoring_device = torch.cuda.current_device()
-        scoring_position_ids = position_ids.transpose(0, 1) if position_ids.ndim == 3 else position_ids
-        scoring_output = self.inference_model(
-            input_ids=sequence_ids.to(scoring_device),
-            attention_mask=attention_mask.to(scoring_device),
-            position_ids=scoring_position_ids.to(scoring_device),
-            colt_rl_response_length=response_length,
-            num_hidden_generations=self.config.num_hidden_generations,
-            **batched_model_inputs,
-        )
-        policy_logits = scoring_output.logits.float() / max(float(self.sampling_params["temperature"]), 1e-5)
-        rollout_log_probs = torch.log_softmax(policy_logits, dim=-1).gather(
-            dim=-1,
-            index=response_ids.to(scoring_device).unsqueeze(-1),
-        ).squeeze(-1).to(input_ids.device)
+        rollout_log_prob_rows = []
+        for row in range(sequence_ids.shape[0]):
+            row_multi_modal_data = repeated_multi_modal_data[row : row + 1]
+            row_model_inputs = self._prepare_batched_multimodal_inputs(
+                row_multi_modal_data, prompts.meta_info
+            )
+            row_position_ids = position_ids[row : row + 1]
+            if row_position_ids.ndim == 3:
+                row_position_ids = row_position_ids.transpose(0, 1)
+            scoring_output = self.inference_model(
+                input_ids=sequence_ids[row : row + 1].to(scoring_device),
+                attention_mask=attention_mask[row : row + 1].to(scoring_device),
+                position_ids=row_position_ids.to(scoring_device),
+                colt_rl_response_length=response_length,
+                num_hidden_generations=self.config.num_hidden_generations,
+                **row_model_inputs,
+            )
+            policy_logits = scoring_output.logits.float() / max(float(self.sampling_params["temperature"]), 1e-5)
+            row_log_probs = torch.log_softmax(policy_logits, dim=-1).gather(
+                dim=-1,
+                index=response_ids[row : row + 1].to(scoring_device).unsqueeze(-1),
+            ).squeeze(-1)
+            rollout_log_prob_rows.append(row_log_probs.to(input_ids.device))
+        rollout_log_probs = torch.cat(rollout_log_prob_rows, dim=0)
         batch = TensorDict(
             {
                 "prompts": input_ids,

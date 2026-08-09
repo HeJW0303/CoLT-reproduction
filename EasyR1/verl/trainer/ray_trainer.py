@@ -707,10 +707,9 @@ class RayPPOTrainer:
             main_tqdm.update()
 
         # perform validation after training
-        if self.val_reward_fn is not None:
+        if self.val_reward_fn is not None and self.config.trainer.val_freq > 0:
             if (
                 val_metrics is None
-                or self.config.trainer.val_freq <= 0
                 or self.global_step % self.config.trainer.val_freq != 0
             ):
                 val_metrics = self._validate()
@@ -718,5 +717,5 @@ class RayPPOTrainer:
 
             print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
 
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
+        if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq != 0:
             self._save_checkpoint()

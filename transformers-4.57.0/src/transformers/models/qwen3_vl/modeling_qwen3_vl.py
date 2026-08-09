@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -611,6 +612,121 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+def _colt_activation_checkpointing_enabled() -> bool:
+    return os.environ.get("COLT_ACTIVATION_CHECKPOINTING", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _set_colt_cache_layer(
+    cache: Cache,
+    layer_idx: int,
+    key_states: Optional[torch.Tensor],
+    value_states: Optional[torch.Tensor],
+    sequence_length: Optional[int] = None,
+) -> None:
+    """Replace one cache layer without mutating tensors tracked by autograd."""
+    if not hasattr(cache, "layers") or layer_idx >= len(cache.layers):
+        raise TypeError("CoLT activation checkpointing requires a cache with pre-created layers.")
+    if (key_states is None) != (value_states is None):
+        raise ValueError("CoLT cache key/value states must be provided together.")
+
+    layer = cache.layers[layer_idx]
+    if key_states is None:
+        layer.keys = None
+        layer.values = None
+        layer.is_initialized = False
+        return
+
+    layer.keys = key_states
+    layer.values = value_states
+    layer.is_initialized = True
+    layer.dtype = key_states.dtype
+    layer.device = key_states.device
+    if sequence_length is not None and hasattr(layer, "cumulative_length"):
+        layer.cumulative_length = sequence_length
+
+
+def _checkpoint_colt_decoder_layer(
+    decoder_layer: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    position_ids: torch.LongTensor,
+    past_key_values: Cache,
+    cache_position: torch.LongTensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    config: Qwen3VLTextConfig,
+    layer_idx: int,
+    layer_kwargs: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Checkpoint one decoder layer while preserving differentiable KV state.
+
+    The standard Transformers checkpoint wrapper drops ``past_key_values`` because
+    mutating a cache during checkpoint recomputation is unsafe. CoLT needs the
+    cache for latent recurrence, so the cache layer is made functional here: the
+    checkpoint function receives the previous K/V tensors and returns the updated
+    tensors as ordinary autograd outputs. The caller installs those outputs into
+    the external cache only after the checkpoint call returns.
+    """
+    if not hasattr(past_key_values, "layers") or layer_idx >= len(past_key_values.layers):
+        raise TypeError("CoLT activation checkpointing requires a cache with pre-created layers.")
+
+    cache_layer = past_key_values.layers[layer_idx]
+    if cache_layer.is_initialized and cache_layer.keys is not None and cache_layer.keys.numel() > 0:
+        past_key_states = cache_layer.keys
+        past_value_states = cache_layer.values
+        past_sequence_length = cache_layer.get_seq_length()
+    else:
+        past_key_states = None
+        past_value_states = None
+        past_sequence_length = 0
+    next_sequence_length = past_sequence_length + hidden_states.shape[1]
+
+    def forward_layer(
+        layer_hidden_states: torch.Tensor,
+        layer_past_key_states: Optional[torch.Tensor],
+        layer_past_value_states: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        local_cache = DynamicCache(config=config)
+        _set_colt_cache_layer(
+            local_cache,
+            layer_idx,
+            layer_past_key_states,
+            layer_past_value_states,
+            sequence_length=past_sequence_length if layer_past_key_states is not None else None,
+        )
+        layer_hidden_states = decoder_layer(
+            layer_hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=local_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **layer_kwargs,
+        )
+        updated_layer = local_cache.layers[layer_idx]
+        return layer_hidden_states, updated_layer.keys, updated_layer.values
+
+    layer_hidden_states, updated_key_states, updated_value_states = torch_checkpoint(
+        forward_layer,
+        hidden_states,
+        past_key_states,
+        past_value_states,
+        use_reentrant=False,
+    )
+    _set_colt_cache_layer(
+        past_key_values,
+        layer_idx,
+        updated_key_states,
+        updated_value_states,
+        sequence_length=next_sequence_length,
+    )
+    return layer_hidden_states, updated_key_states, updated_value_states
+
+
 @dataclass
 @auto_docstring(
     custom_intro="""
@@ -943,18 +1059,40 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        use_colt_activation_checkpointing = (
+            self.training
+            and _colt_activation_checkpointing_enabled()
+            and past_key_values is not None
+        )
+        if use_colt_activation_checkpointing and not isinstance(past_key_values, Cache):
+            raise TypeError("CoLT activation checkpointing requires a Transformers Cache instance.")
+
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=text_position_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-            hidden_states = layer_outputs
+            if use_colt_activation_checkpointing:
+                hidden_states, _, _ = _checkpoint_colt_decoder_layer(
+                    decoder_layer=decoder_layer,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=text_position_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    config=self.config,
+                    layer_idx=layer_idx,
+                    layer_kwargs=kwargs,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=text_position_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                hidden_states = layer_outputs
 
             # add visual features to the hidden states of first several layers
             if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):

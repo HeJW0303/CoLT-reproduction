@@ -123,12 +123,21 @@ def main():
         # os.environ["TOKENIZERS_PARALLELISM"] = "true"
         ray.init(runtime_env=runtime_env)
 
-    runner = Runner.remote()
-    ray.get(runner.run.remote(ppo_config))
+    runner = None
+    try:
+        runner = Runner.remote()
+        ray.get(runner.run.remote(ppo_config))
 
-    if ppo_config.trainer.ray_timeline is not None:
-        # use `export RAY_PROFILING=1` to record the ray timeline
-        ray.timeline(filename=ppo_config.trainer.ray_timeline)
+        if ppo_config.trainer.ray_timeline is not None:
+            # use `export RAY_PROFILING=1` to record the ray timeline
+            ray.timeline(filename=ppo_config.trainer.ray_timeline)
+    finally:
+        if runner is not None:
+            # The runner owns the worker-group handles. Kill it before tearing
+            # down the local Ray cluster so completed jobs do not linger in
+            # actor cleanup after the training loop returns.
+            ray.kill(runner, no_restart=True)
+        ray.shutdown(_exiting_interpreter=True)
 
 
 if __name__ == "__main__":
