@@ -611,10 +611,30 @@ class RayPPOTrainer:
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
-                # recompute old_log_probs
+                # Reuse rollout-time log-probs after the first/periodic audit. The rollout model
+                # computes these from the same pre-update policy that generated the responses.
                 with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    if self.config.worker.rollout.name == "colt_transformers":
+                    reuse_rollout_log_probs = (
+                        self.config.worker.rollout.name == "colt_transformers"
+                        and self.config.worker.rollout.reuse_rollout_log_probs_for_old
+                    )
+                    audit_interval = self.config.worker.rollout.rollout_logprob_audit_interval
+                    audit_old_log_probs = audit_interval > 0 and (
+                        self.global_step == 1 or self.global_step % audit_interval == 0
+                    )
+                    if reuse_rollout_log_probs and not audit_old_log_probs:
+                        old_log_probs = DataProto.from_dict(
+                            tensors={"old_log_probs": batch.batch["rollout_log_probs"]},
+                            meta_info={"temperature": self.config.worker.rollout.temperature},
+                        )
+                        metrics["policy/rollout_logprob_reused"] = 1.0
+                    else:
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        metrics["policy/rollout_logprob_reused"] = 0.0
+
+                    if self.config.worker.rollout.name == "colt_transformers" and (
+                        not reuse_rollout_log_probs or audit_old_log_probs
+                    ):
                         rollout_log_probs = batch.batch["rollout_log_probs"]
                         recomputed_log_probs = old_log_probs.batch["old_log_probs"]
                         response_mask = batch.batch["response_mask"].bool()

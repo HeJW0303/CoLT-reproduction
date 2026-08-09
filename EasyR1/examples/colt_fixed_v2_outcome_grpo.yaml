@@ -66,6 +66,8 @@ worker:
     top_p: 1.0
     top_k: -1
     generation_batch_size: 4
+    reuse_rollout_log_probs_for_old: true
+    rollout_logprob_audit_interval: 100
     tensor_parallel_size: 1
     disable_tqdm: true
     val_override_config:

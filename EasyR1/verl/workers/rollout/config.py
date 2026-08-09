@@ -28,6 +28,10 @@ class RolloutConfig:
     top_p: float = 1.0
     top_k: int = -1
     generation_batch_size: int = 1
+    reuse_rollout_log_probs_for_old: bool = False
+    """Use rollout-time token log-probs as PPO old log-probs when enabled."""
+    rollout_logprob_audit_interval: int = 100
+    """Recompute rollout/actor log-probs every N steps; 0 disables periodic audits."""
     seed: int = 1
     limit_images: int = 0
     dtype: str = "bf16"
@@ -53,6 +57,8 @@ class RolloutConfig:
             raise ValueError("num_hidden_generations must be non-negative.")
         if self.generation_batch_size <= 0:
             raise ValueError("generation_batch_size must be positive.")
+        if self.rollout_logprob_audit_interval < 0:
+            raise ValueError("rollout_logprob_audit_interval must be non-negative.")
         if self.name == "colt_transformers":
             if self.tensor_parallel_size != 1:
                 raise ValueError("colt_transformers rollout currently requires tensor_parallel_size=1.")

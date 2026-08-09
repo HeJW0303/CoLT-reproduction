@@ -33,6 +33,35 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int):
     return np.repeat(value, repeats, axis=0)
 
 
+def _trim_left_prompt_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    response_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep rollout teacher-forcing shape identical to the batch-1 actor path."""
+    if input_ids.shape[0] != 1:
+        return input_ids, attention_mask, position_ids
+
+    prompt_length = input_ids.shape[1] - response_length
+    if prompt_length <= 0:
+        raise ValueError(
+            "CoLT response length must be smaller than the input sequence length: "
+            f"input_length={input_ids.shape[1]}, response_length={response_length}."
+        )
+
+    valid_prompt_length = int(attention_mask[:, :prompt_length].sum().item())
+    left_padding = prompt_length - valid_prompt_length
+    if left_padding <= 0:
+        return input_ids, attention_mask, position_ids
+
+    return (
+        input_ids[:, left_padding:],
+        attention_mask[:, left_padding:],
+        position_ids[..., left_padding:],
+    )
+
+
 class CoLTTransformersRollout(BaseRollout):
     """Correctness-first CoLT rollout using the vendored Transformers model."""
 
@@ -275,11 +304,17 @@ class CoLTTransformersRollout(BaseRollout):
                 row_multi_modal_data, prompts.meta_info
             )
             row_position_ids = position_ids[row : row + 1]
+            row_input_ids, row_attention_mask, row_position_ids = _trim_left_prompt_padding(
+                input_ids=sequence_ids[row : row + 1],
+                attention_mask=attention_mask[row : row + 1],
+                position_ids=row_position_ids,
+                response_length=response_length,
+            )
             if row_position_ids.ndim == 3:
                 row_position_ids = row_position_ids.transpose(0, 1)
             scoring_output = self.inference_model(
-                input_ids=sequence_ids[row : row + 1].to(scoring_device),
-                attention_mask=attention_mask[row : row + 1].to(scoring_device),
+                input_ids=row_input_ids.to(scoring_device),
+                attention_mask=row_attention_mask.to(scoring_device),
                 position_ids=row_position_ids.to(scoring_device),
                 colt_rl_response_length=response_length,
                 num_hidden_generations=self.config.num_hidden_generations,

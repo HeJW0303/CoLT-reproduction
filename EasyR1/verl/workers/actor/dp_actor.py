@@ -45,6 +45,35 @@ except ImportError:
 __all__ = ["DataParallelPPOActor"]
 
 
+def _trim_left_prompt_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    response_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Remove left prompt padding for the batch-1 CoLT forward path."""
+    if input_ids.shape[0] != 1:
+        return input_ids, attention_mask, position_ids
+
+    prompt_length = input_ids.shape[1] - response_length
+    if prompt_length <= 0:
+        raise ValueError(
+            "CoLT response length must be smaller than the input sequence length: "
+            f"input_length={input_ids.shape[1]}, response_length={response_length}."
+        )
+
+    valid_prompt_length = int(attention_mask[:, :prompt_length].sum().item())
+    left_padding = prompt_length - valid_prompt_length
+    if left_padding <= 0:
+        return input_ids, attention_mask, position_ids
+
+    return (
+        input_ids[:, left_padding:],
+        attention_mask[:, left_padding:],
+        position_ids[..., left_padding:],
+    )
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(
         self,
@@ -76,6 +105,13 @@ class DataParallelPPOActor(BasePPOActor):
         position_ids = micro_batch["position_ids"]
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
+        if self.config.colt_latent_reasoning:
+            input_ids, attention_mask, position_ids = _trim_left_prompt_padding(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                response_length=response_length,
+            )
         if position_ids.dim() == 3:  # qwen2vl mrope
             position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
