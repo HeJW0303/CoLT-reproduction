@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from typing import Any, Optional, Union
 
@@ -40,9 +41,6 @@ def _trim_left_prompt_padding(
     response_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Keep rollout teacher-forcing shape identical to the batch-1 actor path."""
-    if input_ids.shape[0] != 1:
-        return input_ids, attention_mask, position_ids
-
     prompt_length = input_ids.shape[1] - response_length
     if prompt_length <= 0:
         raise ValueError(
@@ -50,7 +48,11 @@ def _trim_left_prompt_padding(
             f"input_length={input_ids.shape[1]}, response_length={response_length}."
         )
 
-    valid_prompt_length = int(attention_mask[:, :prompt_length].sum().item())
+    valid_prompt_lengths = attention_mask[:, :prompt_length].sum(dim=-1)
+    if not torch.all(valid_prompt_lengths == valid_prompt_lengths[0]):
+        return input_ids, attention_mask, position_ids
+
+    valid_prompt_length = int(valid_prompt_lengths[0].item())
     left_padding = prompt_length - valid_prompt_length
     if left_padding <= 0:
         return input_ids, attention_mask, position_ids
@@ -60,6 +62,20 @@ def _trim_left_prompt_padding(
         attention_mask[:, left_padding:],
         position_ids[..., left_padding:],
     )
+
+
+def _repeat_cached_latent_outputs(latent_outputs, repeats: int):
+    """Clone a batch-1 latent prefix for an optional response-only batch."""
+    repeated_outputs = copy.deepcopy(latent_outputs)
+    if repeated_outputs.hidden_states is not None:
+        repeated_outputs.hidden_states = tuple(
+            hidden_state.repeat_interleave(repeats, dim=0)
+            if isinstance(hidden_state, torch.Tensor)
+            else hidden_state
+            for hidden_state in repeated_outputs.hidden_states
+        )
+    repeated_outputs.past_key_values.batch_repeat_interleave(repeats)
+    return repeated_outputs
 
 
 class CoLTTransformersRollout(BaseRollout):
@@ -171,6 +187,52 @@ class CoLTTransformersRollout(BaseRollout):
         return {key: torch.cat(values, dim=0) for key, values in batched_values.items()}
 
     @torch.no_grad()
+    def _generate_model_batch(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        prompt_position_ids: torch.Tensor,
+        batch_multi_modal_data: list[Optional[dict[str, Any]]],
+        meta_info: dict[str, Any],
+        eos_token_id: int,
+        colt_cached_latent_outputs=None,
+    ) -> torch.Tensor:
+        if prompt_ids.ndim != 2 or prompt_attention_mask.ndim != 2:
+            raise ValueError("CoLT batched generation expects rank-2 token and attention tensors.")
+        if prompt_position_ids.ndim == 3:
+            prompt_position_ids = prompt_position_ids.transpose(0, 1)
+        if prompt_position_ids.ndim not in {2, 3}:
+            raise ValueError("CoLT batched generation expects rank-2 or rank-3 position_ids.")
+        if prompt_ids.shape[0] != len(batch_multi_modal_data):
+            raise ValueError(
+                "CoLT generation multimodal batch must align with prompt batch: "
+                f"prompts={prompt_ids.shape[0]}, multimodal={len(batch_multi_modal_data)}."
+            )
+
+        device = torch.cuda.current_device()
+        model_inputs = (
+            {}
+            if colt_cached_latent_outputs is not None
+            else self._prepare_batched_multimodal_inputs(batch_multi_modal_data, meta_info)
+        )
+        temperature = float(self.sampling_params["temperature"])
+        generated = self.inference_model.latent_reasoning_generate(
+            input_ids=prompt_ids.to(device),
+            attention_mask=prompt_attention_mask.to(device),
+            position_ids=prompt_position_ids.to(device),
+            num_hidden_generations=self.config.num_hidden_generations,
+            max_new_tokens=self.config.response_length,
+            do_sample=temperature > 0.0,
+            temperature=max(temperature, 1e-5),
+            top_p=float(self.sampling_params["top_p"]),
+            top_k=int(self.sampling_params["top_k"]),
+            eos_token_id=eos_token_id,
+            colt_cached_latent_outputs=colt_cached_latent_outputs,
+            **model_inputs,
+        )
+        return generated[:, prompt_ids.shape[1] :].detach().cpu()
+
+    @torch.no_grad()
     def _generate_batch(
         self,
         prompt_ids: torch.Tensor,
@@ -184,34 +246,20 @@ class CoLTTransformersRollout(BaseRollout):
         if batch_size <= 0:
             raise ValueError(f"CoLT generation batch_size must be positive, received {batch_size}.")
 
-        device = torch.cuda.current_device()
-        prompt_ids = prompt_ids.unsqueeze(0).expand(batch_size, -1).contiguous().to(device)
-        prompt_attention_mask = (
-            prompt_attention_mask.unsqueeze(0).expand(batch_size, -1).contiguous().to(device)
-        )
+        prompt_ids = prompt_ids.unsqueeze(0).expand(batch_size, -1).contiguous()
+        prompt_attention_mask = prompt_attention_mask.unsqueeze(0).expand(batch_size, -1).contiguous()
         if prompt_position_ids.ndim == 2 and prompt_position_ids.shape[0] == 4:
-            prompt_position_ids = (
-                prompt_position_ids.unsqueeze(1).expand(-1, batch_size, -1).contiguous().to(device)
-            )
+            prompt_position_ids = prompt_position_ids.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
         else:
-            prompt_position_ids = prompt_position_ids.unsqueeze(0).expand(batch_size, -1).contiguous().to(device)
-        model_inputs = self._prepare_batched_multimodal_inputs([multi_modal_data] * batch_size, meta_info)
-        temperature = float(self.sampling_params["temperature"])
-        generated = self.inference_model.latent_reasoning_generate(
-            input_ids=prompt_ids,
-            attention_mask=prompt_attention_mask,
-            position_ids=prompt_position_ids,
-            num_hidden_generations=self.config.num_hidden_generations,
-            max_new_tokens=self.config.response_length,
-            do_sample=temperature > 0.0,
-            temperature=max(temperature, 1e-5),
-            top_p=float(self.sampling_params["top_p"]),
-            top_k=int(self.sampling_params["top_k"]),
+            prompt_position_ids = prompt_position_ids.unsqueeze(0).expand(batch_size, -1).contiguous()
+        return self._generate_model_batch(
+            prompt_ids=prompt_ids,
+            prompt_attention_mask=prompt_attention_mask,
+            prompt_position_ids=prompt_position_ids,
+            batch_multi_modal_data=[multi_modal_data] * batch_size,
+            meta_info=meta_info,
             eos_token_id=eos_token_id,
-            **model_inputs,
-        )
-        response_ids = generated[:, prompt_ids.shape[1] :]
-        return response_ids.detach().cpu().tolist()
+        ).tolist()
 
     def _generate_one(
         self,
@@ -247,26 +295,57 @@ class CoLTTransformersRollout(BaseRollout):
         with self.update_sampling_params(**prompts.meta_info):
             n = int(self.sampling_params["n"])
             effective_n = n
-            for row in range(input_ids.shape[0]):
-                prompt_ids = input_ids[row]
-                prompt_attention_mask = attention_mask[row]
-                prompt_position_ids = position_ids[row]
-                multi_modal_data = None if batch_multi_modal_data is None else batch_multi_modal_data[row]
-                generation_batch_size = min(int(self.config.generation_batch_size), n)
+            generation_batch_size = min(int(self.config.generation_batch_size), n)
+            prompt_batch_size = min(int(self.config.generation_prompt_batch_size), input_ids.shape[0])
+            for prompt_start in range(0, input_ids.shape[0], prompt_batch_size):
+                prompt_end = min(prompt_start + prompt_batch_size, input_ids.shape[0])
+                prompt_ids = input_ids[prompt_start:prompt_end]
+                prompt_attention_mask = attention_mask[prompt_start:prompt_end]
+                prompt_position_ids = position_ids[prompt_start:prompt_end]
+                prompt_multi_modal_data = (
+                    [None] * (prompt_end - prompt_start)
+                    if batch_multi_modal_data is None
+                    else list(batch_multi_modal_data[prompt_start:prompt_end])
+                )
                 for start in range(0, n, generation_batch_size):
                     current_batch_size = min(generation_batch_size, n - start)
-                    generated_batch = self._generate_batch(
-                        prompt_ids,
-                        prompt_attention_mask,
-                        prompt_position_ids,
-                        multi_modal_data,
-                        prompts.meta_info,
-                        generation_eos,
-                        batch_size=current_batch_size,
-                    )
+                    batched_prompt_ids = prompt_ids.repeat_interleave(current_batch_size, dim=0)
+                    batched_attention_mask = prompt_attention_mask.repeat_interleave(current_batch_size, dim=0)
+                    batched_position_ids = prompt_position_ids.repeat_interleave(current_batch_size, dim=0)
+                    batched_multi_modal_data = [
+                        multi_modal_data
+                        for multi_modal_data in prompt_multi_modal_data
+                        for _ in range(current_batch_size)
+                    ]
+                    cached_latent_outputs = None
+                    if prompt_end - prompt_start > 1:
+                        prefix_position_ids = prompt_position_ids
+                        if prefix_position_ids.ndim == 3:
+                            prefix_position_ids = prefix_position_ids.transpose(0, 1)
+                        prefix_model_inputs = self._prepare_batched_multimodal_inputs(
+                            prompt_multi_modal_data, prompts.meta_info
+                        )
+                        cached_latent_outputs = self.inference_model._forward_latent_reasoning(
+                            input_ids=prompt_ids.to(torch.cuda.current_device()),
+                            attention_mask=prompt_attention_mask.to(torch.cuda.current_device()),
+                            position_ids=prefix_position_ids.to(torch.cuda.current_device()),
+                            num_hidden_generations=self.config.num_hidden_generations,
+                            **prefix_model_inputs,
+                        )
+                        cached_latent_outputs = _repeat_cached_latent_outputs(
+                            cached_latent_outputs, current_batch_size
+                        )
+                    generated_batch = self._generate_model_batch(
+                        prompt_ids=batched_prompt_ids,
+                        prompt_attention_mask=batched_attention_mask,
+                        prompt_position_ids=batched_position_ids,
+                        batch_multi_modal_data=batched_multi_modal_data,
+                        meta_info=prompts.meta_info,
+                        eos_token_id=generation_eos,
+                        colt_cached_latent_outputs=cached_latent_outputs,
+                    ).tolist()
                     response_ids.extend(generated_batch)
-                    if batch_multi_modal_data is not None:
-                        repeated_multi_modal_data.extend([multi_modal_data] * current_batch_size)
+                    repeated_multi_modal_data.extend(batched_multi_modal_data)
 
         response_ids = VF.pad_2d_list_to_length(
             response_ids,
@@ -291,24 +370,27 @@ class CoLTTransformersRollout(BaseRollout):
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_mask = VF.get_response_mask(response_ids, eos_token_id=eos_ids, dtype=attention_mask.dtype)
         attention_mask = torch.cat([attention_mask, response_mask], dim=-1)
-        # Qwen3-VL latent scoring is not batch-shape invariant under the
-        # FlashAttention path: a batch-16 forward can produce different
-        # logits from the same sample scored as batch-1. Actor recomputation
-        # currently uses batch-1 experience micro-batches, so score each
-        # rollout sample with the same shape before storing its log-probs.
+        # CoLT teacher-forced scoring remains batch-1 because the actor parity
+        # contract requires the same batch shape. Crop only right-padded
+        # response positions; invalid positions are restored as zero log-probs.
         scoring_device = torch.cuda.current_device()
         rollout_log_prob_rows = []
         for row in range(sequence_ids.shape[0]):
-            row_multi_modal_data = repeated_multi_modal_data[row : row + 1]
-            row_model_inputs = self._prepare_batched_multimodal_inputs(
-                row_multi_modal_data, prompts.meta_info
+            effective_response_length = max(int(response_mask[row].sum().item()), 1)
+            row_model_inputs = (
+                self._prepare_multimodal_inputs(repeated_multi_modal_data[row], prompts.meta_info)
+                if repeated_multi_modal_data
+                else {}
             )
-            row_position_ids = position_ids[row : row + 1]
+            if position_ids.ndim == 3:
+                row_position_ids = position_ids[row : row + 1, ..., : input_ids.shape[1] + effective_response_length]
+            else:
+                row_position_ids = position_ids[row : row + 1, : input_ids.shape[1] + effective_response_length]
             row_input_ids, row_attention_mask, row_position_ids = _trim_left_prompt_padding(
-                input_ids=sequence_ids[row : row + 1],
-                attention_mask=attention_mask[row : row + 1],
+                input_ids=sequence_ids[row : row + 1, : input_ids.shape[1] + effective_response_length],
+                attention_mask=attention_mask[row : row + 1, : input_ids.shape[1] + effective_response_length],
                 position_ids=row_position_ids,
-                response_length=response_length,
+                response_length=effective_response_length,
             )
             if row_position_ids.ndim == 3:
                 row_position_ids = row_position_ids.transpose(0, 1)
@@ -316,15 +398,19 @@ class CoLTTransformersRollout(BaseRollout):
                 input_ids=row_input_ids.to(scoring_device),
                 attention_mask=row_attention_mask.to(scoring_device),
                 position_ids=row_position_ids.to(scoring_device),
-                colt_rl_response_length=response_length,
+                colt_rl_response_length=effective_response_length,
                 num_hidden_generations=self.config.num_hidden_generations,
                 **row_model_inputs,
             )
             policy_logits = scoring_output.logits.float() / max(float(self.sampling_params["temperature"]), 1e-5)
             row_log_probs = torch.log_softmax(policy_logits, dim=-1).gather(
                 dim=-1,
-                index=response_ids[row : row + 1].to(scoring_device).unsqueeze(-1),
+                index=response_ids[row : row + 1, :effective_response_length].to(scoring_device).unsqueeze(-1),
             ).squeeze(-1)
+            if effective_response_length < response_length:
+                row_log_probs = torch.nn.functional.pad(
+                    row_log_probs, (0, response_length - effective_response_length)
+                )
             rollout_log_prob_rows.append(row_log_probs.to(input_ids.device))
         rollout_log_probs = torch.cat(rollout_log_prob_rows, dim=0)
         batch = TensorDict(

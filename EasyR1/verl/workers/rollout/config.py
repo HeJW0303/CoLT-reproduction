@@ -28,6 +28,8 @@ class RolloutConfig:
     top_p: float = 1.0
     top_k: int = -1
     generation_batch_size: int = 1
+    generation_prompt_batch_size: int = 1
+    """Number of different prompts to combine in one generation call."""
     reuse_rollout_log_probs_for_old: bool = False
     """Use rollout-time token log-probs as PPO old log-probs when enabled."""
     rollout_logprob_audit_interval: int = 100
@@ -57,6 +59,8 @@ class RolloutConfig:
             raise ValueError("num_hidden_generations must be non-negative.")
         if self.generation_batch_size <= 0:
             raise ValueError("generation_batch_size must be positive.")
+        if self.generation_prompt_batch_size <= 0:
+            raise ValueError("generation_prompt_batch_size must be positive.")
         if self.rollout_logprob_audit_interval < 0:
             raise ValueError("rollout_logprob_audit_interval must be non-negative.")
         if self.name == "colt_transformers":

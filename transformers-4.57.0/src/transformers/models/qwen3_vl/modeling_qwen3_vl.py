@@ -2537,6 +2537,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         num_hidden_generations: int = 0,  # The num of generate latent states
         hidden_generation_mode: bool = False,  # enable latent model or not
         colt_rl_response_length: Optional[int] = None,
+        colt_cached_latent_outputs: Optional[Qwen3VLCausalLMOutputWithPast] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -2568,6 +2569,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 video_grid_thw=video_grid_thw,
                 response_length=colt_rl_response_length,
                 num_hidden_generations=num_hidden_generations,
+                latent_outputs=colt_cached_latent_outputs,
                 **kwargs,
             )
         if self.latent_reasoning_mode:
@@ -3105,6 +3107,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         num_hidden_generations: int = 0,
+        latent_outputs: Optional[Qwen3VLCausalLMOutputWithPast] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3VLCausalLMOutputWithPast:
         if input_ids is None or input_ids.ndim != 2:
@@ -3121,17 +3124,18 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         prompt_attention_mask = attention_mask[:, :prompt_length] if attention_mask is not None else None
         response_attention_mask = attention_mask[:, prompt_length:] if attention_mask is not None else None
         prompt_position_ids = position_ids[..., :prompt_length] if position_ids is not None else None
-        latent_outputs = self._forward_latent_reasoning(
-            input_ids=prompt_input_ids,
-            attention_mask=prompt_attention_mask,
-            position_ids=prompt_position_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            num_hidden_generations=num_hidden_generations,
-            **kwargs,
-        )
+        if latent_outputs is None:
+            latent_outputs = self._forward_latent_reasoning(
+                input_ids=prompt_input_ids,
+                attention_mask=prompt_attention_mask,
+                position_ids=prompt_position_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                num_hidden_generations=num_hidden_generations,
+                **kwargs,
+            )
 
         latent_embd = latent_outputs.hidden_states[0]
         teacher_inputs = [latent_embd]
@@ -3296,21 +3300,25 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         eos_token_id: Optional[int] = None,
         prevent_empty_response: bool = False,
         return_token_log_probs: bool = False,
+        colt_cached_latent_outputs: Optional[Qwen3VLCausalLMOutputWithPast] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[torch.LongTensor, tuple[torch.LongTensor, torch.FloatTensor]]:
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], received {top_p}.")
-        latent_outputs = self._forward_latent_reasoning(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            num_hidden_generations=num_hidden_generations,
-            **kwargs,
-        )
+        if colt_cached_latent_outputs is None:
+            latent_outputs = self._forward_latent_reasoning(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                num_hidden_generations=num_hidden_generations,
+                **kwargs,
+            )
+        else:
+            latent_outputs = colt_cached_latent_outputs
 
         past_key_values = latent_outputs.past_key_values
         latent_embd = latent_outputs.hidden_states[0]

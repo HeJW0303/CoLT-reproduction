@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from einops import rearrange
 from ray.experimental.tqdm_ray import tqdm
 from torch import nn
@@ -51,10 +52,7 @@ def _trim_left_prompt_padding(
     position_ids: torch.Tensor,
     response_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Remove left prompt padding for the batch-1 CoLT forward path."""
-    if input_ids.shape[0] != 1:
-        return input_ids, attention_mask, position_ids
-
+    """Remove padding shared by all rows while preserving each row's mask."""
     prompt_length = input_ids.shape[1] - response_length
     if prompt_length <= 0:
         raise ValueError(
@@ -62,15 +60,47 @@ def _trim_left_prompt_padding(
             f"input_length={input_ids.shape[1]}, response_length={response_length}."
         )
 
-    valid_prompt_length = int(attention_mask[:, :prompt_length].sum().item())
-    left_padding = prompt_length - valid_prompt_length
-    if left_padding <= 0:
+    valid_prompt_lengths = attention_mask[:, :prompt_length].sum(dim=-1)
+    left_padding = prompt_length - valid_prompt_lengths
+    common_left_padding = int(left_padding.min().item())
+    if common_left_padding <= 0:
         return input_ids, attention_mask, position_ids
 
     return (
-        input_ids[:, left_padding:],
-        attention_mask[:, left_padding:],
-        position_ids[..., left_padding:],
+        input_ids[:, common_left_padding:],
+        attention_mask[:, common_left_padding:],
+        position_ids[..., common_left_padding:],
+    )
+
+
+def _trim_right_response_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Crop right-padded response positions and return the original response width."""
+    original_response_length = responses.size(-1)
+    prompt_length = input_ids.shape[1] - original_response_length
+    if prompt_length <= 0:
+        raise ValueError(
+            "CoLT response length must be smaller than the input sequence length: "
+            f"input_length={input_ids.shape[1]}, response_length={original_response_length}."
+        )
+
+    valid_response_lengths = response_mask[:, :original_response_length].sum(dim=-1)
+    effective_response_length = max(int(valid_response_lengths.max().item()), 1)
+    if effective_response_length >= original_response_length:
+        return input_ids, attention_mask, position_ids, responses, original_response_length
+
+    sequence_length = prompt_length + effective_response_length
+    return (
+        input_ids[:, :sequence_length],
+        attention_mask[:, :sequence_length],
+        position_ids[..., :sequence_length],
+        responses[:, :effective_response_length],
+        original_response_length,
     )
 
 
@@ -104,6 +134,14 @@ class DataParallelPPOActor(BasePPOActor):
         attention_mask = micro_batch["attention_mask"]
         position_ids = micro_batch["position_ids"]
         responses = micro_batch["responses"]
+        response_mask = micro_batch["response_mask"]
+        input_ids, attention_mask, position_ids, responses, original_response_length = _trim_right_response_padding(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            responses=responses,
+            response_mask=response_mask,
+        )
         response_length = responses.size(-1)
         if self.config.colt_latent_reasoning:
             input_ids, attention_mask, position_ids = _trim_left_prompt_padding(
@@ -204,6 +242,9 @@ class DataParallelPPOActor(BasePPOActor):
             logits.div_(temperature)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
 
+        if response_length < original_response_length:
+            log_probs = F.pad(log_probs, (0, original_response_length - response_length))
+
         return log_probs
 
     def _optimizer_step(self) -> torch.Tensor:
@@ -242,7 +283,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.eval()
 
         temperature = data.meta_info["temperature"]
-        select_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
+        select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         data = data.select(select_keys, non_tensor_select_keys)
