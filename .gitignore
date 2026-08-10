@@ -26,7 +26,7 @@ wandb/
 
 # Runtime assets must stay outside Git
 envs/
-models/
+/models/
 !transformers-4.57.0/src/transformers/models/
 !transformers-4.57.0/src/transformers/models/qwen3_vl/
 !transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py
