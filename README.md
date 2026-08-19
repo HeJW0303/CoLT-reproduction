@@ -90,6 +90,17 @@ The code to start training is:
 bash ./LLaMA-Factory/local_scripts/run_colt_sft.sh
 ```
 
+### CoLT row-level training controls
+
+Rows marked `visual_only` have all SFT labels set to `-100`; the CoLT model now
+uses that mask for answer CE, latent-to-CoT, CoT-to-latent, latent prediction,
+and Oracle-K losses, while retaining visual grounding supervision. Rows marked
+`visual_cot` are the only rows eligible for `COLT_IMAGE_MASK_PROB`. For a
+sample selected by that probability, the answer decoder masks the complete
+question KV prefix (including image-conditioned question states), leaving the
+latent trajectory and answer history visible. Existing bbox/step-bbox datasets
+derive `visual_cot` automatically unless they explicitly provide the column.
+
 ## 🔮 Inference & Evaluation
 Since CoLT-8B shares the same architecture as Qwen3-VL-8B, it naturally supports easy and efficient inference.
 

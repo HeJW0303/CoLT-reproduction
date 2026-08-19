@@ -85,7 +85,7 @@ cmd_eval() {
 
   local cli_model_path="" gpu_csv="" workers="${VLMEVAL_WORKERS_PER_GPU:-3}"
   local generation="${COLT_GENERATION_MODE:-}"
-  local latent_transition="${COLT_INFERENCE_LATENT_TRANSITION:-official}"
+  local latent_transition="${COLT_INFERENCE_LATENT_TRANSITION:-training-consistent}"
   local prefetch="${VLMEVAL_PREFETCH:-1}" empty_cache="${VLMEVAL_EMPTY_CACHE_EVERY_N:-0}"
   local backend="${VLMEVAL_DIST_BACKEND:-gloo}" reseed="${COLT_RESEED_PER_SAMPLE:-1}"
   local empty_response_policy="${COLT_EMPTY_RESPONSE_POLICY:-allow}"
@@ -145,6 +145,10 @@ cmd_eval() {
     "COLT_EVAL_RESULT_KIND must be standard or external-judge" ;; esac
   if [[ "$result_kind" == external-judge && "$judge" == exact_matching ]]; then
     die "External-judge results require a non-exact judge"
+  fi
+  # The textual-CoT baseline has no CoLT latent reasoning; transition is moot.
+  if [[ "$target" == baseline ]]; then
+    latent_transition=official
   fi
   if [[ "$target" == baseline && "$empty_response_policy" != allow ]]; then
     die "baseline does not support --empty-response-policy prevent"
@@ -206,6 +210,9 @@ cmd_eval() {
   python -m pip check
 
   local adapter_mode=colt model_name="Qwen3-VL-8B-Instruct-COLT" paper_profile=colt
+  local requested_max_new_tokens="${COLT_EVAL_MAX_NEW_TOKENS:-8192}"
+  [[ "$requested_max_new_tokens" =~ ^[1-9][0-9]*$ ]] || die \
+    "COLT_EVAL_MAX_NEW_TOKENS must be a positive integer"
   local effective_sample=True effective_tokens=256
   local source_model_path="$EVAL_MODEL_PATH" runtime_model_path="$EVAL_MODEL_PATH"
   local run_id="$(date +%Y%m%d_%H%M%S)"
@@ -229,7 +236,7 @@ cmd_eval() {
     fi
     if [[ "$generation" == respect-args ]]; then
       effective_sample=False
-      effective_tokens=8192
+      effective_tokens="$requested_max_new_tokens"
       export COLT_RESPECT_GENERATION_ARGS=1
     else
       export COLT_RESPECT_GENERATION_ARGS=0
@@ -253,7 +260,10 @@ cmd_eval() {
     --repo-root "$REPO_ROOT" --model-dir "$source_model_path" \
     --setting "target=$target" --setting "group=$group" --setting "datasets=$dataset_fingerprint" \
     --setting "generation=$generation" \
+    --setting "max_new_tokens=$requested_max_new_tokens" \
     --setting "latent_transition=$latent_transition" \
+    --setting "latent_intervention=${COLT_LATENT_INTERVENTION:-none}" \
+    --setting "answer_visibility=${COLT_ANSWER_VISIBILITY:-full}" \
     --setting "seed=${COLT_EVAL_SEED:-1234}" --setting "workers=$workers" \
     --setting "prefetch=$prefetch" --setting "empty_cache=$empty_cache" \
     --setting "backend=$backend" --setting "reseed=$reseed" \
@@ -263,7 +273,7 @@ cmd_eval() {
     --setting "judge=$judge" --setting "judge_args=$judge_args" \
     --setting "judge_nproc=$judge_nproc" --setting "judge_retry=$judge_retry" \
     --setting "result_kind=$result_kind")"
-  profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_lt${latent_transition//-/_}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
+  profile="replicas${nproc}_w${workers}_p${prefetch}_c${empty_cache}_r${reseed}_${generation}_${empty_response_policy}_lt${latent_transition//-/_}_av${COLT_ANSWER_VISIBILITY:-full}_li${COLT_LATENT_INTERVENTION:-none}_mn${requested_max_new_tokens}_seed${COLT_EVAL_SEED:-1234}_${fingerprint}"
   if [[ "$result_kind" == external-judge ]]; then
     profile="${profile}_judge_${judge_profile}"
   fi
@@ -279,6 +289,7 @@ cmd_eval() {
   export VLMEVAL_WORKERS_PER_GPU="$workers" VLMEVAL_PREFETCH="$prefetch"
   export VLMEVAL_EMPTY_CACHE_EVERY_N="$empty_cache" VLMEVAL_DIST_BACKEND="$backend"
   export COLT_RESEED_PER_SAMPLE="$reseed" COLT_EVAL_SEED="${COLT_EVAL_SEED:-1234}"
+  export COLT_LATENT_TEMPERATURE="${COLT_LATENT_TEMPERATURE:-0.0}"
   export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
   unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE
 
@@ -298,7 +309,7 @@ cmd_eval() {
   fi
   echo "requested_do_sample=False"
   echo "effective_do_sample=$effective_sample"
-  echo "requested_max_new_tokens=8192"
+  echo "requested_max_new_tokens=$requested_max_new_tokens"
   echo "effective_max_new_tokens=$effective_tokens"
   if [[ "$target" == oracle-k ]]; then
     if [[ -n "$oracle_k_forced_k" ]]; then

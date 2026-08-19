@@ -54,7 +54,7 @@ class OracleKInferencePlan:
 
 def resolve_colt_inference_latent_transition(environ: Optional[Mapping[str, str]] = None) -> str:
     environ = os.environ if environ is None else environ
-    mode = environ.get("COLT_INFERENCE_LATENT_TRANSITION", COLT_INFERENCE_TRANSITION_OFFICIAL)
+    mode = environ.get("COLT_INFERENCE_LATENT_TRANSITION", COLT_INFERENCE_TRANSITION_TRAINING_CONSISTENT)
     mode = mode.strip().lower()
     if mode not in COLT_INFERENCE_TRANSITIONS:
         choices = ", ".join(sorted(COLT_INFERENCE_TRANSITIONS))

@@ -128,6 +128,16 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        if self.dataset_attr.bboxes:
+            output["_bboxes"] = example[self.dataset_attr.bboxes]
+        if self.dataset_attr.step_bboxes:
+            output["_step_bboxes"] = example[self.dataset_attr.step_bboxes]
+        if self.dataset_attr.visual_only:
+            output["_visual_only"] = bool(example[self.dataset_attr.visual_only])
+        if self.dataset_attr.visual_cot:
+            output["_visual_cot"] = bool(example[self.dataset_attr.visual_cot])
+        elif self.dataset_attr.bboxes or self.dataset_attr.step_bboxes:
+            output["_visual_cot"] = not output.get("_visual_only", False)
         return output
 
 
@@ -224,6 +234,16 @@ class SharegptDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        if self.dataset_attr.bboxes:
+            output["_bboxes"] = example[self.dataset_attr.bboxes]
+        if self.dataset_attr.step_bboxes:
+            output["_step_bboxes"] = example[self.dataset_attr.step_bboxes]
+        if self.dataset_attr.visual_only:
+            output["_visual_only"] = bool(example[self.dataset_attr.visual_only])
+        if self.dataset_attr.visual_cot:
+            output["_visual_cot"] = bool(example[self.dataset_attr.visual_cot])
+        elif self.dataset_attr.bboxes or self.dataset_attr.step_bboxes:
+            output["_visual_cot"] = not output.get("_visual_only", False)
         return output
 
 
@@ -364,6 +384,16 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        if self.dataset_attr.bboxes:
+            output["_bboxes"] = example[self.dataset_attr.bboxes]
+        if self.dataset_attr.step_bboxes:
+            output["_step_bboxes"] = example[self.dataset_attr.step_bboxes]
+        if self.dataset_attr.visual_only:
+            output["_visual_only"] = bool(example[self.dataset_attr.visual_only])
+        if self.dataset_attr.visual_cot:
+            output["_visual_cot"] = bool(example[self.dataset_attr.visual_cot])
+        elif self.dataset_attr.bboxes or self.dataset_attr.step_bboxes:
+            output["_visual_cot"] = not output.get("_visual_only", False)
         return output
 
 

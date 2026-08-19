@@ -23,7 +23,7 @@ import contextlib
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, List, Mapping, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -59,8 +59,20 @@ from .oracle_k import (
     select_oracle_k_conditioning_step,
     select_oracle_k_inference_plan,
 )
+from .modeling_colt_grounding import (
+    compute_grounding_contrastive_loss,
+    compute_step_contrastive_loss,
+    pool_roi_and_non_roi_features,
+    pool_step_roi_and_nonroi_features,
+)
+from .modeling_colt_latent_heads import LatentStochasticHead, LowRankExplorationHead
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.cuda.amp import autocast
+
+
+# Re-entrancy guard: while a frozen teacher is being constructed, the teacher's
+# own __init__ must not try to load another teacher (would recurse forever).
+_COLT_TEACHER_LOADING = False
 
 
 def _extend_colt_cached_attention_mask(
@@ -71,6 +83,7 @@ def _extend_colt_cached_attention_mask(
     batch_size: int,
     device: torch.device,
     current_attention_mask: Optional[torch.Tensor] = None,
+    mask_prompt: bool = False,
 ) -> torch.Tensor:
     """Build the 2D mask required by a cached CoLT decoding step.
 
@@ -103,7 +116,7 @@ def _extend_colt_cached_attention_mask(
                 f"cache={past_seen_tokens}, prompt={prompt_attention_mask.shape[1]}."
             )
         mask_dtype = prompt_attention_mask.dtype
-        cached_prefix_mask = prompt_attention_mask
+        cached_prefix_mask = torch.zeros_like(prompt_attention_mask) if mask_prompt else prompt_attention_mask
     else:
         cached_latent_length = past_seen_tokens
         mask_dtype = torch.long
@@ -134,6 +147,124 @@ def _extend_colt_cached_attention_mask(
         device=device,
     )
     return torch.cat((cached_prefix_mask, cached_latent_mask, current_attention_mask), dim=1)
+
+
+def _normalize_colt_row_mask(
+    row_mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    device: torch.device,
+    name: str,
+) -> Optional[torch.Tensor]:
+    """Validate and move a per-example CoLT control mask."""
+    if row_mask is None:
+        return None
+    if not isinstance(row_mask, torch.Tensor):
+        row_mask = torch.as_tensor(row_mask)
+    if row_mask.ndim != 1 or row_mask.shape[0] != batch_size:
+        raise ValueError(
+            f"{name} must have shape ({batch_size},), received {tuple(row_mask.shape)}."
+        )
+    return row_mask.to(device=device, dtype=torch.bool)
+
+
+def _resolve_colt_loss_row_mask(
+    labels: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    device: torch.device,
+    visual_only: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return examples that have supervised targets for custom CoLT losses.
+
+    CoLT reconstructs CoT and answer targets from ``input_ids``. Therefore the
+    normal SFT ``labels`` mask must be applied explicitly here instead of being
+    treated as documentation-only metadata.
+    """
+    if labels is None:
+        active_rows = torch.ones(batch_size, dtype=torch.bool, device=device)
+    else:
+        if labels.ndim != 2 or labels.shape[0] != batch_size:
+            raise ValueError(
+                "CoLT labels must have shape (batch_size, sequence_length); "
+                f"received {tuple(labels.shape)} for batch size {batch_size}."
+            )
+        active_rows = labels.ne(-100).any(dim=1).to(device=device)
+
+    visual_only_rows = _normalize_colt_row_mask(
+        visual_only,
+        batch_size=batch_size,
+        device=device,
+        name="colt_visual_only",
+    )
+    if visual_only_rows is not None:
+        active_rows = active_rows & ~visual_only_rows
+    return active_rows
+
+
+def _resolve_colt_visual_cot_rows(
+    visual_cot: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    device: torch.device,
+    bboxes: Optional[List[List[List[float]]]] = None,
+    step_bboxes: Optional[List[List[List[List[float]]]]] = None,
+) -> torch.Tensor:
+    """Resolve the rows eligible for the visual-CoT information bottleneck."""
+    explicit_rows = _normalize_colt_row_mask(
+        visual_cot,
+        batch_size=batch_size,
+        device=device,
+        name="colt_visual_cot",
+    )
+    if explicit_rows is not None:
+        return explicit_rows
+
+    inferred_rows = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    if bboxes is not None:
+        if len(bboxes) != batch_size:
+            raise ValueError(
+                f"colt_bboxes must contain one entry per sample ({batch_size}), received {len(bboxes)}."
+            )
+        inferred_rows |= torch.tensor([bool(sample_bboxes) for sample_bboxes in bboxes], device=device)
+    if step_bboxes is not None:
+        if len(step_bboxes) != batch_size:
+            raise ValueError(
+                "colt_step_bboxes must contain one entry per sample "
+                f"({batch_size}), received {len(step_bboxes)}."
+            )
+        inferred_rows |= torch.tensor(
+            [bool(sample_step_bboxes) for sample_step_bboxes in step_bboxes],
+            device=device,
+        )
+    return inferred_rows
+
+
+def _mask_colt_visual_cot_prompt_rows(
+    attention_mask: torch.Tensor,
+    *,
+    current_seq_len: int,
+    rows_to_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Hide the complete question KV prefix for selected visual-CoT rows."""
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "CoLT visual-CoT answer attention_mask must be rank 2; "
+            f"received shape {tuple(attention_mask.shape)}."
+        )
+    if rows_to_mask.ndim != 1 or rows_to_mask.shape[0] != attention_mask.shape[0]:
+        raise ValueError(
+            "CoLT visual-CoT row mask must match the attention_mask batch dimension; "
+            f"received {tuple(rows_to_mask.shape)} for {attention_mask.shape[0]} rows."
+        )
+    if current_seq_len < 0 or current_seq_len > attention_mask.shape[1]:
+        raise ValueError(
+            "CoLT question cache length must fit inside the answer attention mask; "
+            f"received current_seq_len={current_seq_len}, mask_length={attention_mask.shape[1]}."
+        )
+    masked_attention_mask = attention_mask.clone()
+    masked_attention_mask[rows_to_mask.to(device=attention_mask.device), :current_seq_len] = 0
+    return masked_attention_mask
 
 
 class Qwen3VLVisionMLP(nn.Module):
@@ -1133,6 +1264,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
+        self._colt_cache_visual_features = os.environ.get("COLT_VISUAL_GROUNDING", "0") == "1"
+        self._colt_visual_embeds = None
+        self._colt_image_grid_thw = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1384,6 +1518,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            if self._colt_cache_visual_features:
+                self._colt_visual_embeds = image_embeds
+                self._colt_image_grid_thw = image_grid_thw
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
@@ -1526,6 +1663,7 @@ class LowRankProjector(nn.Module):
 
     def forward(self, x):
         return torch.matmul(torch.matmul(x, self.U), self.V)
+
 
 def extract_think_content_robust(input_ids, think_token_id=151667, end_think_token_id=151668, answer_token_id=9217):
 
@@ -1702,7 +1840,13 @@ def _compute_colt_forward_cot_loss(loss_function, ref_logits, ref_labels, vocab_
     return loss_function(logits=ref_logits, labels=ref_labels, vocab_size=vocab_size)
 
 
-def _compute_colt_backward_alignment_loss(cot_hidden, latent_embd, projector, probe_positions=None):
+def _compute_colt_backward_alignment_loss(
+    cot_hidden,
+    latent_embd,
+    projector,
+    probe_positions=None,
+    active_mask=None,
+):
     """Align the latent state to the official fixed textual semantic anchor."""
     if probe_positions is None:
         cot_last_hidden = cot_hidden[:, -1, :]
@@ -1711,7 +1855,16 @@ def _compute_colt_backward_alignment_loss(cot_hidden, latent_embd, projector, pr
         cot_last_hidden = cot_hidden[batch_indices, probe_positions]
     cot_last_hidden = cot_last_hidden.detach()
     cot_to_latent = projector(cot_last_hidden).unsqueeze(1).to(latent_embd.dtype)
-    return 1 - F.cosine_similarity(cot_to_latent.float(), latent_embd.float(), dim=-1).mean()
+    per_sample_loss = (
+        1 - F.cosine_similarity(cot_to_latent.float(), latent_embd.float(), dim=-1)
+    ).squeeze(-1)
+    if active_mask is None:
+        return per_sample_loss.mean()
+    active_mask = active_mask.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+    active_count = active_mask.sum()
+    if active_count.item() == 0:
+        return per_sample_loss.sum() * 0.0
+    return (per_sample_loss * active_mask).sum() / active_count
 
 
 def _ensure_colt_decoder_initialized(
@@ -1816,6 +1969,7 @@ def _make_minimal_backward_dummy(record):
         "probe_positions": torch.zeros((1,), dtype=torch.long, device=input_ids.device),
         "latent_embd": record["latent_embd"][:1],
         "active": False,
+        "active_mask": torch.zeros((1,), dtype=torch.bool, device=input_ids.device),
     }
 
 
@@ -1941,8 +2095,9 @@ def _run_colt_backward_decoder_steps(
                 record["latent_embd"],
                 projector,
                 probe_positions=record["probe_positions"],
+                active_mask=record.get("active_mask"),
             )
-            losses.append(loss if record.get("active", True) else loss * 0.0)
+            losses.append(loss)
         return losses
 
     active_records = [record for record in records if record.get("active", True)]
@@ -1987,11 +2142,24 @@ def _run_colt_backward_decoder_steps(
             continue
         for anchor, record in zip(projected_anchors, chunk):
             anchor = anchor.to(record["latent_embd"].dtype)
-            losses[record_positions[id(record)]] = 1 - F.cosine_similarity(
-                anchor.float(),
-                record["latent_embd"].float(),
-                dim=-1,
-            ).mean()
+            per_sample_loss = 1 - F.cosine_similarity(
+                anchor.float(), record["latent_embd"].float(), dim=-1
+            ).squeeze(-1)
+            active_mask = record.get("active_mask")
+            if active_mask is None:
+                losses[record_positions[id(record)]] = per_sample_loss.mean()
+            else:
+                active_mask = active_mask.to(
+                    device=per_sample_loss.device,
+                    dtype=per_sample_loss.dtype,
+                )
+                active_count = active_mask.sum()
+                if active_count.item() == 0:
+                    losses[record_positions[id(record)]] = per_sample_loss.sum() * 0.0
+                else:
+                    losses[record_positions[id(record)]] = (
+                        per_sample_loss * active_mask
+                    ).sum() / active_count
     losses[0] = losses[0] + synchronization_loss
     return losses
 
@@ -2006,6 +2174,18 @@ def _is_colt_aux_batching_enabled():
 
 def _is_colt_rl_mode_enabled():
     return os.environ.get("COLT_RL_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+COLT_ANSWER_VISIBILITIES = {"full", "latent_only"}
+
+
+def _resolve_colt_answer_visibility(environ: Optional[Mapping[str, str]] = None) -> str:
+    environ = os.environ if environ is None else environ
+    visibility = environ.get("COLT_ANSWER_VISIBILITY", "full").strip().lower()
+    if visibility not in COLT_ANSWER_VISIBILITIES:
+        choices = ", ".join(sorted(COLT_ANSWER_VISIBILITIES))
+        raise ValueError(f"COLT_ANSWER_VISIBILITY must be one of {choices}, got {visibility!r}")
+    return visibility
 
 
 def _is_colt_rank_zero():
@@ -2140,6 +2320,50 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size),
             nn.LayerNorm(config.text_config.hidden_size),
         )
+        self.stochastic_latent_enabled = os.environ.get("COLT_STOCHASTIC_LATENT", "0") == "1"
+        self.latent_noise_std = float(os.environ.get("COLT_LATENT_NOISE_STD", "0.1"))
+        self.latent_temperature = float(os.environ.get("COLT_LATENT_TEMPERATURE", "1.0"))
+        self.image_mask_prob = float(os.environ.get("COLT_IMAGE_MASK_PROB", "0.0"))
+        self.answer_visibility = _resolve_colt_answer_visibility()
+        self.latent_stochastic_head = LatentStochasticHead(config.text_config.hidden_size)
+        self.lowrank_exploration_enabled = os.environ.get("COLT_LOWRANK_EXPLORE", "0") == "1"
+        self.lowrank_rank = int(os.environ.get("COLT_LOWRANK_RANK", "16"))
+        self.lowrank_exploration_head = (
+            LowRankExplorationHead(config.text_config.hidden_size, rank=self.lowrank_rank)
+            if self.lowrank_exploration_enabled
+            else None
+        )
+        self.visual_grounding_enabled = os.environ.get("COLT_VISUAL_GROUNDING", "0") == "1"
+        self.visual_grounding_weight = float(os.environ.get("COLT_VISUAL_GROUNDING_WEIGHT", "0.1"))
+        self.visual_grounding_temperature = float(
+            os.environ.get("COLT_GROUNDING_TEMPERATURE", "0.07")
+        )
+        global _COLT_TEACHER_LOADING
+        self.kl_anchor_enabled = os.environ.get("COLT_KL_ANCHOR", "0") == "1"
+        self.kl_anchor_weight = float(os.environ.get("COLT_KL_ANCHOR_WEIGHT", "0.1"))
+        self.colt_teacher = None
+        if self.kl_anchor_enabled and not self.colt_rl_mode and not _COLT_TEACHER_LOADING:
+            teacher_path = os.environ.get(
+                "COLT_TEACHER_PATH",
+                "/home/dataset-local/lkl/CoLT-reproduction/checkpoints/colt_paper_faithful_v2",
+            )
+            _COLT_TEACHER_LOADING = True
+            try:
+                from transformers import AutoModelForImageTextToText
+
+                self.colt_teacher = AutoModelForImageTextToText.from_pretrained(
+                    teacher_path,
+                    torch_dtype=config.text_config.dtype,
+                    low_cpu_mem_usage=True,
+                    local_files_only=True,
+                    trust_remote_code=True,
+                )
+                for param in self.colt_teacher.parameters():
+                    param.requires_grad_(False)
+            finally:
+                _COLT_TEACHER_LOADING = False
+        self.latent_answer_grad_norm = None
+        self.latent_used_steps = 0
         # Latent hidden states after LayerNorm typically have std~1, while token embeddings are much smaller.
         # Without scaling, fp16/bf16 attention can overflow and produce NaNs in early decoder layers.
         # FSDP cannot flatten zero-dimensional Parameters. Keep these as
@@ -2539,6 +2763,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         colt_rl_response_length: Optional[int] = None,
         colt_cached_latent_outputs: Optional[Qwen3VLCausalLMOutputWithPast] = None,
         colt_shared_prompt_prefix: bool = False,
+        colt_bboxes: Optional[List[List[List[float]]]] = None,
+        colt_step_bboxes: Optional[List[List[List[List[float]]]]] = None,
+        colt_visual_only: Optional[torch.Tensor] = None,
+        colt_visual_cot: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -2575,6 +2803,29 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
         if self.latent_reasoning_mode:
+            colt_loss_row_mask = _resolve_colt_loss_row_mask(
+                labels,
+                batch_size=input_ids.shape[0],
+                device=input_ids.device,
+                visual_only=colt_visual_only,
+            )
+            colt_visual_cot_rows = _resolve_colt_visual_cot_rows(
+                colt_visual_cot,
+                batch_size=input_ids.shape[0],
+                device=input_ids.device,
+                bboxes=colt_bboxes,
+                step_bboxes=colt_step_bboxes,
+            )
+            colt_visual_only_rows = (
+                _normalize_colt_row_mask(
+                    colt_visual_only,
+                    batch_size=input_ids.shape[0],
+                    device=input_ids.device,
+                    name="colt_visual_only",
+                )
+                if colt_visual_only is not None
+                else torch.zeros_like(colt_loss_row_mask)
+            )
             # Prepare the inputs of each process
             # seperate the question, cot procedure and answer of each sample
             question_id_list, cot_id_list, answer_id_list = map(
@@ -2685,7 +2936,18 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     dtype=torch.long,
                     device=k_logits.device,
                 )
-                k_loss_total = F.cross_entropy(k_logits.float(), k_targets)
+                k_loss_per_sample = F.cross_entropy(
+                    k_logits.float(),
+                    k_targets,
+                    reduction="none",
+                )
+                active_count = colt_loss_row_mask.sum()
+                if active_count.item() == 0:
+                    k_loss_total = k_logits.sum() * 0.0
+                else:
+                    k_loss_total = (
+                        k_loss_per_sample * colt_loss_row_mask.to(k_loss_per_sample.dtype)
+                    ).sum() / active_count
                 k_accuracy = (predicted_k == k_targets + 1).float().mean()
                 self._log_oracle_k_first_batch(k_logits, k_targets, predicted_k)
                 self._accumulate_oracle_k_metrics(k_logits, k_targets, predicted_k)
@@ -2708,6 +2970,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             batch_size = hidden_states.shape[0]
             batched_forward_records = []
             batched_backward_records = []
+            colt_latent_hiddens = []
+            image_mask_rows = torch.zeros_like(colt_loss_row_mask)
 
             synchronized_latent_steps = (
                 _synchronize_colt_oracle_k(training_latent_steps, input_ids.device)
@@ -2761,12 +3025,52 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             **kwargs,
                         )
                     hidden_states = outputs[0]
-                    next_latent_embd = hidden_states[:, -1:, :] + self.alpha * self.prj(hidden_states[:, -1:, :])
+                    latent_hidden = hidden_states[:, -1:, :]
+                    if (
+                        active_step
+                        and self.visual_grounding_enabled
+                        and (colt_bboxes is not None or colt_step_bboxes is not None)
+                    ):
+                        colt_latent_hiddens.append(latent_hidden)
+                    if self.stochastic_latent_enabled:
+                        noise, latent_mean, latent_std = self.latent_stochastic_head(
+                            latent_hidden,
+                            temperature=self.latent_temperature,
+                            sample=True,
+                        )
+                        next_latent_embd = (
+                            latent_hidden
+                            + self.alpha * self.prj(latent_hidden)
+                            + self.latent_noise_std * noise
+                        )
+                        if self.training:
+                            self.latent_used_steps += 1
+                            if self.latent_used_steps % 100 == 0:
+                                grad_norm = self.latent_answer_grad_norm
+                                grad_norm_str = (
+                                    f"{grad_norm:.4f}" if grad_norm is not None else "n/a"
+                                )
+                                print(
+                                    f"[latent-stochastic] step={self.latent_used_steps} "
+                                    f"noise_std_mean={latent_std.float().mean().item():.4f} "
+                                    f"alpha={self.alpha.detach().float().item():.4f} "
+                                    f"answer_grad_norm={grad_norm_str}",
+                                    flush=True,
+                                )
+                    else:
+                        next_latent_embd = latent_hidden + self.alpha * self.prj(latent_hidden)
                     pred_next_latent = self.latent_predictor(current_latent_embd.to(next_latent_embd.dtype))
-                    prediction_loss = F.mse_loss(pred_next_latent, next_latent_embd.detach())
-                    prediction_loss_total += prediction_loss if active_step else prediction_loss * 0.0
+                    prediction_loss_per_sample = F.mse_loss(
+                        pred_next_latent,
+                        next_latent_embd.detach(),
+                        reduction="none",
+                    ).mean(dim=tuple(range(1, pred_next_latent.ndim)))
+                    prediction_loss_total += (
+                        prediction_loss_per_sample
+                        * colt_loss_row_mask.to(prediction_loss_per_sample.dtype)
+                    ).sum() if active_step else prediction_loss_per_sample.sum() * 0.0
                     if active_step:
-                        prediction_steps_num += 1
+                        prediction_steps_num += int(colt_loss_row_mask.sum().item())
 
                     # -----------------------------------------------
                     # B) forward supervision: latent -> CoT decoding
@@ -2786,7 +3090,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     
                     current_ref_ids = cot_step_id[step_ref_idx]
                     current_ref_lens_cpu = [cot_step_len_list[b][step_ref_idx] for b in range(batch_size)]
-                    has_forward_targets = active_step and any(length > 0 for length in current_ref_lens_cpu)
                     current_ref_lens = torch.tensor(
                         current_ref_lens_cpu,
                         dtype=torch.long,
@@ -2798,8 +3101,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         .expand(batch_size, -1)
                         < current_ref_lens.unsqueeze(1)
                     )
+                    current_ref_valid &= colt_loss_row_mask.unsqueeze(1)
                     if not active_step:
                         current_ref_valid = torch.zeros_like(current_ref_valid)
+                    has_forward_targets = active_step and bool(current_ref_valid.any().item())
                     prefix_mask = torch.ones((batch_size, 1), dtype=torch.long, device=current_ref_ids.device)
                     ref_attention_mask = torch.cat([prefix_mask, current_ref_valid.long()], dim=1)
                     ref_labels = current_ref_ids.masked_fill(~current_ref_valid, -100)
@@ -2822,6 +3127,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         "position_ids": ref_position_ids,
                         "labels": ref_labels,
                         "has_targets": has_forward_targets,
+                        "target_mask": colt_loss_row_mask & (current_ref_lens > 0) & active_step,
                     }
                     if self.batch_aux_decoders:
                         batched_forward_records.append(forward_record)
@@ -2854,7 +3160,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                     vocab_size=self.config.text_config.vocab_size,
                                 )
                         if has_forward_targets:
-                            forward_steps_num += 1
+                            forward_steps_num += int(forward_record["target_mask"].sum().item())
                         forward_loss_total += forward_loss
                     # ----------------------------------------------------
                     # C) backward alignment: CoT step (+probe) -> latent
@@ -2878,7 +3184,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             .expand(batch_size, -1)
                             < backward_ref_lens.unsqueeze(1)
                         ).long()
-                        has_backward_targets = any(length > 0 for length in backward_ref_lens_cpu)
+                        backward_active_mask = colt_loss_row_mask & (backward_ref_lens > 0) & active_step
+                        has_backward_targets = bool(backward_active_mask.any().item())
                         # In batched mode every rank must contribute a record to the
                         # synchronized auxiliary call graph.  A rank with no local
                         # backward target contributes an inactive record; the helper
@@ -2891,7 +3198,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             and not self.batch_aux_decoders
                         ):
                             continue
-                        backward_active = active_step and has_backward_targets
+                        backward_active = has_backward_targets
                         # Encode CoT step, then force one extra "probe" step.
                         # Dummy records keep the same ZeRO-3 call graph but carry zero loss.
                         probe_token = torch.full(
@@ -2920,6 +3227,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                             "probe_positions": probe_positions,
                             "latent_embd": supervised_latent_embd,
                             "active": backward_active,
+                            "active_mask": backward_active_mask,
                         }
                         if self.batch_aux_decoders:
                             batched_backward_records.append(backward_record)
@@ -2944,10 +3252,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                                 cot_hidden,
                                 supervised_latent_embd,
                                 self.pj_back,
+                                active_mask=backward_active_mask,
                             )
-                            backward_loss_total += backward_loss if backward_active else backward_loss * 0.0
+                            backward_loss_total += backward_loss
                             if backward_active:
-                                backward_steps_num += 1
+                                backward_steps_num += int(backward_active_mask.sum().item())
 
                 # D) Decode the final answer once all ranks have completed the
                 # synchronized latent loop, using this rank's local-K state.
@@ -2966,6 +3275,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     answer_id_list, batch_first=True, padding_value=self.pad_token_id
                 )
                 embds = self.model.get_input_embeddings()(label_input_ids)
+                if self.stochastic_latent_enabled and self.training and latent_embd.requires_grad:
+                    latent_embd.register_hook(
+                        lambda grad: setattr(self, "latent_answer_grad_norm", grad.float().norm().item())
+                    )
                 embds = torch.concat([latent_embd, embds], dim=1)
                 past_seen_tokens = (
                     past_key_values.get_seq_length() if past_key_values is not None else current_seq_len + training_latent_steps
@@ -2978,6 +3291,39 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 step_attention_mask = torch.ones(
                     (batch_size, embds.shape[1]), dtype=torch.long, device=latent_embd.device
                 )
+                if self.training and self.answer_visibility == "latent_only":
+                    # Permanent causal bottleneck: the answer may attend only
+                    # the latent trajectory and its own decoded history.  This
+                    # removes both direct image access and the residual
+                    # image leakage that can flow through question KV states.
+                    full_seq_len = past_seen_tokens + embds.shape[1]
+                    full_mask = torch.zeros(
+                        (batch_size, full_seq_len), dtype=torch.long, device=latent_embd.device
+                    )
+                    prompt_length = attention_mask_question.shape[1]
+                    full_mask[:, prompt_length:] = 1
+                    step_attention_mask = full_mask
+                elif (
+                    self.training
+                    and self.image_mask_prob > 0.0
+                ):
+                    full_seq_len = past_seen_tokens + embds.shape[1]
+                    full_mask = torch.ones(
+                        (batch_size, full_seq_len), dtype=torch.long, device=latent_embd.device
+                    )
+                    # The bottleneck is sampled per row and only for explicit
+                    # visual-CoT examples. Masking the whole question KV prefix
+                    # is required: masking image-token positions alone still
+                    # leaks image information through question KV states.
+                    sampled_rows = torch.rand(batch_size, device=latent_embd.device) < self.image_mask_prob
+                    rows_to_mask = colt_visual_cot_rows & colt_loss_row_mask & sampled_rows
+                    image_mask_rows |= rows_to_mask
+                    if rows_to_mask.any():
+                        step_attention_mask = _mask_colt_visual_cot_prompt_rows(
+                            full_mask,
+                            current_seq_len=current_seq_len,
+                            rows_to_mask=rows_to_mask,
+                        )
                 outputs = self.model(
                     inputs_embeds=embds,
                     past_key_values=past_key_values,
@@ -2988,11 +3334,34 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 )
 
                 logits = self.lm_head(outputs[0])
-                ce_loss_total += self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.text_config.vocab_size,
-                )
+                if colt_loss_row_mask.any():
+                    ce_loss_total += self.loss_function(
+                        logits=logits,
+                        labels=labels.masked_fill(~colt_loss_row_mask.unsqueeze(1), IGNORE_INDEX),
+                        vocab_size=self.config.text_config.vocab_size,
+                    )
+                else:
+                    ce_loss_total += logits.sum() * 0.0
+                if self.colt_teacher is not None:
+                    with torch.no_grad():
+                        teacher_outputs = self.colt_teacher(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            pixel_values=pixel_values,
+                            image_grid_thw=image_grid_thw,
+                        )
+                    valid = (labels != IGNORE_INDEX) & colt_loss_row_mask.unsqueeze(1)
+                    if valid.any():
+                        student_lp = F.log_softmax(logits.float()[valid], dim=-1)
+                        teacher_lp = F.log_softmax(teacher_outputs.logits.float()[valid], dim=-1)
+                        anchor_loss_total = F.kl_div(
+                            student_lp,
+                            teacher_lp,
+                            reduction="batchmean",
+                            log_target=True,
+                        )
+                    else:
+                        anchor_loss_total = k_loss_total.new_zeros(())
             if self.batch_aux_decoders:
                 forward_losses = _run_colt_forward_decoder_steps(
                     self.decoder,
@@ -3004,8 +3373,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 )
                 for forward_loss, record in zip(forward_losses, batched_forward_records):
                     forward_loss_total += forward_loss
-                    if record["has_targets"]:
-                        forward_steps_num += 1
+                    forward_steps_num += int(record["target_mask"].sum().item())
 
                 backward_losses = _run_colt_backward_decoder_steps(
                     self.backward_decoder,
@@ -3016,8 +3384,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 )
                 for backward_loss, record in zip(backward_losses, batched_backward_records):
                     backward_loss_total += backward_loss
-                    if record.get("active", True):
-                        backward_steps_num += 1
+                    active_mask = record.get("active_mask")
+                    if active_mask is None:
+                        backward_steps_num += int(bool(record.get("active", True)))
+                    else:
+                        backward_steps_num += int(active_mask.sum().item())
 
             forward_loss_total = forward_loss_total / max(forward_steps_num, 1)
             backward_loss_total = backward_loss_total / max(backward_steps_num, 1)
@@ -3049,6 +3420,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 print(f"forward_loss_total : {component_losses[1]}")
                 print(f"backward_loss_total : {component_losses[2]}")
                 print(f"prediction_loss_total : {component_losses[3]}")
+                print(
+                    "colt_control_rows : "
+                    f"active={int(colt_loss_row_mask.sum().item())} "
+                    f"visual_cot={int(colt_visual_cot_rows.sum().item())} "
+                    f"visual_only={int(colt_visual_only_rows.sum().item())} "
+                    f"image_mask_hit={int(image_mask_rows.sum().item())}"
+                )
                 if self.oracle_k_predictor_enabled:
                     global_k_loss, global_k_accuracy, global_k_samples = (
                         metric.detach().float().cpu().item() for metric in global_k_metrics
@@ -3056,12 +3434,64 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     print(f"k_loss_total : {global_k_loss}")
                     print(f"k_accuracy : {global_k_accuracy}")
                     print(f"k_samples_global : {int(global_k_samples)}")
+            grounding_loss_total = k_loss_total.new_zeros(())
+            anchor_loss_total = k_loss_total.new_zeros(())
+            if (
+                self.visual_grounding_enabled
+                and colt_latent_hiddens
+                and self.model._colt_visual_embeds is not None
+                and self.model._colt_image_grid_thw is not None
+            ):
+                if colt_step_bboxes is not None:
+                    z_Hs = torch.cat(colt_latent_hiddens, dim=1)
+                    gqa_idx = [i for i, b in enumerate(colt_step_bboxes) if b]
+                    if gqa_idx:
+                        z_Hs = z_Hs[gqa_idx]
+                        step_bboxes_valid = [colt_step_bboxes[i] for i in gqa_idx]
+                        z_pos, z_neg_same = pool_step_roi_and_nonroi_features(
+                            self.model._colt_visual_embeds,
+                            self.model._colt_image_grid_thw,
+                            step_bboxes_valid,
+                        )
+                        grounding_loss_total = compute_step_contrastive_loss(
+                            z_Hs,
+                            z_pos.detach(),
+                            z_neg_same.detach(),
+                            self.visual_grounding_temperature,
+                        )
+                elif colt_bboxes is not None:
+                    z_H = torch.cat(colt_latent_hiddens, dim=1).mean(dim=1)
+                    z_V_pos, z_V_neg = pool_roi_and_non_roi_features(
+                        self.model._colt_visual_embeds,
+                        self.model._colt_image_grid_thw,
+                        colt_bboxes,
+                    )
+                    grounding_loss_total = compute_grounding_contrastive_loss(
+                        z_H,
+                        z_V_pos.detach(),
+                        z_V_neg.detach(),
+                        self.visual_grounding_temperature,
+                    )
+            if should_log_components and _is_colt_rank_zero():
+                print(f"grounding_loss_total : {grounding_loss_total.detach().float().item()}")
+                print(
+                    "weighted_visual_term : "
+                    f"{(self.visual_grounding_weight * grounding_loss_total).detach().float().item()}"
+                )
+                if self.colt_teacher is not None:
+                    print(f"kl_anchor_loss_total : {anchor_loss_total.detach().float().item()}")
+                    print(
+                        "weighted_kl_anchor : "
+                        f"{(self.kl_anchor_weight * anchor_loss_total).detach().float().item()}"
+                    )
             loss = (
                 ce_loss_total
                 + self.forward_align_weight * forward_loss_total
                 + self.backward_align_weight * backward_loss_total
                 + self.prediction_weight * prediction_loss_total
                 + self.oracle_k_predictor_loss_weight * k_loss_total
+                + self.visual_grounding_weight * grounding_loss_total
+                + self.kl_anchor_weight * anchor_loss_total
             )
 
         elif self.latent_reasoning_mode == False:
@@ -3193,6 +3623,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             batch_size=input_ids.shape[0],
             device=input_ids.device,
             current_attention_mask=response_attention_mask,
+            mask_prompt=getattr(self, "answer_visibility", "full") == "latent_only",
         )
         outputs = self.model(
             inputs_embeds=answer_embeds,
@@ -3226,6 +3657,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         num_hidden_generations: int = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3VLCausalLMOutputWithPast:
+        intervention = os.environ.get("COLT_LATENT_INTERVENTION", "none").strip().lower()
+        if intervention not in ("none", "skip", "zero", "random"):
+            raise ValueError(
+                "COLT_LATENT_INTERVENTION must be one of none|skip|zero|random, "
+                f"got {intervention!r}"
+            )
+        intervention_seed = int(os.environ.get("COLT_LATENT_INTERVENTION_SEED", "1234"))
         if position_ids is not None:
             if position_ids.ndim == 2:
                 max_position_ids = position_ids.max(dim=-1, keepdim=True).values
@@ -3258,16 +3696,38 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             self._pool_question_hidden(hidden_states, attention_mask).unsqueeze(1),
             self.prj,
             self.inference_latent_transition,
-        )
+        ).to(self.lm_head.weight.dtype)
         k_logits = self._predict_oracle_k(hidden_states, attention_mask)
         predicted_k = torch.argmax(k_logits, dim=-1) + 1 if k_logits is not None else None
         inference_plan = self._resolve_oracle_k_inference_plan(
             num_hidden_generations,
             predicted_k=predicted_k,
         )
+        answer_only_latent = getattr(self, "answer_visibility", "full") == "latent_only"
+        if answer_only_latent and intervention in ("skip", "zero", "random"):
+            inference_plan = OracleKInferencePlan(transition_steps=0, conditioning_k=0)
+        elif intervention == "skip":
+            inference_plan = OracleKInferencePlan(transition_steps=0, conditioning_k=0)
+        if intervention != "none":
+            print(
+                f"[latent-intervention] mode={intervention} "
+                f"transition_steps={inference_plan.transition_steps} "
+                f"conditioning_k={inference_plan.conditioning_k} "
+                f"seed={intervention_seed}",
+                flush=True,
+            )
         self.last_oracle_k_prediction = predicted_k.detach().cpu() if predicted_k is not None else None
         self.last_oracle_k_used = inference_plan.transition_steps
         self.last_oracle_k_conditioning = inference_plan.conditioning_k
+        latent_scale = 1.0
+        if intervention in ("zero", "random"):
+            latent_scale = float(latent_embd.detach().float().abs().mean().item()) or 1.0
+        if answer_only_latent and intervention in ("skip", "zero"):
+            latent_embd = torch.zeros_like(latent_embd)
+        elif answer_only_latent and intervention == "random":
+            torch.manual_seed(intervention_seed)
+            latent_embd = torch.randn_like(latent_embd) * latent_scale
+        self._last_latent_hiddens = []
         for i in range(inference_plan.transition_steps):
             past_seen_tokens = past_key_values.get_seq_length()
             step_cache_position = torch.arange(
@@ -3291,6 +3751,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 inference_plan.conditioning_k,
                 conditioning_step,
             )
+            if intervention == "zero":
+                latent_step_input = torch.zeros_like(latent_step_input)
+            elif intervention == "random":
+                torch.manual_seed(intervention_seed + i)
+                latent_step_input = torch.randn_like(latent_step_input) * latent_scale
             step_outputs = self.model(
                 inputs_embeds=latent_step_input,
                 past_key_values=past_key_values,
@@ -3300,12 +3765,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
             past_key_values = step_outputs.past_key_values
+            self._last_latent_hiddens.append(step_outputs[0][:, -1:, :])
             latent_embd = advance_colt_inference_latent(
                 step_outputs[0][:, -1:, :],
                 self.prj,
                 self.alpha,
                 self.inference_latent_transition,
-            )
+            ).to(self.lm_head.weight.dtype)
             outputs = step_outputs
 
         logits = self.lm_head(latent_embd)
@@ -3397,6 +3863,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 current_length=1,
                 batch_size=input_ids.shape[0],
                 device=input_ids.device,
+                mask_prompt=getattr(self, "answer_visibility", "full") == "latent_only",
             )
 
             if next_input_ids is None:

@@ -13,6 +13,7 @@ import torch
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration,
     _extend_colt_cached_attention_mask,
+    _resolve_colt_answer_visibility,
 )
 
 
@@ -169,6 +170,29 @@ class CoLTEasyR1ContractTests(unittest.TestCase):
         )
         expected = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 0]], dtype=torch.long)
         torch.testing.assert_close(actual, expected)
+
+    def test_cached_attention_mask_can_mask_entire_prompt_for_latent_only(self) -> None:
+        prompt_mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.long)
+        actual = _extend_colt_cached_attention_mask(
+            prompt_mask,
+            past_seen_tokens=6,
+            current_length=2,
+            batch_size=1,
+            device=prompt_mask.device,
+            current_attention_mask=torch.tensor([[1, 0]], dtype=torch.long),
+            mask_prompt=True,
+        )
+        expected = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
+        torch.testing.assert_close(actual, expected)
+
+    def test_answer_visibility_resolver_rejects_unknown_modes(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"COLT_ANSWER_VISIBILITY": "latent_only"}):
+            self.assertEqual(_resolve_colt_answer_visibility(), "latent_only")
+        with patch.dict("os.environ", {"COLT_ANSWER_VISIBILITY": "unsupported"}):
+            with self.assertRaises(ValueError):
+                _resolve_colt_answer_visibility()
 
     def test_cached_latent_paths_keep_left_padding_masked(self) -> None:
         model = FakeCoLT()

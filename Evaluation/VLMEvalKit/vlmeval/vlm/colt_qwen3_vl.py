@@ -48,7 +48,22 @@ class Qwen3VLChat(BaseModel):
         self.model_path = model_path
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
-        self.max_new_tokens = max_new_tokens
+        max_new_tokens_override = os.environ.get("COLT_EVAL_MAX_NEW_TOKENS")
+        if max_new_tokens_override is None:
+            self.max_new_tokens = max_new_tokens
+        else:
+            try:
+                self.max_new_tokens = int(max_new_tokens_override)
+            except ValueError as error:
+                raise ValueError(
+                    "COLT_EVAL_MAX_NEW_TOKENS must be a positive integer, got "
+                    f"{max_new_tokens_override!r}."
+                ) from error
+            if self.max_new_tokens <= 0:
+                raise ValueError(
+                    "COLT_EVAL_MAX_NEW_TOKENS must be a positive integer, got "
+                    f"{max_new_tokens_override!r}."
+                )
         self.do_sample = do_sample
         self.temperature = temperature
         self.top_k = top_k

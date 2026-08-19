@@ -107,14 +107,30 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
+        batch_bboxes, batch_bboxlens = [], []
+        batch_step_bboxes, batch_step_bboxlens = [], []
+        batch_visual_only, batch_visual_cot = [], []
+        has_visual_controls = any(
+            "visual_only" in feature or "visual_cot" in feature for feature in features
+        )
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+            bboxes = feature.pop("bboxes", None) or []
+            step_bboxes = feature.pop("step_bboxes", None) or []
+            visual_only = bool(feature.pop("visual_only", False))
+            visual_cot = bool(feature.pop("visual_cot", False))
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
+            batch_bboxes.extend(bboxes)
+            batch_bboxlens.append(len(bboxes))
+            batch_step_bboxes.extend(step_bboxes)
+            batch_step_bboxlens.append(len(step_bboxes))
+            batch_visual_only.append(visual_only)
+            batch_visual_cot.append(visual_cot)
             batch_imglens.append(len(images))
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
@@ -232,6 +248,28 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             mm_inputs["cross_attention_mask"] = F.pad(cross_attention_mask, (0, 0, 0, 0, 0, seq_len - orig_len))
 
         features.update(mm_inputs)
+
+        if batch_bboxlens and any(batch_bboxlens):
+            per_sample_bboxes = []
+            bbox_offset = 0
+            for bbox_len in batch_bboxlens:
+                per_sample_bboxes.append(batch_bboxes[bbox_offset : bbox_offset + bbox_len])
+                bbox_offset += bbox_len
+            features["colt_bboxes"] = per_sample_bboxes
+
+        if batch_step_bboxlens and any(batch_step_bboxlens):
+            per_sample_step_bboxes = []
+            step_offset = 0
+            for step_len in batch_step_bboxlens:
+                per_sample_step_bboxes.append(
+                    batch_step_bboxes[step_offset : step_offset + step_len]
+                )
+                step_offset += step_len
+            features["colt_step_bboxes"] = per_sample_step_bboxes
+
+        if has_visual_controls:
+            features["colt_visual_only"] = torch.tensor(batch_visual_only, dtype=torch.bool)
+            features["colt_visual_cot"] = torch.tensor(batch_visual_cot, dtype=torch.bool)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

@@ -15,11 +15,28 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def resolve_expected_step(state: dict, explicit_step: int | None) -> int:
+    if explicit_step is not None:
+        return explicit_step
+
+    max_steps = state.get("max_steps")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0:
+        raise RuntimeError(
+            "Trained model metadata does not contain a positive max_steps; "
+            "pass --expected-step explicitly."
+        )
+    return max_steps
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate an evaluation model without changing it.")
     parser.add_argument("--mode", choices=("trained", "official", "base"), required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--expected-step", type=int, default=1910)
+    parser.add_argument(
+        "--expected-step",
+        type=int,
+        help="Expected trained global step; defaults to trainer_state.max_steps.",
+    )
     parser.add_argument("--expected-revision")
     args = parser.parse_args()
 
@@ -58,10 +75,11 @@ def main() -> None:
     if args.mode == "trained":
         state = load_json(model_dir / "trainer_state.json")
         actual_step = state.get("global_step")
-        if actual_step != args.expected_step:
+        expected_step = resolve_expected_step(state, args.expected_step)
+        if actual_step != expected_step:
             raise RuntimeError(
                 f"Incomplete or unexpected trained model: global_step={actual_step}, "
-                f"expected={args.expected_step}"
+                f"expected={expected_step}"
             )
         for name in ("train_results.json",):
             if not (model_dir / name).is_file():

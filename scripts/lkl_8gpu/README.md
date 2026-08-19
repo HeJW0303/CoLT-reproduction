@@ -113,8 +113,9 @@ logs/eval/codefaithful/codefaithful_chartqa_greedy_max8192_YYYYMMDD_HHMMSS.log
 
 `--latent-transition official` 保留官方推理行为：循环前与循环内均使用 `prj(H)`。
 `--latent-transition training-consistent` 与既有 checkpoint 的训练递推保持一致：初始问题
-hidden 不投影，每个 latent step 使用 `H + alpha * prj(H)`。默认仍为 `official`，确保旧结果
-可复现；transition 模式会进入日志、结果目录和 fingerprint，禁止复用另一模式的预测。
+hidden 不投影，每个 latent step 使用 `H + alpha * prj(H)`。**默认已改为 `training-consistent`**
+（与本仓库训练递推一致）；需要与官方 CoLT 旧结果对比时显式传 `--latent-transition official`。
+transition 模式会进入日志、结果目录和 fingerprint，禁止复用另一模式的预测。
 
 模型在尚未生成可见文本时可能直接输出 EOS。严格复现默认保留该行为并将空响应计为错误；
 诊断性评测可显式阻止“空文本前的 EOS”，且该设置会进入日志名、结果目录和 fingerprint：

@@ -28,10 +28,10 @@ resolve_eval_model() {
 }
 
 generation_log_label() {
-  local label
+  local label max_new_tokens="${COLT_EVAL_MAX_NEW_TOKENS:-8192}"
   case "$1" in
     official) label="sampling_max256" ;;
-    respect-args) label="greedy_max8192" ;;
+    respect-args) label="greedy_max${max_new_tokens}" ;;
     *) die "Unknown generation mode for log naming: $1" ;;
   esac
   case "${2:-allow}" in
@@ -51,7 +51,9 @@ verify_eval_model() {
   local -a args=(
     --mode "$mode"
     --model-dir "$EVAL_MODEL_PATH"
-    --expected-step "${COLT_EXPECTED_GLOBAL_STEP:-1910}"
+  )
+  [[ -z "${COLT_EXPECTED_GLOBAL_STEP:-}" ]] || args+=(
+    --expected-step "$COLT_EXPECTED_GLOBAL_STEP"
   )
   if [[ "$mode" == base ]]; then
     args+=(--expected-revision "$BASE_MODEL_REVISION")

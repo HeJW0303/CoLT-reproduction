@@ -264,6 +264,16 @@ def _get_preprocessed_dataset(
         "videos": Sequence(Value("string")),
         "audios": Sequence(Value("string")),
     })
+    if "bboxes" in column_names or "_bboxes" in column_names:
+        features["bboxes"] = Sequence(Sequence(Value("float32")))
+    if "step_bboxes" in column_names or "_step_bboxes" in column_names:
+        features["step_bboxes"] = Sequence(
+            Sequence(Sequence(Value("float32")))
+        )
+    if "visual_only" in column_names or "_visual_only" in column_names:
+        features["visual_only"] = Value("bool")
+    if "visual_cot" in column_names or "_visual_cot" in column_names:
+        features["visual_cot"] = Value("bool")
 
     # Replace here (keep at the same position)
     log_path = os.environ.get("BAD_SAMPLES_LOG", "bad_samples.txt")

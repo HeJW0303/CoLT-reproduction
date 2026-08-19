@@ -105,12 +105,25 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 videos=examples["_videos"][i] or [],
                 audios=examples["_audios"][i] or [],
             )
+            visual_only = bool(examples.get("_visual_only", [False] * len(examples["_prompt"]))[i])
+            if visual_only:
+                # Visual-only rows (e.g. external GQA grounding) must not teach
+                # answer generation or CoT decoding; keep only the grounding loss.
+                labels = [IGNORE_INDEX] * len(labels)
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
             model_inputs["images"].append(examples["_images"][i])
             model_inputs["videos"].append(examples["_videos"][i])
             model_inputs["audios"].append(examples["_audios"][i])
+            if "_bboxes" in examples:
+                model_inputs["bboxes"].append(examples["_bboxes"][i])
+            if "_step_bboxes" in examples:
+                model_inputs["step_bboxes"].append(examples["_step_bboxes"][i])
+            if "_visual_only" in examples:
+                model_inputs["visual_only"].append(visual_only)
+            if "_visual_cot" in examples:
+                model_inputs["visual_cot"].append(bool(examples["_visual_cot"][i]))
 
         return model_inputs
 

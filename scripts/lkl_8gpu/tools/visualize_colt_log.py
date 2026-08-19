@@ -29,8 +29,13 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LOG = ROOT / "logs" / "colt_train_20260713_130119.log"
-DEFAULT_OUTPUT = ROOT / "Vis"
+DEFAULT_LOG = (
+    ROOT
+    / "logs"
+    / "background"
+    / "visual_cot_v2_base_all_gqa_full_then_all8_20260817_022125.log"
+)
+DEFAULT_OUTPUT = ROOT / "vis"
 
 NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 TRAINER_RE = re.compile(
@@ -42,18 +47,16 @@ COMPONENTS = (
     "forward_loss_total",
     "backward_loss_total",
     "prediction_loss_total",
+    "grounding_loss_total",
+    "weighted_visual_term",
 )
 COMPONENT_LABELS = {
     "ce_loss_total": "Answer CE",
     "forward_loss_total": "Forward alignment",
     "backward_loss_total": "Backward alignment",
     "prediction_loss_total": "Latent prediction",
-}
-COMPONENT_WEIGHTS = {
-    "ce_loss_total": 1.0,
-    "forward_loss_total": 0.2,
-    "backward_loss_total": 0.2,
-    "prediction_loss_total": 0.2,
+    "grounding_loss_total": "Grounding loss",
+    "weighted_visual_term": "Weighted visual term",
 }
 COLORS = {
     "loss": "#0072B2",
@@ -61,10 +64,32 @@ COLORS = {
     "forward_loss_total": "#009E73",
     "backward_loss_total": "#CC79A7",
     "prediction_loss_total": "#E69F00",
+    "grounding_loss_total": "#7B2CBF",
+    "weighted_visual_term": "#F77F00",
     "grad": "#8B1A1A",
     "lr": "#56B4E9",
     "speed": "#6A3D9A",
 }
+CONTROL_FIELDS = ("active", "visual_cot", "visual_only", "image_mask_hit")
+CONTROL_LABELS = {
+    "active": "Active rows",
+    "visual_cot": "Visual-CoT rows",
+    "visual_only": "Visual-only rows",
+    "image_mask_hit": "Image-mask hits",
+}
+CONTROL_COLORS = {
+    "active": "#264653",
+    "visual_cot": "#2A9D8F",
+    "visual_only": "#E9C46A",
+    "image_mask_hit": "#E76F51",
+}
+CONTROL_RE = re.compile(
+    rf"colt_control_rows\s*:\s*"
+    rf"active\s*=\s*(?P<active>{NUMBER})\s+"
+    rf"visual_cot\s*=\s*(?P<visual_cot>{NUMBER})\s+"
+    rf"visual_only\s*=\s*(?P<visual_only>{NUMBER})\s+"
+    rf"image_mask_hit\s*=\s*(?P<image_mask_hit>{NUMBER})"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,12 +202,28 @@ def parse_trainer_and_components(
     for local_step, match in enumerate(matches, start=1):
         step = step_offset + local_step
         segment = text[segment_start : match.start()]
-        row: dict[str, float | int | bool] = {"step": step, "complete_step": True}
+        row: dict[str, float | int | bool] = {"step": step}
+        component_counts: list[int] = []
         for name in COMPONENTS:
             values = component_values(segment, name)
             raw_parts[name].append(values)
             row.update(summarize_values(values, name))
-        row["micro_records"] = min(int(row[f"{name}_count"]) for name in COMPONENTS)
+            component_counts.append(len(values))
+        row["component_record_count"] = min(component_counts, default=0)
+        row["component_metrics_complete"] = all(count > 0 for count in component_counts)
+
+        control_matches = list(CONTROL_RE.finditer(segment))
+        for field in CONTROL_FIELDS:
+            values = np.asarray(
+                [float(match.group(field)) for match in control_matches], dtype=float
+            )
+            row.update(summarize_values(values, f"control_{field}"))
+        row["control_record_count"] = len(control_matches)
+        row["control_metrics_complete"] = bool(control_matches)
+        # Keep the historical column name as a compatibility alias. It now means
+        # that all required component scalars for this optimizer step were seen;
+        # it never meant "64 micro-batches".
+        row["complete_step"] = bool(row["component_metrics_complete"])
         component_rows.append(row)
 
         loss, grad_norm, learning_rate, epoch = map(float, match.groups())
@@ -200,11 +241,23 @@ def parse_trainer_and_components(
     trailing = text[segment_start:]
     trailing_arrays = {name: component_values(trailing, name) for name in COMPONENTS}
     if any(values.size for values in trailing_arrays.values()):
-        row = {"step": step_offset + len(matches) + 1, "complete_step": False}
+        row = {"step": step_offset + len(matches) + 1}
+        component_counts = []
         for name, values in trailing_arrays.items():
             raw_parts[name].append(values)
             row.update(summarize_values(values, name))
-        row["micro_records"] = min(int(row[f"{name}_count"]) for name in COMPONENTS)
+            component_counts.append(len(values))
+        row["component_record_count"] = min(component_counts, default=0)
+        row["component_metrics_complete"] = False
+        control_matches = list(CONTROL_RE.finditer(trailing))
+        for field in CONTROL_FIELDS:
+            values = np.asarray(
+                [float(match.group(field)) for match in control_matches], dtype=float
+            )
+            row.update(summarize_values(values, f"control_{field}"))
+        row["control_record_count"] = len(control_matches)
+        row["control_metrics_complete"] = False
+        row["complete_step"] = False
         component_rows.append(row)
 
     raw = {
@@ -284,6 +337,9 @@ def parse_metadata(
     warning_counts["trust_remote_code"] = text.count("`trust_remote_code` is not supported anymore")
     warning_counts["Traceback blocks"] = text.count("Traceback (most recent call last):")
     warning_counts["NFS cleanup error"] = text.count("Device or resource busy")
+    warning_counts["Post-training verifier mismatch"] = len(
+        re.findall(r"Incomplete or unexpected trained model: global_step=", text)
+    )
 
     return {
         "log_files": [str(path.resolve()) for path in log_paths],
@@ -301,6 +357,9 @@ def parse_metadata(
         "trainable_parameters": trainable,
         "checkpoint_steps": checkpoint_steps,
         "training_completed": "Training completed" in text or "train_runtime" in text,
+        "post_training_verification_failure": bool(
+            re.search(r"Incomplete or unexpected trained model: global_step=", text)
+        ),
         "warning_counts": dict(warning_counts),
     }
 
@@ -397,7 +456,7 @@ def plot_overview(
         ax.plot(components.step, rolling(values, window), lw=1.8, color=COLORS[name], label=COMPONENT_LABELS[name])
     ax.set_yscale("log")
     ax.set(title="CoLT component losses (step mean)", xlabel="Optimizer step", ylabel="Loss (log scale)")
-    ax.legend(frameon=False, ncol=2, fontsize=8)
+    ax.legend(frameon=False, ncol=3, fontsize=8)
     add_checkpoint_lines(ax, checkpoint_steps)
 
     ax = axes[1, 0]
@@ -454,7 +513,7 @@ def plot_overview(
 
 
 def plot_component_details(components: pd.DataFrame, output: Path, window: int, dpi: int) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=True)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
     fig.suptitle("CoLT Component Loss Details", fontsize=18)
     for ax, name in zip(axes.flat, COMPONENTS):
         step = components.step
@@ -477,8 +536,102 @@ def plot_component_details(components: pd.DataFrame, output: Path, window: int, 
     save_figure(fig, output / "02_component_loss_details.png", dpi)
 
 
+def plot_control_metrics(
+    components: pd.DataFrame, output: Path, window: int, dpi: int
+) -> None:
+    """Plot the row-level controls and visual supervision signals.
+
+    These values are emitted once per optimizer step by the current trainer
+    callback.  They are deliberately plotted separately from the loss panel:
+    a count such as ``visual_cot=1`` is a control signal, not a loss value.
+    """
+    control_columns = [
+        f"control_{field}_mean"
+        for field in CONTROL_FIELDS
+        if f"control_{field}_mean" in components
+    ]
+    if not control_columns:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=True)
+    fig.suptitle("CoLT Visual Controls and Grounding Signals", fontsize=18)
+
+    ax = axes[0, 0]
+    for field in CONTROL_FIELDS:
+        column = f"control_{field}_mean"
+        if column not in components:
+            continue
+        ax.plot(
+            components.step,
+            rolling(components[column], window),
+            lw=1.8,
+            color=CONTROL_COLORS[field],
+            label=CONTROL_LABELS[field],
+        )
+    ax.set(title="Control-row counts", xlabel="Optimizer step", ylabel="Rows")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[0, 1]
+    active = components.get("control_active_mean", pd.Series(index=components.index, dtype=float))
+    for field in ("visual_cot", "visual_only", "image_mask_hit"):
+        column = f"control_{field}_mean"
+        if column not in components:
+            continue
+        denominator = active.replace(0, np.nan)
+        rate = 100.0 * components[column] / denominator
+        ax.plot(
+            components.step,
+            rolling(rate, window),
+            lw=1.8,
+            color=CONTROL_COLORS[field],
+            label=f"{CONTROL_LABELS[field]} / active",
+        )
+    ax.set(title="Control rates among active rows", xlabel="Optimizer step", ylabel="Percent")
+    ax.set_ylim(bottom=0)
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1, 0]
+    for name in ("grounding_loss_total", "weighted_visual_term"):
+        column = f"{name}_mean"
+        if column not in components:
+            continue
+        ax.plot(
+            components.step,
+            rolling(components[column].clip(lower=1e-8), window),
+            lw=1.8,
+            color=COLORS[name],
+            label=COMPONENT_LABELS[name],
+        )
+    ax.set_yscale("log")
+    ax.set(title="Visual supervision losses", xlabel="Optimizer step", ylabel="Loss (log scale)")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1, 1]
+    if "control_record_count" in components:
+        ax.plot(
+            components.step,
+            components.control_record_count,
+            color=COLORS["speed"],
+            lw=1.4,
+            label="control records / step",
+        )
+    if "component_record_count" in components:
+        ax.plot(
+            components.step,
+            components.component_record_count,
+            color=COLORS["loss"],
+            lw=1.4,
+            label="component records / step",
+        )
+    ax.set(title="Metric coverage diagnostics", xlabel="Optimizer step", ylabel="Records")
+    ax.legend(frameon=False, fontsize=8)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    save_figure(fig, output / "07_visual_controls_and_grounding.png", dpi)
+
+
 def plot_distributions(raw: dict[str, np.ndarray], output: Path, dpi: int) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle("Raw CoLT Loss Distributions", fontsize=18)
     for ax, name in zip(axes.flat, COMPONENTS):
         values = raw[name]
@@ -546,6 +699,8 @@ def plot_correlations(
         "forward_loss_total_mean": "Forward align",
         "backward_loss_total_mean": "Backward align",
         "prediction_loss_total_mean": "Prediction",
+        "grounding_loss_total_mean": "Grounding",
+        "weighted_visual_term_mean": "Weighted visual",
         "seconds_per_step": "Sec / step",
     }
     metric_columns = [column for column in labels if column in merged]
@@ -599,6 +754,21 @@ def export_raw_components(raw: dict[str, np.ndarray], output: Path) -> None:
             )
 
 
+def build_training_metrics(
+    trainer: pd.DataFrame, components: pd.DataFrame, progress: pd.DataFrame
+) -> pd.DataFrame:
+    """Return one optimizer-step-aligned table for downstream analysis."""
+    frame = trainer.merge(components, on="step", how="left", validate="one_to_one")
+    if not progress.empty:
+        progress_columns = [
+            column for column in progress.columns if column == "step" or column not in frame.columns
+        ]
+        frame = frame.merge(
+            progress[progress_columns], on="step", how="left", validate="one_to_one"
+        )
+    return frame
+
+
 def finite_number(value: object) -> float | None:
     try:
         result = float(value)
@@ -616,8 +786,17 @@ def build_summary(
 ) -> dict[str, object]:
     total_steps = int(metadata.get("total_steps") or len(trainer))
     last_step = int(trainer.step.max())
-    complete_components = components[components.complete_step.astype(bool)]
+    complete_components = components[components.complete_step.fillna(False).astype(bool)]
+    missing_component_rows = components[~components.complete_step.fillna(False).astype(bool)]
+    ambiguous_component_rows = components[
+        components.component_record_count.fillna(0).astype(int).gt(1)
+    ]
+    control_rows = components[
+        components.control_metrics_complete.fillna(False).astype(bool)
+    ]
     last_window = min(100, len(trainer))
+    component_record_counts = components.component_record_count.dropna().astype(int)
+    control_record_counts = components.control_record_count.dropna().astype(int)
     summary: dict[str, object] = {
         **metadata,
         "recorded_optimizer_steps": last_step,
@@ -625,17 +804,34 @@ def build_summary(
         "remaining_optimizer_steps": max(0, total_steps - last_step),
         "trainer_records": len(trainer),
         "component_complete_steps": len(complete_components),
-        "component_partial_step": bool((~components.complete_step.astype(bool)).any()),
-        "partial_step_micro_records": int(components.loc[~components.complete_step.astype(bool), "micro_records"].max())
-        if (~components.complete_step.astype(bool)).any()
+        "component_partial_step": bool(len(missing_component_rows)),
+        "component_missing_steps": [int(step) for step in missing_component_rows.step],
+        "component_ambiguous_steps": [int(step) for step in ambiguous_component_rows.step],
+        "component_record_count_min": int(component_record_counts.min())
+        if len(component_record_counts)
+        else 0,
+        "component_record_count_max": int(component_record_counts.max())
+        if len(component_record_counts)
+        else 0,
+        "control_complete_steps": len(control_rows),
+        "control_missing_steps": [
+            int(step)
+            for step in components.loc[
+                ~components.control_metrics_complete.fillna(False), "step"
+            ]
+        ],
+        "control_record_count_min": int(control_record_counts.min())
+        if len(control_record_counts)
+        else 0,
+        "control_record_count_max": int(control_record_counts.max())
+        if len(control_record_counts)
         else 0,
         "nonstandard_component_record_steps": [
             {
                 "step": int(row.step),
-                "micro_records": int(row.micro_records),
+                "component_record_count": int(row.component_record_count),
             }
-            for row in complete_components.itertuples()
-            if int(row.micro_records) != int(metadata.get("total_batch_size") or row.micro_records)
+            for row in ambiguous_component_rows.itertuples()
         ],
         "latest_trainer_metrics": {
             key: finite_number(trainer.iloc[-1][key])
@@ -670,6 +866,21 @@ def build_summary(
             for name, values in raw.items()
             if len(values)
         },
+        "control_row_statistics": {
+            field: {
+                "mean": finite_number(control_rows[f"control_{field}_mean"].mean())
+                if len(control_rows)
+                else None,
+                "sum": finite_number(control_rows[f"control_{field}_mean"].sum())
+                if len(control_rows)
+                else None,
+                "max": finite_number(control_rows[f"control_{field}_mean"].max())
+                if len(control_rows)
+                else None,
+            }
+            for field in CONTROL_FIELDS
+            if f"control_{field}_mean" in control_rows
+        },
     }
     if not progress.empty:
         stable = progress[progress.step >= 10]
@@ -694,6 +905,8 @@ def write_report(summary: dict[str, object], output: Path) -> None:
     runtime = summary.get("runtime", {})
     warnings = summary["warning_counts"]
     state = "已完成" if summary["training_completed"] else "日志快照未训练完成"
+    if summary.get("post_training_verification_failure"):
+        state += "；训练后模型校验曾失败"
     lines = [
         "# CoLT 训练日志可视化摘要",
         "",
@@ -709,6 +922,8 @@ def write_report(summary: dict[str, object], output: Path) -> None:
         f"(step {summary['gradient_norm_peak']['step']})",
         f"- 学习率峰值：{summary['learning_rate_peak']['value']:.6g} "
         f"(step {summary['learning_rate_peak']['step']})",
+        f"- CoLT 组件指标覆盖：{summary['component_complete_steps']} / {summary['trainer_records']} 个 optimizer step；"
+        f"控制行覆盖：{summary['control_complete_steps']} / {summary['trainer_records']}",
     ]
     if runtime:
         lines.extend(
@@ -718,49 +933,63 @@ def write_report(summary: dict[str, object], output: Path) -> None:
             ]
         )
     if summary["component_partial_step"]:
+        missing_steps = summary["component_missing_steps"]
+        shown_steps = ", ".join(map(str, missing_steps[:12]))
+        suffix = "..." if len(missing_steps) > 12 else ""
         lines.append(
-            f"- 尾部存在未完成的 step {summary['recorded_optimizer_steps'] + 1}："
-            f"已写入 {summary['partial_step_micro_records']} / {summary['total_batch_size']} 条细粒度记录。"
+            f"- 缺少完整 CoLT 组件指标的 step：{shown_steps}{suffix}；"
+            "这些 step 保留在 step-level CSV 中，缺失字段为 NaN，不会被伪造填补。"
         )
     short_steps = summary["nonstandard_component_record_steps"]
     if short_steps:
         details = "，".join(
-            f"step {item['step']} 有 {item['micro_records']} 条" for item in short_steps
+            f"step {item['step']} 有 {item['component_record_count']} 条"
+            for item in short_steps[:12]
         )
         lines.append(
-            f"- 完整但不足 64 条的尾 batch：{details}。这是数据集末尾的正常短 batch，不是日志缺失。"
+            f"- 组件标量记录数异常（>1）：{details}。同一 step 的多个值仅做 step-level 汇总。"
         )
     lines.extend(
         [
             "",
-            "## CoLT 四项损失（最近 100 个完整 step 的 step-mean 中位数）",
+            "## CoLT 六项损失（最近 100 个完整组件 step 的 step-mean 中位数）",
             "",
             f"- 最终答案 CE：{medians['ce_loss_total']:.6g}",
             f"- 前向对齐损失：{medians['forward_loss_total']:.6g}",
             f"- 反向对齐损失：{medians['backward_loss_total']:.6g}",
             f"- latent prediction 损失：{medians['prediction_loss_total']:.6g}",
+            f"- grounding 损失：{medians['grounding_loss_total']:.6g}",
+            f"- 加权视觉项：{medians['weighted_visual_term']:.6g}",
+            "",
+            "## 解析说明",
+            "",
+            "日志由 8 个分布式进程并发写入，细粒度 CoLT 字段可能粘连在同一物理行。脚本以每条 Trainer 指标"
+            "作为一个 optimizer step 的边界，并将该边界之前出现的同名标量聚合到对应 step。当前训练器每个"
+            "step 通常只输出一组已经聚合的 CoLT 标量；global batch size=64 不等于日志中的 64 条组件记录。",
+            "",
+            "`training_metrics.csv` 是按 optimizer step 对齐的主表；`component_step_metrics.csv` 保留组件的"
+            "count/mean/median/p10/p90/min/max；`raw_component_metrics.csv` 只按日志出现顺序导出原始标量，"
+            "由于 stdout 并发交错，不应把不同列的同一行解释为同一个样本。缺失组件记录保留为 NaN。",
+            "",
+            "训练是否完成以 `training_completed`、最终 Trainer step 和 train_runtime 为准。若日志在训练完成后"
+            "还有模型验证失败，报告会单独标注为 post-training verifier 事件，不把它误判为训练过程失败。",
             "",
             "## 日志事件计数",
             "",
         ]
     )
     lines.extend(f"- {name}: {count}" for name, count in warnings.items())
-    lines.extend(
-        [
-            "",
-            "## 解析说明",
-            "",
-            "日志由 8 个分布式进程并发写入，四项 CoLT 损失经常粘连在同一物理行。脚本采用全文正则解析，"
-            "并以每条 Trainer 指标作为一个优化 step 的结束边界。常规完整优化 step 含 64 条细粒度记录"
-            "（8 卡 × 8 次梯度累积），数据集尾部允许出现短 batch。`raw_component_metrics.csv` 的各列分别保持日志"
-            "出现顺序，但由于 stdout 并发"
-            "交错，同一行的四个值不能严格解释为同一个样本的配对记录；step 级统计不受这一点影响。",
-            "",
-            "训练初期数据转换阶段出现的 `SystemExit: 0` 后仍成功完成 122,179 条数据转换并进入训练，因此不能"
-            "把该 traceback 单独解读为训练失败。是否完整结束以 `training_completed` 和最终 step 为准。",
-            "",
-        ]
-    )
+    control_stats = summary.get("control_row_statistics", {})
+    if control_stats:
+        lines.extend(["", "## 控制行统计（完整控制 step）", ""])
+        for field in CONTROL_FIELDS:
+            stats = control_stats.get(field)
+            if stats and stats.get("mean") is not None:
+                lines.append(
+                    f"- {CONTROL_LABELS[field]}：mean={stats['mean']:.6g}，"
+                    f"sum={stats['sum']:.6g}，max={stats['max']:.6g}"
+                )
+    lines.append("")
     (output / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -791,6 +1020,9 @@ def main() -> None:
     trainer.to_csv(args.output_dir / "trainer_metrics.csv", index=False)
     components.to_csv(args.output_dir / "component_step_metrics.csv", index=False)
     progress.to_csv(args.output_dir / "progress_metrics.csv", index=False)
+    build_training_metrics(trainer, components, progress).to_csv(
+        args.output_dir / "training_metrics.csv", index=False
+    )
     export_raw_components(raw, args.output_dir)
 
     summary = build_summary(trainer, components, progress, raw, metadata)
@@ -802,6 +1034,7 @@ def main() -> None:
     set_plot_style()
     plot_overview(trainer, components, progress, metadata, args.output_dir, args.rolling_window, args.dpi)
     plot_component_details(components, args.output_dir, args.rolling_window, args.dpi)
+    plot_control_metrics(components, args.output_dir, args.rolling_window, args.dpi)
     plot_distributions(raw, args.output_dir, args.dpi)
     plot_performance(progress, metadata, args.output_dir, args.rolling_window, args.dpi)
     plot_correlations(trainer, components, progress, args.output_dir, args.dpi)
