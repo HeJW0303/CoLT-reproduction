@@ -51,6 +51,7 @@ logger = logging.get_logger(__name__)
 FILES_TO_COPY_ON_TRAIN_BEGIN = [
     "LLaMA-Factory/examples/train_full/colt_qwen3_sft.yaml",
     "transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py",
+    "transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_colt_latent_heads.py",
     "LLaMA-Factory/local_scripts/run_colt.sh",
 ]
 

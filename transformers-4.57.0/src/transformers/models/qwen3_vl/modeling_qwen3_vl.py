@@ -65,7 +65,12 @@ from .modeling_colt_grounding import (
     pool_roi_and_non_roi_features,
     pool_step_roi_and_nonroi_features,
 )
-from .modeling_colt_latent_heads import LatentStochasticHead, LowRankExplorationHead
+from .modeling_colt_latent_heads import (
+    LaReLatentRefocusingExtractor,
+    LatentStochasticHead,
+    LowRankExplorationHead,
+    pack_visual_tokens_by_sample,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.cuda.amp import autocast
 
@@ -899,6 +904,17 @@ class Qwen3VLPreTrainedModel(PreTrainedModel):
         "attentions": Qwen3VLTextAttention,
     }
 
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, LaReLatentRefocusingExtractor):
+            initializer_range = float(
+                getattr(self.config.get_text_config(), "initializer_range", 0.02)
+            )
+            # Module.apply initializes children before their parent.  Resetting
+            # here therefore survives both ordinary post_init and HF's
+            # missing-key initialization under ZeRO-3.
+            module.reset_safe_output(initializer_range)
+
 
 class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     config: Qwen3VLVisionConfig
@@ -1264,7 +1280,14 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
-        self._colt_cache_visual_features = os.environ.get("COLT_VISUAL_GROUNDING", "0") == "1"
+        self._colt_cache_visual_features = (
+            os.environ.get("COLT_VISUAL_GROUNDING", "0") == "1"
+            or os.environ.get("COLT_LARE_REFOCUS", "0") == "1"
+            or (
+                "COLT_LARE_REFOCUS" not in os.environ
+                and bool(getattr(config, "colt_lare_refocus", False))
+            )
+        )
         self._colt_visual_embeds = None
         self._colt_image_grid_thw = None
 
@@ -2182,6 +2205,23 @@ COLT_ANSWER_VISIBILITIES = {"full", "latent_only"}
 def _resolve_colt_answer_visibility(environ: Optional[Mapping[str, str]] = None) -> str:
     environ = os.environ if environ is None else environ
     visibility = environ.get("COLT_ANSWER_VISIBILITY", "full").strip().lower()
+def _resolve_colt_lare_bool(config, env_name: str, config_name: str, default: bool) -> bool:
+    raw_value = os.environ.get(env_name)
+    if raw_value is None:
+        return bool(getattr(config, config_name, default))
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{env_name} must be a boolean flag, got {raw_value!r}")
+
+
+def _resolve_colt_lare_value(config, env_name: str, config_name: str, default, cast):
+    raw_value = os.environ.get(env_name)
+    return cast(getattr(config, config_name, default) if raw_value is None else raw_value)
+
+
     if visibility not in COLT_ANSWER_VISIBILITIES:
         choices = ", ".join(sorted(COLT_ANSWER_VISIBILITIES))
         raise ValueError(f"COLT_ANSWER_VISIBILITY must be one of {choices}, got {visibility!r}")
@@ -2339,6 +2379,88 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             os.environ.get("COLT_GROUNDING_TEMPERATURE", "0.07")
         )
         global _COLT_TEACHER_LOADING
+        self.lare_refocus_enabled = _resolve_colt_lare_bool(
+            config, "COLT_LARE_REFOCUS", "colt_lare_refocus", False
+        )
+        self.lare_extractor_dim = _resolve_colt_lare_value(
+            config, "COLT_LARE_DIM", "colt_lare_dim", 1536, int
+        )
+        self.lare_layers = _resolve_colt_lare_value(
+            config, "COLT_LARE_LAYERS", "colt_lare_layers", 2, int
+        )
+        self.lare_heads = _resolve_colt_lare_value(
+            config, "COLT_LARE_HEADS", "colt_lare_heads", 12, int
+        )
+        self.lare_queries = _resolve_colt_lare_value(
+            config, "COLT_LARE_QUERIES", "colt_lare_queries", 4, int
+        )
+        self.lare_max_steps = _resolve_colt_lare_value(
+            config, "COLT_LARE_MAX_STEPS", "colt_lare_max_steps", 16, int
+        )
+        self.lare_dropout = _resolve_colt_lare_value(
+            config, "COLT_LARE_DROPOUT", "colt_lare_dropout", 0.0, float
+        )
+        self.lare_visual_dropout = _resolve_colt_lare_value(
+            config, "COLT_LARE_VISUAL_DROPOUT", "colt_lare_visual_dropout", 0.1, float
+        )
+        self.lare_attention_topk = _resolve_colt_lare_value(
+            config, "COLT_LARE_ATTN_TOPK", "colt_lare_attention_topk", 0, int
+        )
+        self.lare_gate_bias = _resolve_colt_lare_value(
+            config, "COLT_LARE_GATE_BIAS", "colt_lare_gate_bias", -2.0, float
+        )
+        self.lare_reconstruction_weight = _resolve_colt_lare_value(
+            config, "COLT_LARE_RECON_WEIGHT", "colt_lare_reconstruction_weight", 0.05, float
+        )
+        self.lare_reconstruction_steps = _resolve_colt_lare_value(
+            config, "COLT_LARE_RECON_STEPS", "colt_lare_reconstruction_steps", 1000, int
+        )
+        self.lare_detach_visual = _resolve_colt_lare_bool(
+            config, "COLT_LARE_DETACH_VISUAL", "colt_lare_detach_visual", True
+        )
+        self.lare_record_attention = _resolve_colt_lare_bool(
+            config, "COLT_LARE_RECORD_ATTENTION", "colt_lare_record_attention", False
+        )
+        if self.lare_reconstruction_weight < 0:
+            raise ValueError(
+                "COLT_LARE_RECON_WEIGHT must be non-negative, "
+                f"got {self.lare_reconstruction_weight!r}"
+            )
+        self.lare_refocusing_extractor = (
+            LaReLatentRefocusingExtractor(
+                model_hidden_size=config.text_config.hidden_size,
+                extractor_hidden_size=self.lare_extractor_dim,
+                num_layers=self.lare_layers,
+                num_heads=self.lare_heads,
+                num_queries=self.lare_queries,
+                max_steps=self.lare_max_steps,
+                dropout=self.lare_dropout,
+                visual_dropout=self.lare_visual_dropout,
+                attention_topk=self.lare_attention_topk,
+                gate_bias=self.lare_gate_bias,
+                reconstruction_steps=self.lare_reconstruction_steps,
+            )
+            if self.lare_refocus_enabled
+            else None
+        )
+        self._last_lare_attention_maps = []
+        if self.lare_refocus_enabled:
+            # Persist architecture settings with the checkpoint.  Explicit env
+            # values still take precedence, including COLT_LARE_REFOCUS=0.
+            config.colt_lare_refocus = True
+            config.colt_lare_dim = self.lare_extractor_dim
+            config.colt_lare_layers = self.lare_layers
+            config.colt_lare_heads = self.lare_heads
+            config.colt_lare_queries = self.lare_queries
+            config.colt_lare_max_steps = self.lare_max_steps
+            config.colt_lare_dropout = self.lare_dropout
+            config.colt_lare_visual_dropout = self.lare_visual_dropout
+            config.colt_lare_attention_topk = self.lare_attention_topk
+            config.colt_lare_gate_bias = self.lare_gate_bias
+            config.colt_lare_reconstruction_weight = self.lare_reconstruction_weight
+            config.colt_lare_reconstruction_steps = self.lare_reconstruction_steps
+            config.colt_lare_detach_visual = self.lare_detach_visual
+            config.colt_lare_record_attention = self.lare_record_attention
         self.kl_anchor_enabled = os.environ.get("COLT_KL_ANCHOR", "0") == "1"
         self.kl_anchor_weight = float(os.environ.get("COLT_KL_ANCHOR_WEIGHT", "0.1"))
         self.colt_teacher = None
@@ -2395,6 +2517,19 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
     def _load_from_state_dict(
         self,
+        if self.lare_refocusing_extractor is not None:
+            initializer_range = float(getattr(config.text_config, "initializer_range", 0.02))
+            self.lare_refocusing_extractor.reset_safe_output(initializer_range)
+            if _is_colt_rank_zero():
+                print(
+                    "[colt-lare] enabled "
+                    f"dim={self.lare_extractor_dim} layers={self.lare_layers} "
+                    f"heads={self.lare_heads} queries={self.lare_queries} "
+                    f"visual_dropout={self.lare_visual_dropout} "
+                    f"topk={self.lare_attention_topk} "
+                    f"recon_weight={self.lare_reconstruction_weight}",
+                    flush=True,
+                )
         state_dict,
         prefix,
         local_metadata,
@@ -2454,6 +2589,54 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if (
             self.training
             and self._oracle_k_flag("COLT_ORACLE_K_REQUIRE_PREOPTIMIZER_INIT")
+    def _prepare_lare_visual_inputs(self, prompt_input_ids, reference_hidden):
+        """Return padded native image features for every prompt row.
+
+        Placeholder counts, rather than ``image_grid_thw`` row counts, define
+        sample ownership.  This supports variable resolution and multiple
+        images in one sample and fails loudly if the cached features are stale.
+        """
+        if not self.lare_refocus_enabled or self.lare_refocusing_extractor is None:
+            return None, None
+        sample_token_counts = (prompt_input_ids == self.config.image_token_id).sum(dim=-1)
+        cached_visual = self.model._colt_visual_embeds
+        if cached_visual is not None and self.lare_detach_visual:
+            cached_visual = cached_visual.detach()
+        return pack_visual_tokens_by_sample(
+            cached_visual,
+            sample_token_counts,
+            hidden_size=self.config.text_config.hidden_size,
+            dtype=reference_hidden.dtype,
+            device=reference_hidden.device,
+        )
+
+    def _apply_lare_refocusing(
+        self,
+        latent_hidden,
+        base_next_latent,
+        visual_tokens,
+        visual_mask,
+        *,
+        step_index,
+        compute_reconstruction,
+    ):
+        if not self.lare_refocus_enabled or self.lare_refocusing_extractor is None:
+            zero = base_next_latent.float().sum() * 0.0
+            return base_next_latent, None, None, zero
+        if visual_tokens is None or visual_mask is None:
+            raise RuntimeError("LaRe refocusing is enabled but visual inputs were not prepared")
+        delta, attention, gate, reconstruction_loss = self.lare_refocusing_extractor(
+            latent_hidden,
+            visual_tokens,
+            visual_mask,
+            step_index=step_index,
+            compute_reconstruction=compute_reconstruction,
+        )
+        if self.lare_record_attention:
+            self._last_lare_attention_maps.append(attention.detach())
+        next_latent = base_next_latent + delta.to(base_next_latent.dtype)
+        return next_latent, attention, gate, reconstruction_loss
+
             and not self._oracle_k_predictor_preflight_done
         ):
             raise RuntimeError(
@@ -2932,6 +3115,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 predicted_k = torch.argmax(k_logits.detach(), dim=-1) + 1
                 k_targets = torch.full(
                     (hidden_states.shape[0],),
+            lare_visual_tokens, lare_visual_mask = self._prepare_lare_visual_inputs(
+                question_ids, hidden_states
+            )
+            self._last_lare_attention_maps = []
                     oracle_k - 1,
                     dtype=torch.long,
                     device=k_logits.device,
@@ -2970,9 +3157,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             batch_size = hidden_states.shape[0]
             batched_forward_records = []
             batched_backward_records = []
+            lare_reconstruction_loss_total = hidden_states.new_zeros((), dtype=torch.float32)
             colt_latent_hiddens = []
             image_mask_rows = torch.zeros_like(colt_loss_row_mask)
 
+            lare_reconstruction_steps = 0
+            lare_attention_entropies = []
+            lare_gate_means = []
             synchronized_latent_steps = (
                 _synchronize_colt_oracle_k(training_latent_steps, input_ids.device)
                 if self.oracle_k_enabled
@@ -3065,6 +3256,32 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                         next_latent_embd.detach(),
                         reduction="none",
                     ).mean(dim=tuple(range(1, pred_next_latent.ndim)))
+                    next_latent_embd, lare_attention, lare_gate, lare_reconstruction_loss = (
+                        self._apply_lare_refocusing(
+                            latent_hidden,
+                            next_latent_embd,
+                            lare_visual_tokens,
+                            lare_visual_mask,
+                            step_index=i,
+                            compute_reconstruction=(
+                                self.training and self.lare_reconstruction_weight > 0.0
+                            ),
+                        )
+                    )
+                    if self.lare_refocus_enabled and lare_attention is not None:
+                        if active_step:
+                            lare_reconstruction_loss_total = (
+                                lare_reconstruction_loss_total + lare_reconstruction_loss.float()
+                            )
+                            lare_reconstruction_steps += 1
+                            attention_for_stats = lare_attention.float().clamp_min(1e-12)
+                            lare_attention_entropies.append(
+                                -(attention_for_stats * attention_for_stats.log())
+                                .sum(dim=-1)
+                                .mean()
+                                .detach()
+                            )
+                            lare_gate_means.append(lare_gate.float().mean().detach())
                     prediction_loss_total += (
                         prediction_loss_per_sample
                         * colt_loss_row_mask.to(prediction_loss_per_sample.dtype)
@@ -3399,6 +3616,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 component_log_interval > 0
                 and self._colt_forward_microbatch_count % component_log_interval == 0
             )
+            lare_reconstruction_loss_total = (
+                lare_reconstruction_loss_total / max(lare_reconstruction_steps, 1)
+            )
             global_k_metrics = None
             if should_log_components and self.oracle_k_predictor_enabled:
                 # Every rank must participate. This aggregates the full effective
@@ -3426,6 +3646,25 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     f"visual_cot={int(colt_visual_cot_rows.sum().item())} "
                     f"visual_only={int(colt_visual_only_rows.sum().item())} "
                     f"image_mask_hit={int(image_mask_rows.sum().item())}"
+                if self.lare_refocus_enabled:
+                    print(
+                        "lare_reconstruction_loss_total : "
+                        f"{lare_reconstruction_loss_total.detach().float().item()}"
+                    )
+                    print(
+                        "weighted_lare_reconstruction : "
+                        f"{(self.lare_reconstruction_weight * lare_reconstruction_loss_total).detach().float().item()}"
+                    )
+                    if lare_attention_entropies:
+                        print(
+                            "lare_attention_entropy : "
+                            f"{torch.stack(lare_attention_entropies).mean().detach().float().item()}"
+                        )
+                    if lare_gate_means:
+                        print(
+                            "lare_gate_mean : "
+                            f"{torch.stack(lare_gate_means).mean().detach().float().item()}"
+                        )
                 )
                 if self.oracle_k_predictor_enabled:
                     global_k_loss, global_k_accuracy, global_k_samples = (
@@ -3498,6 +3737,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             outputs = self.model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
+                + self.lare_reconstruction_weight * lare_reconstruction_loss_total
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
@@ -3722,6 +3962,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         latent_scale = 1.0
         if intervention in ("zero", "random"):
             latent_scale = float(latent_embd.detach().float().abs().mean().item()) or 1.0
+        lare_visual_tokens, lare_visual_mask = self._prepare_lare_visual_inputs(
+            input_ids, hidden_states
+        )
+        self._last_lare_attention_maps = []
         if answer_only_latent and intervention in ("skip", "zero"):
             latent_embd = torch.zeros_like(latent_embd)
         elif answer_only_latent and intervention == "random":
@@ -3765,13 +4009,23 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
             past_key_values = step_outputs.past_key_values
-            self._last_latent_hiddens.append(step_outputs[0][:, -1:, :])
-            latent_embd = advance_colt_inference_latent(
-                step_outputs[0][:, -1:, :],
+            latent_hidden = step_outputs[0][:, -1:, :]
+            self._last_latent_hiddens.append(latent_hidden)
+            base_next_latent = advance_colt_inference_latent(
+                latent_hidden,
                 self.prj,
                 self.alpha,
                 self.inference_latent_transition,
-            ).to(self.lm_head.weight.dtype)
+            )
+            latent_embd, _, _, _ = self._apply_lare_refocusing(
+                latent_hidden,
+                base_next_latent,
+                lare_visual_tokens,
+                lare_visual_mask,
+                step_index=i,
+                compute_reconstruction=False,
+            )
+            latent_embd = latent_embd.to(self.lm_head.weight.dtype)
             outputs = step_outputs
 
         logits = self.lm_head(latent_embd)

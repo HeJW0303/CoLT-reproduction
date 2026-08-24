@@ -264,6 +264,19 @@ cmd_eval() {
     --setting "latent_transition=$latent_transition" \
     --setting "latent_intervention=${COLT_LATENT_INTERVENTION:-none}" \
     --setting "answer_visibility=${COLT_ANSWER_VISIBILITY:-full}" \
+    --setting "lare_refocus=${COLT_LARE_REFOCUS:-auto}" \
+    --setting "lare_dim=${COLT_LARE_DIM:-auto}" \
+    --setting "lare_layers=${COLT_LARE_LAYERS:-auto}" \
+    --setting "lare_heads=${COLT_LARE_HEADS:-auto}" \
+    --setting "lare_queries=${COLT_LARE_QUERIES:-auto}" \
+    --setting "lare_max_steps=${COLT_LARE_MAX_STEPS:-auto}" \
+    --setting "lare_dropout=${COLT_LARE_DROPOUT:-auto}" \
+    --setting "lare_visual_dropout=${COLT_LARE_VISUAL_DROPOUT:-auto}" \
+    --setting "lare_attention_topk=${COLT_LARE_ATTN_TOPK:-auto}" \
+    --setting "lare_gate_bias=${COLT_LARE_GATE_BIAS:-auto}" \
+    --setting "lare_reconstruction_weight=${COLT_LARE_RECON_WEIGHT:-auto}" \
+    --setting "lare_reconstruction_steps=${COLT_LARE_RECON_STEPS:-auto}" \
+    --setting "lare_detach_visual=${COLT_LARE_DETACH_VISUAL:-auto}" \
     --setting "seed=${COLT_EVAL_SEED:-1234}" --setting "workers=$workers" \
     --setting "prefetch=$prefetch" --setting "empty_cache=$empty_cache" \
     --setting "backend=$backend" --setting "reseed=$reseed" \

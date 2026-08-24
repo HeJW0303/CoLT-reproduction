@@ -72,6 +72,7 @@ create_generation_overlay() {
   done
   for source_file in \
     "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py" \
+    "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_colt_latent_heads.py" \
     "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/modeling_oracle_k.py" \
     "$REPO_ROOT/transformers-4.57.0/src/transformers/models/qwen3_vl/oracle_k.py"; do
     [[ -f "$source_file" ]] && ln -sfn "$source_file" "$overlay/$(basename "$source_file")"
