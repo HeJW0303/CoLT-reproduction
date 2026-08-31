@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
@@ -48,6 +49,116 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _attach_colt_cot_attention_targets(dataset_module: "DatasetModule") -> "DatasetModule":
+    """Attach a frozen CoT-attention sidecar to a tokenized training dataset.
+
+    The sidecar is deliberately index-aligned with the *tokenized* dataset,
+    not the raw JSON.  This avoids an ambiguous join after invalid records are
+    filtered and guarantees that its variable-length patch maps match the
+    exact prompt/image preprocessing used by the training run.
+    """
+    target_path = os.environ.get("COLT_COT_ATTN_TARGETS_PATH")
+    if not target_path:
+        return dataset_module
+    if "train_dataset" not in dataset_module:
+        raise ValueError("COLT_COT_ATTN_TARGETS_PATH requires a train dataset.")
+    metadata_path = os.path.join(target_path, "metadata.json")
+    if not os.path.isfile(metadata_path):
+        raise ValueError(
+            "CoT attention sidecar is missing metadata.json; rebuild it with "
+            "scripts/lkl_8gpu/lare/build_cot_attention_targets.py."
+        )
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    expected_format = "colt_frozen_cot_attention_targets_v2_canonical_steps"
+    if metadata.get("format") != expected_format:
+        raise ValueError(
+            "CoT attention sidecar does not use the canonical CoLT step contract "
+            f"(expected format={expected_format!r}, got={metadata.get('format')!r}). "
+            "Rebuild it with scripts/lkl_8gpu/lare/build_cot_attention_targets.py."
+        )
+    # Do not let the historical ``teacher_layer=18`` field silently describe
+    # Teacher-A as an all-head L18 teacher.  New sidecars carry an explicit
+    # mode and a separate fallback field; keeping this contract at load time
+    # makes the training log self-describing and catches stale metadata before
+    # the first optimizer step.
+    attention_mode = metadata.get("teacher_attention_mode")
+    if attention_mode not in {"explicit_sparse_layer_head", "single_layer_all_heads"}:
+        raise ValueError(
+            "CoT attention sidecar is missing an explicit teacher_attention_mode. "
+            "Rebuild it with the updated build_cot_attention_targets.py."
+        )
+    if attention_mode == "explicit_sparse_layer_head":
+        if metadata.get("teacher_layer") is not None:
+            raise ValueError(
+                "Explicit sparse CoT teacher metadata must set teacher_layer=null; "
+                "use teacher_layer_fallback for the legacy CLI default."
+            )
+        pairs = metadata.get("teacher_head_pairs")
+        if not isinstance(pairs, list) or not pairs:
+            raise ValueError(
+                "Explicit sparse CoT teacher metadata lacks teacher_head_pairs; rebuild the sidecar."
+            )
+        if metadata.get("teacher_heads") != pairs:
+            raise ValueError(
+                "Explicit sparse CoT teacher metadata has a stale teacher_heads alias; rebuild the sidecar."
+            )
+    elif not isinstance(metadata.get("teacher_layer"), int):
+        raise ValueError(
+            "single_layer_all_heads CoT teacher metadata requires an integer teacher_layer."
+        )
+    elif metadata.get("teacher_head_pairs") not in (None, []):
+        raise ValueError(
+            "single_layer_all_heads CoT teacher metadata cannot contain explicit teacher_head_pairs."
+        )
+    train_dataset = dataset_module["train_dataset"]
+    expected_fingerprint = metadata.get("source_train_fingerprint")
+    actual_fingerprint = getattr(train_dataset, "_fingerprint", None)
+    if expected_fingerprint and actual_fingerprint != expected_fingerprint:
+        raise ValueError(
+            "CoT attention sidecar was built for a different tokenized dataset: "
+            f"cache={expected_fingerprint}, training={actual_fingerprint}."
+        )
+    target_dataset = load_from_disk(target_path)
+    # The builder writes a Dataset.  Accept a DatasetDict with a train split as
+    # well to keep the artifact easy to shard/merge externally.
+    if hasattr(target_dataset, "keys") and not isinstance(target_dataset, Dataset):
+        if "train" not in target_dataset:
+            raise ValueError("CoT attention sidecar DatasetDict must contain a train split.")
+        target_dataset = target_dataset["train"]
+    required_columns = {"cot_attention_targets"}
+    if not required_columns.issubset(target_dataset.column_names):
+        raise ValueError(
+            "CoT attention sidecar lacks required columns: "
+            f"need={sorted(required_columns)}, got={target_dataset.column_names}."
+        )
+    if len(target_dataset) != len(train_dataset):
+        raise ValueError(
+            "CoT attention sidecar length does not match tokenized training data: "
+            f"targets={len(target_dataset)}, training={len(train_dataset)}."
+        )
+    dataset_module["train_dataset"] = train_dataset.add_column(
+        "cot_attention_targets", target_dataset["cot_attention_targets"]
+    )
+    coverage = metadata.get("target_coverage") or {}
+    logger.info_rank0(
+        "Attached frozen CoT attention targets from %s (%d tokenized rows); "
+        "teacher_mode=%s teacher_layer=%s teacher_layer_fallback=%s "
+        "teacher_head_pairs=%s query_pool=%s rows_with_any_map=%s/%s step_rows_with_map=%s.",
+        target_path,
+        len(target_dataset),
+        attention_mode,
+        metadata.get("teacher_layer"),
+        metadata.get("teacher_layer_fallback"),
+        metadata.get("teacher_head_pairs"),
+        metadata.get("query_pool"),
+        coverage.get("rows_with_any_map", "unknown"),
+        coverage.get("source_rows", metadata.get("source_rows", len(target_dataset))),
+        coverage.get("step_rows_with_map", "unknown"),
+    )
+    return dataset_module
 
 
 def _load_single_dataset(
@@ -274,6 +385,8 @@ def _get_preprocessed_dataset(
         features["visual_only"] = Value("bool")
     if "visual_cot" in column_names or "_visual_cot" in column_names:
         features["visual_cot"] = Value("bool")
+    if "causal_grounded" in column_names or "_causal_grounded" in column_names:
+        features["causal_grounded"] = Value("bool")
 
     # Replace here (keep at the same position)
     log_path = os.environ.get("BAD_SAMPLES_LOG", "bad_samples.txt")
@@ -363,7 +476,7 @@ def get_dataset(
                 dataset_module["train_dataset"] = dataset_module["train_dataset"].to_iterable_dataset()
 
             logger.info_rank0(f"Loaded tokenized dataset from {data_args.tokenized_path}.")
-            return dataset_module
+            return _attach_colt_cot_attention_targets(dataset_module)
 
         if data_args.streaming:
             raise ValueError("Turn off `streaming` when saving dataset to disk.")
@@ -401,4 +514,4 @@ def get_dataset(
                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
 
-        return get_dataset_module(dataset_dict)
+        return _attach_colt_cot_attention_targets(get_dataset_module(dataset_dict))

@@ -140,15 +140,16 @@ def verify_aux_batching_switch() -> None:
 
     previous = os.environ.pop("COLT_BATCH_AUX_DECODERS", None)
     try:
-        if _is_colt_aux_batching_enabled():
-            raise RuntimeError("Auxiliary decoder batching must default to disabled.")
+        if not _is_colt_aux_batching_enabled():
+            raise RuntimeError("Auxiliary decoder batching must default to enabled.")
         for value in ("1", "true", "yes", "on"):
             os.environ["COLT_BATCH_AUX_DECODERS"] = value
             if not _is_colt_aux_batching_enabled():
-                raise RuntimeError(f"Auxiliary decoder batching did not accept opt-in value {value!r}.")
-        os.environ["COLT_BATCH_AUX_DECODERS"] = "0"
-        if _is_colt_aux_batching_enabled():
-            raise RuntimeError("Auxiliary decoder batching did not honor explicit disable value '0'.")
+                raise RuntimeError(f"Auxiliary decoder batching did not accept enable value {value!r}.")
+        for value in ("0", "false", "no", "off"):
+            os.environ["COLT_BATCH_AUX_DECODERS"] = value
+            if _is_colt_aux_batching_enabled():
+                raise RuntimeError(f"Auxiliary decoder batching did not accept disable value {value!r}.")
     finally:
         if previous is None:
             os.environ.pop("COLT_BATCH_AUX_DECODERS", None)
@@ -171,7 +172,7 @@ def main() -> None:
     verify_backward_decoder_official_behavior()
     print("Backward decoder OK: official initialization/checkpointing behavior is preserved.")
     verify_aux_batching_switch()
-    print("Batching OK: auxiliary decoder batching defaults off and supports explicit opt-in.")
+    print("Batching OK: auxiliary decoder batching defaults on and supports explicit opt-out.")
 
 
 if __name__ == "__main__":

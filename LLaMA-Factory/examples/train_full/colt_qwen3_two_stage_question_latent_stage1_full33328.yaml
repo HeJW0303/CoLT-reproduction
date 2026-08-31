@@ -1,0 +1,60 @@
+### Two-stage question-latent curriculum, Stage 1 (full 33,328 rows / 521 steps).
+### Full image -> latent trajectory; answer CE uses clean-question KV + final latent only.
+
+### model
+model_name_or_path: /data/nvme0/lkl/models/Qwen3-VL-8B-Instruct
+image_max_pixels: 802816
+video_max_pixels: 100352
+video_maxlen: 128
+video_fps: 2
+trust_remote_code: true
+disable_gradient_checkpointing: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+deepspeed: LLaMA-Factory/examples/deepspeed/ds_z3_8gpu.json
+
+### data: audited strict single-image / single-normalized-box grounding corpus
+dataset: onethinker_sft_image_grounding_bbox_normalized_strict
+template: qwen3_vl
+dataset_dir: /data/nvme0/lkl/datasets/CoLT_Train_Dataset
+media_dir: /data/nvme0/lkl/datasets/CoLT_Train_Dataset
+use_fast_tokenizer: false
+cutoff_len: 16384
+overwrite_cache: false
+preprocessing_num_workers: 32
+preprocessing_batch_size: 32
+tokenized_path: /data/nvme0/lkl/cache/colt/two_stage_question_latent_stage1_full33328_tokenized
+
+### output
+output_dir: /data/nvme0/lkl/CoLT-reproduction/checkpoints/two_stage_question_latent_stage1_full33328
+logging_steps: 1
+save_strategy: steps
+save_steps: 200
+save_only_model: false
+plot_loss: true
+overwrite_output_dir: false
+save_total_limit: 2
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-5
+weight_decay: 1.0e-6
+num_train_epochs: 1.0
+max_steps: 521
+lr_scheduler_type: cosine
+warmup_ratio: 0.02
+bf16: true
+ddp_timeout: 180000000
+flash_attn: fa2
+seed: 42
+data_seed: 42
+
+### logging
+report_to: wandb
+run_name: two_stage_question_latent_stage1_full33328

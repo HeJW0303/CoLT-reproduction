@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -36,6 +38,16 @@ if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
     from .template import Template
+
+
+def _has_nonempty_cot_attention_target(targets: list[Any]) -> bool:
+    """Return whether a batch contains at least one usable teacher map.
+
+    ``[]`` and ``[[], [], []]`` are valid deliberate abstentions emitted by
+    the frozen-teacher builder.  They should not force the collator to create
+    a zero-width tensor or raise before the base CoLT loss can run.
+    """
+    return any(target is not None and any(bool(step) for step in target) for target in targets)
 
 
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
@@ -109,9 +121,11 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         batch_images, batch_videos, batch_audios = [], [], []
         batch_bboxes, batch_bboxlens = [], []
         batch_step_bboxes, batch_step_bboxlens = [], []
-        batch_visual_only, batch_visual_cot = [], []
+        batch_visual_only, batch_visual_cot, batch_causal_grounded = [], [], []
+        batch_cot_attention_targets = []
         has_visual_controls = any(
-            "visual_only" in feature or "visual_cot" in feature for feature in features
+            "visual_only" in feature or "visual_cot" in feature or "causal_grounded" in feature
+            for feature in features
         )
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         for feature in features:
@@ -122,6 +136,8 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             step_bboxes = feature.pop("step_bboxes", None) or []
             visual_only = bool(feature.pop("visual_only", False))
             visual_cot = bool(feature.pop("visual_cot", False))
+            causal_grounded = bool(feature.pop("causal_grounded", False))
+            cot_attention_targets = feature.pop("cot_attention_targets", None)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
@@ -131,6 +147,8 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_step_bboxlens.append(len(step_bboxes))
             batch_visual_only.append(visual_only)
             batch_visual_cot.append(visual_cot)
+            batch_causal_grounded.append(causal_grounded)
+            batch_cot_attention_targets.append(cot_attention_targets)
             batch_imglens.append(len(images))
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
@@ -270,6 +288,76 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if has_visual_controls:
             features["colt_visual_only"] = torch.tensor(batch_visual_only, dtype=torch.bool)
             features["colt_visual_cot"] = torch.tensor(batch_visual_cot, dtype=torch.bool)
+            features["colt_causal_grounded"] = torch.tensor(batch_causal_grounded, dtype=torch.bool)
+
+        # Stage-1 question-latent curriculum is intentionally restricted to
+        # the audited, single-image / single-normalized-box corpus. Failing
+        # here prevents a silent fallback to ordinary full-image answer CE.
+        if os.environ.get("COLT_CAUSAL_GROUNDED_LATENT", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            if not all(batch_causal_grounded):
+                raise ValueError(
+                    "COLT_CAUSAL_GROUNDED_LATENT=1 requires every collated row to set causal_grounded=true."
+                )
+            for index, (images, bboxes) in enumerate(zip(batch_imglens, batch_bboxlens)):
+                if images != 1 or bboxes != 1:
+                    raise ValueError(
+                        "Causal-grounded Stage 1 requires exactly one image and one bbox per row; "
+                        f"row={index}, images={images}, bboxes={bboxes}."
+                    )
+            for index, bbox in enumerate(batch_bboxes):
+                if len(bbox) != 4 or not all(math.isfinite(float(value)) for value in bbox):
+                    raise ValueError(f"Invalid causal-grounded bbox at row {index}: {bbox!r}")
+                x1, y1, x2, y2 = map(float, bbox)
+                if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+                    raise ValueError(f"Causal-grounded bbox must be normalized xyxy at row {index}: {bbox!r}")
+
+        # A causal-filtered sidecar may deliberately abstain for every step of
+        # every row in a small batch.  That batch must fall back to the
+        # original CoLT objectives; it must not fail before the model sees the
+        # examples.  Only attach padded target tensors when at least one
+        # non-empty map is present in this batch.
+        has_nonempty_teacher_map = _has_nonempty_cot_attention_target(batch_cot_attention_targets)
+        if has_nonempty_teacher_map:
+            # Targets are a cached, frozen visible-CoT teacher distribution:
+            # ``List[semantic_step][visual_token]``. Empty step lists mean
+            # "teacher deliberately abstained" (for example, an ungroundable
+            # or diffuse CoT sentence), not a zero-valued map.
+            max_steps = max(
+                (len(target) for target in batch_cot_attention_targets if target is not None),
+                default=0,
+            )
+            max_tokens = max(
+                (
+                    len(step)
+                    for target in batch_cot_attention_targets
+                    if target is not None
+                    for step in target
+                ),
+                default=0,
+            )
+            if max_steps == 0 or max_tokens == 0:
+                # Kept as a defensive guard for malformed sidecars.  The
+                # normal all-abstain case is handled by the predicate above.
+                raise ValueError("CoT attention sidecar contains no non-empty teacher map.")
+            targets = torch.zeros(
+                (len(batch_cot_attention_targets), max_steps, max_tokens), dtype=torch.float32
+            )
+            target_mask = torch.zeros_like(targets, dtype=torch.bool)
+            for row, target in enumerate(batch_cot_attention_targets):
+                if target is None:
+                    continue
+                for step, values in enumerate(target):
+                    if not values:
+                        continue
+                    values_tensor = torch.as_tensor(values, dtype=torch.float32)
+                    if not torch.isfinite(values_tensor).all() or torch.any(values_tensor < 0):
+                        raise ValueError(
+                            "CoT attention sidecar must contain finite non-negative probabilities/scores."
+                        )
+                    targets[row, step, : values_tensor.numel()] = values_tensor
+                    target_mask[row, step, : values_tensor.numel()] = True
+            features["colt_cot_attention_targets"] = targets
+            features["colt_cot_attention_target_mask"] = target_mask
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

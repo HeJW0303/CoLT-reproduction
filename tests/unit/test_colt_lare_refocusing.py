@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from datasets import Dataset
+
+from llamafactory.data.loader import _attach_colt_cot_attention_targets
 
 from transformers.models.qwen3_vl.modeling_colt_latent_heads import (
     LaReLatentRefocusingExtractor,
+    cot_attention_alignment_loss,
     pack_visual_tokens_by_sample,
 )
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    split_cot_by_dynamic_boundaries,
+    split_cot_by_dynamic_boundaries_with_metadata,
+)
 
 
 class _TinyTokenizer:
@@ -102,6 +114,10 @@ class LaReLatentRefocusingExtractorTests(unittest.TestCase):
         torch.testing.assert_close(gate, expected_gate)
         self.assertEqual(float(reconstruction), 0.0)
 
+    def test_native_self_attention_is_marked_for_safe_missing_key_initialization(self) -> None:
+        extractor = self._make_extractor()
+        self.assertTrue(extractor.layers[0].self_attention._colt_lare_constructor_initialized)
+
     def test_text_only_row_has_zero_delta_and_gate_without_nan(self) -> None:
         extractor = self._make_extractor().eval()
         latent = torch.randn(2, 1, 16)
@@ -167,6 +183,86 @@ class LaReLatentRefocusingExtractorTests(unittest.TestCase):
             )
 
 
+class CoTAttentionAlignmentTests(unittest.TestCase):
+    def test_confident_teacher_aligns_student_and_ignores_padded_tokens(self) -> None:
+        student = torch.tensor([[[0.70, 0.20, 0.10, 0.00], [0.65, 0.25, 0.10, 0.00]]])
+        target = torch.tensor([[0.75, 0.20, 0.05, 999.0]])
+        mask = torch.tensor([[True, True, True, False]])
+        visual = torch.tensor([[True, True, True, False]])
+        loss, rows, confidence = cot_attention_alignment_loss(
+            student, target, mask, visual, min_confidence=0.01
+        )
+        self.assertGreater(float(rows), 0.0)
+        self.assertGreater(float(confidence), 0.0)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertLess(float(loss), 0.1)
+
+    def test_uniform_teacher_abstains_instead_of_forcing_a_fake_region(self) -> None:
+        student = torch.tensor([[[0.9, 0.05, 0.05]]])
+        target = torch.tensor([[1.0, 1.0, 1.0]])
+        mask = torch.ones(1, 3, dtype=torch.bool)
+        loss, rows, confidence = cot_attention_alignment_loss(
+            student, target, mask, mask, min_confidence=0.05
+        )
+        self.assertEqual(float(rows), 0.0)
+        self.assertEqual(float(confidence), 0.0)
+        self.assertEqual(float(loss), 0.0)
+
+    def test_stale_target_length_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Rebuild the sidecar cache"):
+            cot_attention_alignment_loss(
+                torch.ones(1, 2, 3) / 3,
+                torch.ones(1, 2),
+                torch.ones(1, 2, dtype=torch.bool),
+                torch.ones(1, 3, dtype=torch.bool),
+                min_confidence=0.0,
+            )
+
+
+class CoTCanonicalStepPartitionTests(unittest.TestCase):
+    def test_metadata_preserves_the_exact_colt_decoder_partition(self) -> None:
+        cot = torch.tensor([10, 11, 99, 12, 13, 99, 14, 15, 99])
+        expected_steps, expected_lengths = split_cot_by_dynamic_boundaries(
+            cot, num_steps=3, eos_token_id=1, boundary_token_ids={99}, min_step_tokens=2
+        )
+        steps, lengths, metadata = split_cot_by_dynamic_boundaries_with_metadata(
+            cot, num_steps=3, eos_token_id=1, boundary_token_ids={99}, min_step_tokens=2
+        )
+        self.assertEqual(lengths, expected_lengths)
+        self.assertEqual([step.tolist() for step in steps], [step.tolist() for step in expected_steps])
+        self.assertEqual(metadata["split_points"], [0, 3, 6, 9])
+        self.assertEqual(metadata["teacher_eligible"], [True, True, True])
+
+    def test_forced_cut_abstains_without_removing_a_colt_step(self) -> None:
+        cot = torch.arange(9)
+        steps, lengths, metadata = split_cot_by_dynamic_boundaries_with_metadata(
+            cot, num_steps=3, eos_token_id=99, boundary_token_ids=set(), min_step_tokens=8
+        )
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(lengths, [4, 4, 4])
+        self.assertEqual(metadata["split_points"], [0, 3, 6, 9])
+        self.assertEqual(metadata["teacher_eligible"], [False, False, False])
+
+    def test_legacy_semantic_sidecar_is_rejected_before_training(self) -> None:
+        # A matching row count/fingerprint is insufficient: v1 used a separate
+        # semantic regrouping and could therefore supervise the wrong latent
+        # index.  The loader must require a rebuilt canonical sidecar.
+        train_dataset = Dataset.from_dict({"input_ids": [[1, 2, 3]]})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "colt_frozen_cot_attention_targets_v1",
+                        "source_train_fingerprint": train_dataset._fingerprint,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"COLT_COT_ATTN_TARGETS_PATH": temp_dir}, clear=False):
+                with self.assertRaisesRegex(ValueError, "canonical CoLT step contract"):
+                    _attach_colt_cot_attention_targets({"train_dataset": train_dataset})
+
+
 class LaReQwenWiringTests(unittest.TestCase):
     def test_env_switch_constructs_self_describing_safe_module_on_cpu(self) -> None:
         config = Qwen3VLConfig(
@@ -228,6 +324,49 @@ class LaReQwenWiringTests(unittest.TestCase):
             rtol=0.0,
         )
 
+        # Reproduce the ``from_pretrained(base Qwen)`` missing-key path.  It
+        # must gather and reset every new LaRe tensor as a unit rather than
+        # retaining construction-time random values (which are only local
+        # shards under ZeRO-3).
+        extractor = model.lare_refocusing_extractor
+        with torch.no_grad():
+            extractor.output_projection.weight.fill_(0.125)
+            extractor.output_projection.bias.fill_(0.125)
+            extractor.gate_projection.weight.fill_(0.125)
+            extractor.gate_projection.bias.fill_(0.125)
+        missing_lare_keys = [
+            key for key in model.state_dict() if key.startswith("lare_refocusing_extractor.")
+        ]
+        model._mark_lare_parameters_for_missing_key_initialization()
+        model._initialize_missing_keys(missing_lare_keys, is_quantized=False)
+        torch.testing.assert_close(
+            extractor.output_projection.weight,
+            torch.zeros_like(extractor.output_projection.weight),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            extractor.output_projection.bias,
+            torch.zeros_like(extractor.output_projection.bias),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            extractor.gate_projection.weight,
+            torch.zeros_like(extractor.gate_projection.weight),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            extractor.gate_projection.bias,
+            torch.full_like(extractor.gate_projection.bias, -2.0),
+            atol=0.0,
+            rtol=0.0,
+        )
+        output_norm, gate_bias = extractor.safe_initialization_stats()
+        self.assertEqual(output_norm, 0.0)
+        self.assertEqual(gate_bias, -2.0)
+
         # Exercise the actual CoLT wiring without invoking the vision tower:
         # Qwen caches one flattened visual tensor, while prompt placeholders
         # define ownership for variable-length rows.
@@ -288,6 +427,15 @@ class LaReQwenWiringTests(unittest.TestCase):
         self.assertFalse(disabled_model.lare_refocus_enabled)
         self.assertIsNone(disabled_model.lare_refocusing_extractor)
         self.assertFalse(disabled_model.model._colt_cache_visual_features)
+
+        # ZeRO-3 presents a partitioned ``in_proj_weight`` as one-dimensional
+        # during the missing-key initialization pass.  Calling the generic
+        # MultiheadAttention reset would fail fan-in/fan-out validation; the
+        # LaRe-specific guard must leave the constructor initialization intact.
+        attention = model.lare_refocusing_extractor.layers[0].self_attention
+        attention.in_proj_weight = torch.nn.Parameter(torch.empty(1))
+        model._init_weights(attention)
+        self.assertEqual(attention.in_proj_weight.ndim, 1)
 
 
 if __name__ == "__main__":

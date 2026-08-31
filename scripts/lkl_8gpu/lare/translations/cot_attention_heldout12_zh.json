@@ -1,0 +1,114 @@
+{
+  "format": "colt_cot_attention_bilingual_translations_v1",
+  "note": "Chinese translations correspond to the canonical three CoT spans; question_en removes repeated dataset boilerplate for legibility.",
+  "rows": {
+    "44203": {
+      "question_en": "Given the referring expression \"little boy\", provide one bounding box, three positive points inside the object, and three negative points outside it as segmentation hints.",
+      "question_zh": "根据指代表达“小男孩”，给出一个边界框、三个位于目标内部的正点，以及三个位于目标外部的负点，作为分割提示。",
+      "cot_steps_zh": [
+        "好的，先识别目标“小男孩”：图中右侧是一个金发、穿绿色上衣并戴蓝色围兜的孩子。给他画框，范围大约为 x1=480、y1=126、x2=998、y2=993。再选三个男孩内部的正点，例如头发上的 (624,303)、脸上的 (684,540) 和手上的 (764,783)。负点必须落在男孩之外。可以利用框内男孩身体以外的木质背景；例如男孩身后木凳上的 (552,750)，",
+        "这个点在目标外。另一个可选 (924,354)，位于木质结构上。也可以选 (488,519) 附近的背景，但必须确认不落在男孩身上。由于男人在 x=480 左侧、位于框外，也可以作为目标外区域，不过说明优先在框内选明确的非目标像素。框内确有木凳和木板背景，因此选 (540,669)、(940,339)、(496,543) 三个框内背景点，并逐一确认它们不在男孩或其边界上。",
+        "最终选取框内但位于男孩之外的背景点：(556,720) 是男孩身后的木凳，(900,360) 是木板，(492,573) 是男孩身后的背景。正点为：(640,330) 在头发上，(680,555) 在脸颊上，(760,795) 在手上。边界框确定为 [480,126,998,993]，应完整包住男孩。汇总：框 [480,126,998,993]；正点 [[640,330],[680,555],[760,795]]；负点 [[556,720],[900,360],[492,573]]。"
+      ]
+    },
+    "83575": {
+      "question_en": "In what ways does this diagram classify the leaves? A. size, taste, scent; B. all above; C. location, size, shape; D. shape, arrangement, veins, edges, and arrangement on the stem.",
+      "question_zh": "这张图按哪些方式对叶片分类？A. 大小、味道和气味；B. 以上全部；C. 位置、大小和形状；D. 形状、排列方式、叶脉、叶缘以及在茎上的排列方式。",
+      "cot_steps_zh": [
+        "先分析图中的标签：叶脉、形状、排列方式、叶缘、在茎上的排列方式。选项 A 所说的大小、味道和气味并未出现在图中，因此排除 A。",
+        "选项 B 是“以上全部”，但 A 已经错误，所以 B 也排除。选项 C 包含位置和大小，这两项同样不是图中的分类，因此 C 错误。",
+        "检查 D：叶脉分为网状和平行；形状包括掌形、披针形、心形、圆形、针形；排列方式包括单叶和复叶；叶缘包括全缘、锯齿和裂叶；在茎上的排列包括互生、对生和轮生。D 与图中全部类别吻合。"
+      ]
+    },
+    "33366": {
+      "question_en": "The figure shows a chemistry question and four answer options. Choose the metal ion that matches both reported reactions (options A-D are shown in the image).",
+      "question_zh": "图中给出一道化学题及四个选项。请选择同时符合题述两种反应现象的金属离子（A-D 选项见图）。",
+      "cot_steps_zh": [
+        "逐项判断金属离子与 KI 和硫氰酸钴(II)的反应。第一种现象是与 KI 生成红色沉淀，过量 KI 又使其溶解成无色溶液；第二种现象是与硫氰酸钴(II)生成深蓝色晶体沉淀。A 中 Pb²⁺ 与 I⁻ 生成黄色 PbI₂，不符。B 中 Hg²⁺ 与 I⁻ 先生成红色 HgI₂，过量 I⁻ 形成可溶、无色的 [HgI₄]²⁻。接着检查第二种反应。",
+        "深蓝色晶体沉淀是 Hg²⁺ 的特征现象。再看 C：Cu²⁺ 与 KI 生成白色 CuI 并析出棕色 I₂，不是可被过量 KI 溶解的红色沉淀，因此排除。D 中 Co²⁺ 与 KI 不生成相应沉淀，也排除。再核对 Hg²⁺ 与硫氰酸钴(II)的反应。",
+        "综合判断，只有 Hg²⁺ 满足：先与 KI 形成红色 HgI₂，过量 KI 生成可溶的 K₂[HgI₄] 无色络合物；它与硫氰酸钴(II)的深蓝色反应也符合题述。因此金属离子是 Hg²⁺，对应选项 B。"
+      ]
+    },
+    "58053": {
+      "question_en": "What are the magnitudes of vectors A, B, and C shown in the image?",
+      "question_zh": "图中向量 A、B、C 的模分别是多少？",
+      "cot_steps_zh": [
+        "观察图像，向量的模由旁边标注的长度直接给出。",
+        "向量 A 标为 44，向量 B 标为 26.",
+        "5，而向量 C 标为 31.0。因此三个模分别是 44、26.5 和 31.0。"
+      ]
+    },
+    "24004": {
+      "question_en": "What statistical quantity does Figure 8 evaluate, and how do the algorithms compare in attaining nominal coverage across the scenarios?",
+      "question_zh": "图 8 评估的是哪项统计指标？在不同情景下，各算法达到名义覆盖率的表现如何？",
+      "cot_steps_zh": [
+        "先判断图意。纵轴是 Coverage（覆盖率），通常表示置信区间或置信集包含真实参数的概率，名义值可能是 0.95。横轴是 ρ₂，分面包含 Null 与 Signal、不同参数设置以及 Dense 与 Sparse。图例中的算法包括 Asymptotic、Parametric、Regression 和 combootcca。因此，这是一项比较不同算法在零假设/有信号、稠密/稀疏和不同 ρ₂ 下覆盖概率的统计评估。",
+        "在 Null 情景中，希望覆盖率接近名义值；在 Signal 情景中也比较这一点。稠密和稀疏结构会改变各算法表现。需要比较红、青、绿、紫色柱在各面板中的高度。以稠密 Null 面板为例，combootcca（紫色）和 Regression（绿色）的覆盖率更高、更接近 1，而 Asymptotic（红色）较低；稀疏情景下 combootcca 仍通常较好。",
+        "因此，该图展示不同算法在零假设/有信号、稠密/稀疏及不同 ρ₂ 设置下的覆盖概率。combootcca 和 Regression 在许多情景下比 Asymptotic 与 Parametric 更接近名义覆盖率，但具体差异随情景而变。"
+      ]
+    },
+    "12465": {
+      "question_en": "Which respiratory-system part connects the lungs to the rest of the body? A. Left lung B. Nose C. Right lung D. Trachea",
+      "question_zh": "呼吸系统中，哪一部分把肺与身体其他部位连接起来？A. 左肺 B. 鼻 C. 右肺 D. 气管",
+      "cot_steps_zh": [
+        "题目问的是哪一部分把肺与身体其他部位连接。回忆呼吸系统：气管是输送空气的主要管道，从喉部等上呼吸道向下连接支气管，支气管再进入肺。",
+        "因此气管是连接肺与其他呼吸结构的主要通道。逐项检查：",
+        "A 左肺和 C 右肺本身就是肺，不是连接管；B 鼻是呼吸道入口；D 气管才是正确答案。"
+      ]
+    },
+    "6773": {
+      "question_en": "Does the Tomato line intersect the Maroon line? A. No B. Yes",
+      "question_zh": "Tomato 色曲线与 Maroon 色曲线是否相交？A. 否 B. 是",
+      "cot_steps_zh": [
+        "观察 Tomato 色线和 Maroon 色线的走向，判断它们是否交叉。Tomato 色线先上升再下降，Maroon 色线总体上升。需要沿横轴检查两条线是否在某处相遇。",
+        "再次核对图中的相对位置：Maroon 色线起初位于 Tomato 色线下方；当 Tomato 色线下降时，要判断 Maroon 色线是否追上并穿过它。图中似乎仍没有明确交点。",
+        "最后沿完整曲线检查，Tomato 色线与 Maroon 色线没有相遇，因此答案是 A（否）。"
+      ]
+    },
+    "45455": {
+      "question_en": "Provide the bounding box of the region described as: the rightmost pizza.",
+      "question_zh": "请给出“最右侧的披萨”所对应区域的边界框。",
+      "cot_steps_zh": [
+        "要确定最右侧披萨的边界框，先查看整张图。",
+        "最右侧的披萨是桌子右边、放在盘子上的那张大披萨，",
+        "边界框应覆盖这张披萨的完整范围。"
+      ]
+    },
+    "106410": {
+      "question_en": "Provide the bounding box of the region described as: pinkish-colored cushions.",
+      "question_zh": "请给出“粉红色靠垫”所对应区域的边界框。",
+      "cot_steps_zh": [
+        "要找到粉红色靠垫的边界框，先观察图中的沙发。",
+        "这些粉红色靠垫是沙发的一部分，具体位于人们坐下的座位区域。需要从沙发上的多个靠垫中识别出它们；",
+        "最终边界框覆盖沙发区域内这些粉红色靠垫所在的范围。"
+      ]
+    },
+    "109495": {
+      "question_en": "Remove all green balls and all brown cubes. How many shapes remain?",
+      "question_zh": "去掉所有绿色球体和所有棕色立方体后，还剩多少个形状？",
+      "cot_steps_zh": [
+        "先按题意去掉全部绿色球体和棕色立方体。检查图中，没有绿色球体。",
+        "图中也没有棕色立方体，因此无需去掉任何形状。现在清点全部形状：一个黄色立方体、一个灰色球体、一个青色圆柱体，",
+        "以及一个灰色圆柱体。共计 1+1+1+1=4，所以答案是 4。"
+      ]
+    },
+    "100054": {
+      "question_en": "What number is written in green on the far left?",
+      "question_zh": "最左侧用绿色写着什么数字？",
+      "cot_steps_zh": [
+        "查看最左边的绿色数字。图中左侧第一个绿色标记似乎在高柜上，可能写着“04”。需要再确认最左侧的绿色文字。",
+        "继续观察：左边带时钟的柜子上确实有绿色的“04”吗？再次定位最左侧绿色数字。",
+        "最左侧的绿色数字位于高木柜上，内容是“04”。"
+      ]
+    },
+    "84678": {
+      "question_en": "What is the young man doing? A. board trick B. accident C. bell hop D. suicide",
+      "question_zh": "这个年轻人在做什么？A. 滑板动作 B. 事故 C. 行李员工作 D. 自杀",
+      "cot_steps_zh": [
+        "观察图中年轻人的动作。选项包括滑板动作、事故、行李员工作和自杀，",
+        "图里他正在做一个滑板技巧动作。",
+        "这对应选项 A：滑板动作。"
+      ]
+    }
+  }
+}

@@ -124,6 +124,8 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 model_inputs["visual_only"].append(visual_only)
             if "_visual_cot" in examples:
                 model_inputs["visual_cot"].append(bool(examples["_visual_cot"][i]))
+            if "_causal_grounded" in examples:
+                model_inputs["causal_grounded"].append(bool(examples["_causal_grounded"][i]))
 
         return model_inputs
 

@@ -2,15 +2,19 @@
 
 cmd_train() {
   local target="${1:-}"
-  [[ -n "$target" ]] || die "Usage: colt.sh train {codefaithful|paper-faithful|oracle-k} [options]"
+  [[ -n "$target" ]] || die "Usage: colt.sh train {codefaithful|paper-faithful|oracle-k} [options]; set COLT_TRAIN_RUN_LABEL for the experiment name"
   shift
-  local resume="${RESUME:-0}" cli_config="" cli_output="" batch_aux="${COLT_BATCH_AUX_DECODERS:-0}"
+  local default_batch_aux=1
+  [[ "$target" != codefaithful ]] || default_batch_aux=0
+  local resume="${RESUME:-0}" cli_config="" cli_output="" \
+    batch_aux="${COLT_BATCH_AUX_DECODERS:-$default_batch_aux}"
   while (( $# > 0 )); do
     case "$1" in
       --resume) resume=1; shift ;;
       --config) [[ $# -ge 2 ]] || die "--config requires a path"; cli_config="$2"; shift 2 ;;
       --output-dir) [[ $# -ge 2 ]] || die "--output-dir requires a path"; cli_output="$2"; shift 2 ;;
       --batch-aux) batch_aux=1; shift ;;
+      --no-batch-aux) batch_aux=0; shift ;;
       *) die "Unknown train option: $1" ;;
     esac
   done
@@ -28,29 +32,26 @@ cmd_train() {
   [[ "${#COLT_GPU_IDS[@]}" -eq 8 ]] || die "Training requires exactly 8 GPU ids: $gpu_csv"
   maybe_check_selected_gpus_free
 
-  local default_config default_output record_prefix log_prefix
+  local default_config default_output default_run_label
   case "$target" in
     codefaithful)
       default_config="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu.yaml"
       default_output="$OUTPUT_ROOT/colt_codefaithful"
-      record_prefix=colt_codefaithful_run
-      log_prefix=colt_codefaithful_train
+      default_run_label=colt_sft_standard_objective
       export COLT_PAPER_FAITHFUL=0 COLT_ORACLE_K_ENABLED=0 COLT_ORACLE_K_PREDICTOR_ENABLED=0
       export COLT_ORACLE_K_DYNAMIC_INFERENCE=0
       ;;
     paper-faithful)
       default_config="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_paper_faithful.yaml"
       default_output="$OUTPUT_ROOT/colt_paper_faithful"
-      record_prefix=colt_paper_faithful_run
-      log_prefix=colt_paper_faithful_train
+      default_run_label=colt_sft_paper_reference
       export COLT_PAPER_FAITHFUL=1 COLT_ORACLE_K_ENABLED=0 COLT_ORACLE_K_PREDICTOR_ENABLED=0
       export COLT_ORACLE_K_DYNAMIC_INFERENCE=0
       ;;
     oracle-k)
       default_config="$REPO_ROOT/LLaMA-Factory/examples/train_full/colt_qwen3_sft_lkl_8gpu_oracle_k_predictor.yaml"
       default_output="$OUTPUT_ROOT/colt_oracle_k_predictor"
-      record_prefix=colt_oracle_k_predictor_run
-      log_prefix=colt_oracle_k_predictor_train
+      default_run_label=colt_sft_oracle_k_predictor
       export COLT_PAPER_FAITHFUL=1 COLT_ORACLE_K_ENABLED=1
       export COLT_ORACLE_K_MAX="${COLT_ORACLE_K_MAX:-8}"
       export COLT_ORACLE_K_BUDGET_CONDITIONING="${COLT_ORACLE_K_BUDGET_CONDITIONING:-1}"
@@ -83,12 +84,20 @@ cmd_train() {
       die "A resumed Oracle-K run must not reinitialize the trained K predictor"
   fi
 
-  record_prefix="${COLT_TRAIN_RECORD_PREFIX:-$record_prefix}"
-  log_prefix="${COLT_TRAIN_LOG_PREFIX:-$log_prefix}"
-
   local train_config="${cli_config:-${COLT_TRAIN_CONFIG:-$default_config}}"
   local output_dir="${cli_output:-${COLT_TRAIN_OUTPUT_DIR:-$default_output}}"
+  local run_label="${COLT_TRAIN_RUN_LABEL:-$default_run_label}"
+  # Keep the old prefix variables as a compatibility bridge, but never place
+  # their log at LOG_ROOT directly. New launchers should set RUN_LABEL.
+  if [[ -z "${COLT_TRAIN_RUN_LABEL:-}" && -n "${COLT_TRAIN_RECORD_PREFIX:-}" ]]; then
+    run_label="${COLT_TRAIN_RECORD_PREFIX%_run}"
+  fi
+  local log_name="${COLT_TRAIN_LOG_NAME:-${COLT_TRAIN_LOG_PREFIX:-${run_label}_train}}"
   [[ "$train_config" == /* && "$output_dir" == /* ]] || die "Training config and output paths must be absolute."
+  [[ "$run_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die \
+    "COLT_TRAIN_RUN_LABEL must contain only ASCII letters, digits, dot, underscore, or hyphen: $run_label"
+  [[ "$log_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die \
+    "COLT_TRAIN_LOG_NAME/COLT_TRAIN_LOG_PREFIX must contain only ASCII letters, digits, dot, underscore, or hyphen: $log_name"
   [[ -f "$train_config" ]] || die "Missing training config: $train_config"
   export COLT_BATCH_AUX_DECODERS="$batch_aux"
   export COLT_AUX_MAX_BATCH_TOKENS="${COLT_AUX_MAX_BATCH_TOKENS:-4096}"
@@ -106,7 +115,7 @@ cmd_train() {
   config_output="$(python -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["output_dir"])' "$train_config")"
   [[ "$config_output" == "$output_dir" ]] || die \
     "Config output_dir ($config_output) does not match guarded output directory ($output_dir)."
-  mkdir -p "$output_dir" "$LOG_ROOT"
+  mkdir -p "$output_dir" "$LOG_ROOT/train"
   if find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
     [[ "$resume" == 1 ]] || die \
       "Output directory is not empty: $output_dir. Use --resume only for a verified interrupted run."
@@ -125,8 +134,9 @@ cmd_train() {
     python -m unittest discover -s "$REPO_ROOT/tests/oracle_k" -p 'test_*.py' -v
 
   local run_stamp="$(date +%Y%m%d_%H%M%S)"
-  local run_record="$LOG_ROOT/${record_prefix}_${run_stamp}"
-  local log_file="$LOG_ROOT/${log_prefix}_${run_stamp}.log"
+  local run_record="$LOG_ROOT/train/${run_label}_${run_stamp}"
+  local log_file="$run_record/${log_name}_${run_stamp}.log"
+  [[ ! -e "$run_record" ]] || die "Training run record already exists: $run_record"
   mkdir -p "$run_record"
   cp "$train_config" "$run_record/"
   deepspeed_config="$(python -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["deepspeed"])' "$train_config")"
@@ -144,6 +154,8 @@ cmd_train() {
   python -m pip freeze > "$run_record/pip_freeze.txt"
   {
     printf 'target=%s\n' "$target"
+    printf 'run_label=%s\n' "$run_label"
+    printf 'log_file=%s\n' "$log_file"
     printf 'config=%s\n' "$train_config"
     printf 'output_dir=%s\n' "$output_dir"
     printf 'resume=%s\n' "$resume"
@@ -163,7 +175,7 @@ cmd_train() {
     printf 'COLT_LARE_VISUAL_DROPOUT=%s\n' "${COLT_LARE_VISUAL_DROPOUT:-0.1}"
     printf 'COLT_LARE_ATTN_TOPK=%s\n' "${COLT_LARE_ATTN_TOPK:-0}"
     printf 'COLT_LARE_GATE_BIAS=%s\n' "${COLT_LARE_GATE_BIAS:--2.0}"
-    printf 'COLT_LARE_RECON_WEIGHT=%s\n' "${COLT_LARE_RECON_WEIGHT:-0.05}"
+    printf 'COLT_LARE_RECON_WEIGHT=%s\n' "${COLT_LARE_RECON_WEIGHT:-0.1}"
     printf 'COLT_LARE_RECON_STEPS=%s\n' "${COLT_LARE_RECON_STEPS:-1000}"
     printf 'COLT_LARE_DETACH_VISUAL=%s\n' "${COLT_LARE_DETACH_VISUAL:-1}"
     printf 'COLT_LARE_RECORD_ATTENTION=%s\n' "${COLT_LARE_RECORD_ATTENTION:-0}"

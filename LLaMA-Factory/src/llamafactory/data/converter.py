@@ -138,6 +138,8 @@ class AlpacaDatasetConverter(DatasetConverter):
             output["_visual_cot"] = bool(example[self.dataset_attr.visual_cot])
         elif self.dataset_attr.bboxes or self.dataset_attr.step_bboxes:
             output["_visual_cot"] = not output.get("_visual_only", False)
+        if self.dataset_attr.causal_grounded:
+            output["_causal_grounded"] = bool(example[self.dataset_attr.causal_grounded])
         return output
 
 
@@ -244,6 +246,8 @@ class SharegptDatasetConverter(DatasetConverter):
             output["_visual_cot"] = bool(example[self.dataset_attr.visual_cot])
         elif self.dataset_attr.bboxes or self.dataset_attr.step_bboxes:
             output["_visual_cot"] = not output.get("_visual_only", False)
+        if self.dataset_attr.causal_grounded:
+            output["_causal_grounded"] = bool(example[self.dataset_attr.causal_grounded])
         return output
 
 
@@ -394,6 +398,8 @@ class OpenAIDatasetConverter(DatasetConverter):
             output["_visual_cot"] = bool(example[self.dataset_attr.visual_cot])
         elif self.dataset_attr.bboxes or self.dataset_attr.step_bboxes:
             output["_visual_cot"] = not output.get("_visual_only", False)
+        if self.dataset_attr.causal_grounded:
+            output["_causal_grounded"] = bool(example[self.dataset_attr.causal_grounded])
         return output
 
 

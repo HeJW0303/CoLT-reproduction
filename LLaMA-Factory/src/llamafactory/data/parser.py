@@ -47,6 +47,7 @@ class DatasetAttr:
     step_bboxes: Optional[str] = None
     visual_only: Optional[str] = None
     visual_cot: Optional[str] = None
+    causal_grounded: Optional[str] = None
     # dpo columns
     chosen: Optional[str] = None
     rejected: Optional[str] = None
@@ -91,6 +92,7 @@ class DatasetAttr:
                 "step_bboxes",
                 "visual_only",
                 "visual_cot",
+                "causal_grounded",
                 "chosen",
                 "rejected",
                 "kto_tag",
